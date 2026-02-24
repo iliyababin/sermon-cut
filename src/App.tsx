@@ -1,17 +1,23 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { VideoLibrary } from "./components/VideoLibrary";
 import { DownloadForm } from "./components/DownloadForm";
 import { ReviewScreen } from "./components/ReviewScreen";
 import { Settings } from "./components/Settings";
 import { ProcessingProvider } from "./lib/processing-context";
 import { VideoInfo } from "./lib/types";
-import { Download, Film, Settings as SettingsIcon, Clapperboard } from "lucide-react";
+import { Download, Film, Settings as SettingsIcon, Clapperboard, ArrowUpCircle } from "lucide-react";
+import { useUpdater } from "./hooks/useUpdater";
 
 type View = "library" | "download" | "review" | "settings";
 
 export default function App() {
   const [currentView, setCurrentView] = useState<View>("library");
   const [selectedVideo, setSelectedVideo] = useState<VideoInfo | null>(null);
+  const updater = useUpdater();
+
+  useEffect(() => {
+    updater.checkForUpdates();
+  }, []);
 
   const handleVideoSelect = (video: VideoInfo) => {
     // Only open review screen for videos that are ready for review
@@ -63,6 +69,17 @@ export default function App() {
           />
         </nav>
 
+        {updater.available && (
+          <div className="px-2 pb-2">
+            <button
+              onClick={() => setCurrentView("settings")}
+              className="w-full px-3 py-2 bg-primary/10 text-primary rounded-lg hover:bg-primary/20 transition-colors text-sm flex items-center gap-2"
+            >
+              <ArrowUpCircle className="w-4 h-4" />
+              Update v{updater.version} available
+            </button>
+          </div>
+        )}
         <div className="p-4 border-t border-border text-sm text-muted-foreground">
           v0.1.0
         </div>

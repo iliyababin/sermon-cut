@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { getSettings, saveSettings, getAppDataDir, resetState, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists } from "@/lib/tauri";
 import type { Settings as SettingsType, YouTubeAuthStatus, PlaylistInfo } from "@/lib/types";
-import { Save, Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle } from "lucide-react";
+import { Save, Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle, RefreshCw, Download } from "lucide-react";
+import { useUpdater } from "@/hooks/useUpdater";
 import { open } from "@tauri-apps/plugin-dialog";
 import { LocalImage } from "./LocalImage";
 
@@ -18,6 +19,7 @@ export function Settings() {
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
   const [resetConfirm, setResetConfirm] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const updater = useUpdater();
 
   useEffect(() => {
     loadSettings();
@@ -378,6 +380,69 @@ export function Settings() {
               <span className="text-muted-foreground">Data Directory</span>
               <span className="font-mono text-xs">{appDataDir}</span>
             </div>
+          </div>
+
+          <div className="mt-4">
+            {updater.available ? (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-green-600">
+                    Update v{updater.version} available
+                  </span>
+                  <button
+                    onClick={updater.downloadAndInstall}
+                    disabled={updater.downloading}
+                    className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 flex items-center gap-2 text-sm transition-colors"
+                  >
+                    {updater.downloading ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Installing... {updater.progress}%
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-4 h-4" />
+                        Download & Install
+                      </>
+                    )}
+                  </button>
+                </div>
+                {updater.downloading && (
+                  <div className="w-full bg-secondary rounded-full h-2">
+                    <div
+                      className="bg-primary h-2 rounded-full transition-all"
+                      style={{ width: `${updater.progress}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            ) : (
+              <button
+                onClick={updater.checkForUpdates}
+                disabled={updater.checking}
+                className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 flex items-center gap-2 text-sm transition-colors"
+              >
+                {updater.checking ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Checking...
+                  </>
+                ) : (
+                  <>
+                    <RefreshCw className="w-4 h-4" />
+                    Check for Updates
+                  </>
+                )}
+              </button>
+            )}
+            {updater.error && (
+              <p className="mt-2 text-sm text-destructive">{updater.error}</p>
+            )}
+            {updater.checked && !updater.available && !updater.checking && !updater.error && (
+              <p className="mt-2 text-sm text-muted-foreground">
+                You're on the latest version.
+              </p>
+            )}
           </div>
 
           <div className="mt-6 pt-6 border-t border-border">

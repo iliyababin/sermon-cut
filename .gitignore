@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-ssr/
+*.local
+
+# Rust/Tauri build
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Binaries (should be downloaded during build)
+binaries/
+
+# Secrets
+src-tauri/resources/youtube_client_secrets.json
+
+# Duplicate/generated model files at wrong path
+src-tauri/yolov8n-pose.onnx
+src-tauri/yolov8n-pose.pt
+
+# Generated thumbnails
+src-tauri/thumbnails/
+
+# Tauri generated schemas
+src-tauri/gen/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+.venv/

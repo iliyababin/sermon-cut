@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { VideoLibrary } from "./components/VideoLibrary";
 import { DownloadForm } from "./components/DownloadForm";
 import { ReviewScreen } from "./components/ReviewScreen";
@@ -13,9 +14,11 @@ type View = "library" | "download" | "review" | "settings";
 export default function App() {
   const [currentView, setCurrentView] = useState<View>("library");
   const [selectedVideo, setSelectedVideo] = useState<VideoInfo | null>(null);
+  const [appVersion, setAppVersion] = useState("");
   const updater = useUpdater();
 
   useEffect(() => {
+    getVersion().then(setAppVersion);
     updater.checkForUpdates();
   }, []);
 
@@ -81,7 +84,7 @@ export default function App() {
           </div>
         )}
         <div className="p-4 border-t border-border text-sm text-muted-foreground">
-          v0.1.0
+          {appVersion && `v${appVersion}`}
         </div>
       </aside>
 

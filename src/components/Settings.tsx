@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { getSettings, saveSettings, getAppDataDir, resetState, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists } from "@/lib/tauri";
 import type { Settings as SettingsType, YouTubeAuthStatus, PlaylistInfo } from "@/lib/types";
 import { Save, Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle, RefreshCw, Download } from "lucide-react";
@@ -19,11 +20,13 @@ export function Settings() {
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
   const [resetConfirm, setResetConfirm] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
   const updater = useUpdater();
 
   useEffect(() => {
     loadSettings();
     loadYoutubeAuth();
+    getVersion().then(setAppVersion);
   }, []);
 
   async function loadSettings() {
@@ -374,7 +377,7 @@ export function Settings() {
           <div className="space-y-2 text-sm">
             <div className="flex justify-between">
               <span className="text-muted-foreground">Version</span>
-              <span>0.1.0</span>
+              <span>{appVersion}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">Data Directory</span>

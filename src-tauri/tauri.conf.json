@@ -46,7 +46,7 @@
       "open": true
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMyNDYxNjY1NDM1MUY3MTMKUldRVDkxRkRaUlpHd2lCY0NlaXpGUVM1UERpTXNJU0pjU3FTMC9rL2NaNitjSTVoVEFEZk5SZTgK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhDMjI1RDM0RjZFM0M4NTkKUldSWnlPUDJORjBpalBJNU4wcFd0dk5DSEtURHRFNzNDa1l6STZ3Rjl0UXRXY1FXeFk4dDlMZEoK",
       "endpoints": [
         "https://github.com/iliyababin/sermon-cut/releases/latest/download/latest.json"
       ]

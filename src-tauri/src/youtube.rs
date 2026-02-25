@@ -159,8 +159,8 @@ pub async fn start_oauth_flow(credentials: &YouTubeCredentials) -> Result<YouTub
 
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &auth_url])
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", &auth_url])
             .spawn()
             .map_err(|e| format!("Failed to open browser: {}", e))?;
     }

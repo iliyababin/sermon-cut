@@ -105,6 +105,13 @@ pub struct Settings {
     pub youtube_playlist_id: Option<String>,
 }
 
+/// The transcription server (backend/app.py, deployed on Modal).
+pub const DEFAULT_MODAL_API_URL: &str = "https://iliyababin--youtube-clipper-transcribe-audio.us-east.modal.run";
+
+/// The original server, which no longer works (its AI model was retired).
+/// Installs that saved it are moved to the default.
+const RETIRED_MODAL_API_URL: &str = "https://sccyouthcenter--youtube-clipper-transcribe-audio.modal.run";
+
 /// ~/Movies/sermon-cut on macOS, ~/Videos/sermon-cut elsewhere.
 pub fn default_library_dir() -> String {
     dirs::video_dir()
@@ -118,7 +125,7 @@ impl Default for Settings {
         Self {
             download_quality: "best".to_string(),
             output_folder: default_library_dir(),
-            modal_api_url: "https://sccyouthcenter--youtube-clipper-transcribe-audio.modal.run".to_string(),
+            modal_api_url: DEFAULT_MODAL_API_URL.to_string(),
             modal_api_key: None,
             logo_path: None,
             youtube_auth: None,
@@ -174,8 +181,12 @@ impl AppState {
         match std::fs::read(&path) {
             Ok(contents) => match serde_json::from_slice::<PersistedState>(&contents) {
                 Ok(persisted) => {
+                    let mut settings = persisted.settings.unwrap_or_default();
+                    if settings.modal_api_url.trim_end_matches('/') == RETIRED_MODAL_API_URL {
+                        settings.modal_api_url = DEFAULT_MODAL_API_URL.to_string();
+                    }
                     return AppState {
-                        settings: persisted.settings.unwrap_or_default(),
+                        settings,
                         legacy_videos: persisted.videos,
                         notices: persisted.notices,
                     };

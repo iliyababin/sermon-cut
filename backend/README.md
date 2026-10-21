@@ -24,9 +24,10 @@ Deploy prints your endpoint URL:
 https://<your-workspace>--youtube-clipper-transcribe-audio.modal.run
 ```
 
-Paste that into the desktop app under **Settings → Modal API URL**. The default
-baked into the app points at the `sccyouthcenter` workspace, so a new
-deployment has to be set there.
+The app's default (`DEFAULT_MODAL_API_URL` in `src-tauri/src/state.rs`) points at
+`https://iliyababin--youtube-clipper-transcribe-audio.us-east.modal.run`. If you
+deploy somewhere else, paste your URL into **Settings → Modal API URL**, or
+change that constant.
 
 `modal serve app.py` instead of `deploy` gives you a hot-reloading temporary
 URL for development.

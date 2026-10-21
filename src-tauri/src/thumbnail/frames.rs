@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use std::path::{Path, PathBuf};
 
 /// Format seconds as HH:MM:SS.mmm for ffmpeg.
@@ -37,35 +38,41 @@ pub async fn extract_candidate_frames(
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create frame output directory: {}", e))?;
 
-    let mut frames = Vec::new();
-
-    for i in 0..count {
+    // Grab frames a few at a time. Each grab is its own ffmpeg (seek, decode
+    // one frame); 4K HEVC decoding is the slow part, so overlapping them helps.
+    // JPEG at top quality instead of PNG: a 4K PNG is ~20 MB and takes ~1.5 s
+    // to write (and as long again to read back), a JPEG ~0.2 MB and ~0.2 s.
+    let jobs = (0..count).map(|i| {
         let timestamp = sample_start + (i as f64 * interval);
-        let frame_path = output_dir.join(format!("frame_{:03}_{:.0}s.png", i, timestamp));
-
-        let output = crate::tools::command("ffmpeg")
-            .args([
-                "-ss",
-                &format_time(timestamp),
-                "-i",
-                video_path,
-                "-vframes",
-                "1",
-                "-y",
-                frame_path.to_str().unwrap_or("frame.png"),
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() && frame_path.exists() => {
-                frames.push((timestamp, frame_path));
-            }
-            _ => {
+        let frame_path = output_dir.join(format!("frame_{:03}_{:.0}s.jpg", i, timestamp));
+        async move {
+            let output = crate::tools::command("ffmpeg")
+                .args([
+                    "-ss",
+                    &format_time(timestamp),
+                    "-i",
+                    video_path,
+                    "-vframes",
+                    "1",
+                    "-q:v",
+                    "2",
+                    "-y",
+                    frame_path.to_str().unwrap_or("frame.jpg"),
+                ])
+                .output()
+                .await;
+            match output {
+                Ok(o) if o.status.success() && frame_path.exists() => Some((timestamp, frame_path)),
                 // Frame extraction failed for this timestamp, skip
+                _ => None,
             }
         }
-    }
+    });
+    let frames: Vec<(f64, PathBuf)> = futures::stream::iter(jobs)
+        .buffered(4)
+        .filter_map(|f| async move { f })
+        .collect()
+        .await;
 
     if frames.is_empty() {
         return Err("No frames could be extracted from the video".to_string());

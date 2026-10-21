@@ -10,7 +10,7 @@ recording.
 Needs one workspace secret named `openrouter-api-key`:
 
     OPENROUTER_API_KEY   (required)  your OpenRouter key
-    ANALYSIS_MODEL       (optional)  defaults to anthropic/claude-sonnet-4
+    ANALYSIS_MODEL       (optional)  defaults to anthropic/claude-sonnet-5.5
     WHISPER_MODEL        (optional)  defaults to large-v3-turbo
     API_TOKEN            (optional)  if set, callers must send
                                      `Authorization: Bearer <token>`
@@ -105,14 +105,15 @@ SERMON_SCHEMA = {
 CORS = {"Access-Control-Allow-Origin": "*"}
 
 
-def parse_time_to_seconds(time_str: str) -> int:
-    """Convert HH:MM:SS or MM:SS to seconds."""
-    parts = time_str.split(":")
-    if len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-    if len(parts) == 2:
-        return int(parts[0]) * 60 + int(parts[1])
-    return int(parts[0])
+def parse_time_to_seconds(time_str: str):
+    """Convert HH:MM:SS or MM:SS to seconds. None if it isn't a time."""
+    try:
+        seconds = 0.0
+        for part in str(time_str).strip().split(":"):
+            seconds = seconds * 60 + float(part)
+        return int(seconds)
+    except ValueError:
+        return None
 
 
 def fail(message: str, status: int = 500):
@@ -158,7 +159,7 @@ def analyze(segments: list) -> dict:
         for s in segments
     )
 
-    model_name = os.environ.get("ANALYSIS_MODEL", "anthropic/claude-sonnet-4")
+    model_name = os.environ.get("ANALYSIS_MODEL", "anthropic/claude-sonnet-5.5")
     print(f"[INFO] Analyzing transcript with {model_name}...")
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -224,9 +225,11 @@ def transcribe_audio(data: dict, authorization: str = Header(None)):
 
         chapters = None
         if analysis.get("chapters"):
+            # Skip malformed chapters rather than failing after transcription.
             chapters = [
                 {"time": parse_time_to_seconds(ch[0]), "title": ch[1]}
                 for ch in analysis["chapters"]
+                if len(ch) >= 2 and parse_time_to_seconds(ch[0]) is not None
             ]
 
         def seconds(key):

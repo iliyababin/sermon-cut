@@ -38,7 +38,7 @@ All optional, all set as extra keys on the same secret:
 | Key | Default | Purpose |
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | **required** |
-| `ANALYSIS_MODEL` | `anthropic/claude-sonnet-4` | any OpenRouter model id |
+| `ANALYSIS_MODEL` | `anthropic/claude-sonnet-5.5` | any OpenRouter model id |
 | `WHISPER_MODEL` | `large-v3-turbo` | any faster-whisper model |
 | `API_TOKEN` | unset | if set, callers must send `Authorization: Bearer <token>` |
 
@@ -47,7 +47,7 @@ To change one, recreate the secret with every key you want:
 ```bash
 modal secret create openrouter-api-key --force \
   OPENROUTER_API_KEY=sk-or-v1-... \
-  ANALYSIS_MODEL=anthropic/claude-sonnet-4.5
+  ANALYSIS_MODEL=anthropic/claude-sonnet-5.5
 ```
 
 **On `API_TOKEN`:** leave it unset and the endpoint is public — anyone with the
@@ -63,7 +63,7 @@ To retarget the analysis at a different kind of service, edit
 
 16kHz mono PCM WAV works best; that's what the desktop app sends
 (`ffmpeg -vn -acodec pcm_s16le -ar 16000 -ac 1`). The app caps uploads at
-300 MB.
+200 MB.
 
 ```json
 {

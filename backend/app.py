@@ -29,8 +29,10 @@ app = modal.App("youtube-clipper")
 GPU = "T4"
 TIMEOUT = 1800  # 30 min — long services take a while
 
+# faster-whisper (CTranslate2) needs CUDA 12's cuBLAS and cuDNN 9 at runtime,
+# which a plain debian_slim image doesn't have.
 image = (
-    modal.Image.debian_slim()
+    modal.Image.from_registry("nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04", add_python="3.11")
     .apt_install("ffmpeg")
     .pip_install("faster-whisper", "openai", "fastapi")
 )

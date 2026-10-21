@@ -310,27 +310,53 @@ pub async fn youtube_list_playlists(
     crate::youtube::list_playlists(&access_token).await
 }
 
+/// Working folder for the standalone Thumbnail tab, in the app's data folder
+/// (covered by the `$APPDATA/**` asset scope), so it works without a library.
+fn standalone_dir(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Can't find the app data folder: {}", e))?
+        .join("standalone-thumbnails");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+    Ok(dir)
+}
+
 /// Crop an arbitrary image for the standalone Thumbnail tab.
 ///
 /// The library-backed `process_custom_thumbnail` needs a real video id; this
 /// one works on any file the user picks. Grading and the logo overlay are
 /// skipped on purpose — the template system draws those in the webview.
+/// Only the latest result matters ("Save As" copies it out), so earlier
+/// files are cleared first.
 #[tauri::command]
 pub async fn crop_standalone_thumbnail(
-    state: State<'_, AppStateHandle>,
+    app_handle: AppHandle,
     source_image_path: String,
     crop_rect: crate::thumbnail::CropRect,
 ) -> Result<String, String> {
-    let output_dir = {
-        let guard = state.lock().await;
-        guard.settings.library_folder()
-    };
-    let dir = Path::new(&output_dir).join("thumbnails");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create thumbnails directory: {}", e))?;
-
+    let dir = standalone_dir(&app_handle)?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     crate::thumbnail::process_custom_thumbnail(&source_image_path, &dir, &crop_rect, false, None)
         .await
+}
+
+/// Save a thumbnail rendered in the Thumbnail tab, as the PNG it is.
+#[tauri::command]
+pub async fn save_standalone_thumbnail(
+    app_handle: AppHandle,
+    image_data: Vec<u8>,
+) -> Result<String, String> {
+    let path = standalone_dir(&app_handle)?.join(format!(
+        "thumbnail_{}.png",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    std::fs::write(&path, &image_data).map_err(|e| format!("Failed to save thumbnail: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// Copy a file, creating the destination's parent directory if needed.

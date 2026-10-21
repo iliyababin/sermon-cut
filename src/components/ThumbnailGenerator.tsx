@@ -18,7 +18,7 @@ import { splitTitleIntoLines } from "@/lib/utils";
 import {
   readImageBase64,
   cropStandaloneThumbnail,
-  saveRenderedThumbnail,
+  saveStandaloneThumbnail,
   copyFile,
 } from "@/lib/tauri";
 
@@ -122,9 +122,8 @@ export function ThumbnailGenerator() {
         speakerName.trim(),
       );
 
-      // 3. Save the final composited thumbnail
-      const filename = `standalone_${Date.now()}.png`;
-      const path = await saveRenderedThumbnail("standalone", imageData, filename);
+      // 3. Save the final composited thumbnail (not tied to a library video)
+      const path = await saveStandaloneThumbnail(imageData);
       setSavedPath(path);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

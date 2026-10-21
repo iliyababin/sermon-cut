@@ -164,6 +164,11 @@ async fn run_pipeline(
         let fallback_crop = crop::calculate_fallback_crop(img.width(), img.height());
 
         let mut cropped = crop_image(&img, &fallback_crop);
+        // Crop-only variant for the template overlays (see the main loop).
+        if count > 1 {
+            let raw_path = output_dir.join(format!("{}thumbnail_option_1_raw.jpg", output_stem));
+            save_jpeg(&cropped, &raw_path)?;
+        }
         grading::apply_color_grading(&mut cropped);
         if let Some(lp) = logo_path {
             logo::apply_logo_overlay(&mut cropped, lp);

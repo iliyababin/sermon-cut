@@ -213,6 +213,11 @@ export async function cropStandaloneThumbnail(
   return invoke("crop_standalone_thumbnail", { sourceImagePath, cropRect });
 }
 
+/** Save a Thumbnail-tab render (PNG bytes); resolves with its path. */
+export async function saveStandaloneThumbnail(imageData: Uint8Array): Promise<string> {
+  return invoke("save_standalone_thumbnail", { imageData: Array.from(imageData) });
+}
+
 export async function copyFile(
   source: string,
   destination: string,

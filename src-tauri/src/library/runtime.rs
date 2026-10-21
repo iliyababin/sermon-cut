@@ -1121,8 +1121,9 @@ impl Library {
             let dir = paths.ensure_video_dir(id)?;
             let mut data = manifest::load_video_data(&dir);
             data.review = review;
-            if let Some(selected) = selected_thumbnail {
-                let name = file_in_dir(&dir, &selected)?;
+            // A selection that's no longer a file here (e.g. an overlay render
+            // replaced it mid-edit) is ignored rather than losing the text edits.
+            if let Some(name) = selected_thumbnail.and_then(|sel| file_in_dir(&dir, &sel).ok()) {
                 data.selected_thumbnail = Some(name);
             }
             manifest::save_video_data(&dir, &data)
@@ -1187,7 +1188,9 @@ impl Library {
             let _g = self.inner();
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for f in entries.flatten() {
-                    if f.file_name().to_string_lossy().starts_with("thumbnail_option_") {
+                    let n = f.file_name().to_string_lossy().to_string();
+                    // Overlays rendered from the old options are stale too.
+                    if n.starts_with("thumbnail_option_") || n.starts_with(RENDERED_PREFIX) {
                         let _ = std::fs::remove_file(f.path());
                     }
                 }
@@ -1231,21 +1234,6 @@ impl Library {
             let name = file_in_dir(&dir, &path)?;
             let _g = self.inner();
             let mut data = manifest::load_video_data(&dir);
-
-            // Each render writes a fresh timestamped file so the webview can't
-            // serve a cached image. Drop the previous render's files and
-            // manifest entries so neither grows without bound.
-            let superseded: Vec<String> = data
-                .thumbnail_options
-                .iter()
-                .filter(|n| n.starts_with(RENDERED_PREFIX) && *n != &name)
-                .cloned()
-                .collect();
-            for old in &superseded {
-                let _ = std::fs::remove_file(dir.join(old));
-            }
-            data.thumbnail_options.retain(|n| !superseded.contains(n));
-
             if !data.thumbnail_options.contains(&name) {
                 data.thumbnail_options.insert(0, name.clone());
             }
@@ -1270,12 +1258,28 @@ impl Library {
         let (paths, _entry, _data) = self.begin_op(id)?;
         let result = async {
             let dir = paths.ensure_video_dir(id)?;
-            let name = sanitize_filename(&filename)?;
+            let name = rendered_file_name(&filename)?;
             let out_path = dir.join(&name);
             crate::thumbnail::save_png_as_jpeg(&png_bytes, &out_path)?;
 
             let _g = self.inner();
             let mut data = manifest::load_video_data(&dir);
+
+            // Each render pass writes fresh timestamped files (the webview
+            // caches images by path) and saves them one at a time. Drop files
+            // from earlier passes, but not this pass's siblings.
+            let batch = render_batch(&name);
+            let superseded: Vec<String> = data
+                .thumbnail_options
+                .iter()
+                .filter(|n| n.starts_with(RENDERED_PREFIX) && render_batch(n) != batch)
+                .cloned()
+                .collect();
+            for old in &superseded {
+                let _ = std::fs::remove_file(dir.join(old));
+            }
+            data.thumbnail_options.retain(|n| !superseded.contains(n));
+
             if !data.thumbnail_options.contains(&name) {
                 data.thumbnail_options.insert(0, name.clone());
             }
@@ -1454,20 +1458,27 @@ pub struct UploadJob {
 /// Filename prefix for thumbnails rendered by the template system.
 const RENDERED_PREFIX: &str = "thumbnail_rendered_";
 
-/// Accept only a bare filename, so a rendered thumbnail can't be written
-/// outside the video's own folder.
-fn sanitize_filename(name: &str) -> Result<String, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Thumbnail filename is empty".to_string());
-    }
-    if Path::new(trimmed).components().count() != 1
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-    {
+/// Name for a rendered thumbnail: a plain file name in the video's folder,
+/// always with the rendered prefix (so cleanup can find it) and .jpg (it is
+/// re-encoded as JPEG).
+fn rendered_file_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if !super::is_valid_file_name(name) {
         return Err(format!("Invalid thumbnail filename: {}", name));
     }
-    Ok(trimmed.to_string())
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stem = stem.strip_prefix(RENDERED_PREFIX).unwrap_or(&stem);
+    Ok(format!("{}{}.jpg", RENDERED_PREFIX, stem))
+}
+
+/// The render pass a rendered thumbnail belongs to: the timestamp after the
+/// last underscore ("thumbnail_rendered_3_1729530000000.jpg" → "1729530000000").
+fn render_batch(name: &str) -> &str {
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    stem.rsplit_once('_').map_or(stem, |(_, b)| b)
 }
 
 /// Resolve a path the frontend sent back to a file directly inside `dir`.
@@ -1583,6 +1594,18 @@ mod tests {
         assert_eq!(std::fs::read(root.join("A [x].mp4")).unwrap(), b"existing");
         assert_eq!(std::fs::read(root.join(&name)).unwrap(), b"new");
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn rendered_names_are_safe_and_batched() {
+        assert_eq!(rendered_file_name("thumbnail_rendered_1_123.jpg").unwrap(), "thumbnail_rendered_1_123.jpg");
+        assert_eq!(rendered_file_name("x_9.png").unwrap(), "thumbnail_rendered_x_9.jpg");
+        for bad in ["..", "../x.jpg", "a/b.jpg", ".hidden.jpg", ""] {
+            assert!(rendered_file_name(bad).is_err(), "{bad}");
+        }
+        assert_eq!(render_batch("thumbnail_rendered_3_1729530000000.jpg"), "1729530000000");
+        assert_eq!(render_batch("thumbnail_rendered_10_1729530000000.jpg"), render_batch("thumbnail_rendered_1_1729530000000.jpg"));
+        assert_ne!(render_batch("thumbnail_rendered_1_1.jpg"), render_batch("thumbnail_rendered_1_2.jpg"));
     }
 
     #[test]

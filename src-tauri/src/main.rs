@@ -105,6 +105,7 @@ fn main() {
             library::commands::process_custom_thumbnail,
             library::commands::save_rendered_thumbnail,
             commands::crop_standalone_thumbnail,
+            commands::save_standalone_thumbnail,
             commands::copy_file,
             library::commands::reveal_video,
             library::commands::open_library_folder,

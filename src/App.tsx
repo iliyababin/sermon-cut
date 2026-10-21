@@ -27,7 +27,7 @@ export default function App() {
 
   const handleVideoSelect = async (video: LibraryVideo) => {
     // Only processed videos have something to review
-    if (video.status !== "ready_for_review" && video.status !== "done") return;
+    if (video.status !== "ready_for_review" && video.status !== "done" && video.status !== "uploading") return;
     try {
       setSelectedVideo(await getVideo(video.id));
       setReviewKey((k) => k + 1);

@@ -237,17 +237,21 @@ pub async fn youtube_upload_video(
     let job = lib.begin_upload(&video_id, thumbnail_path)?;
     changed(&app_handle);
 
-    let result = async {
+    let result: Result<String, String> = async {
         let privacy = privacy.unwrap_or_else(|| "unlisted".to_string());
         let access_token = crate::commands::fresh_access_token(&state, &app_handle).await?;
 
+        let on_progress = |percent: u32, status: &str| {
+            lib.set_upload_progress(&video_id, percent);
+            emit_upload(&app_handle, &video_id, percent, status, None, None);
+        };
         let upload_result = youtube::upload_video(
             &access_token,
             &job.video_path.to_string_lossy(),
             &title,
             &description,
             &privacy,
-            Some(&app_handle),
+            &on_progress,
         )
         .await?;
         let uploaded_id = upload_result.id.clone();
@@ -285,8 +289,28 @@ pub async fn youtube_upload_video(
     .await;
 
     lib.finish_upload(&video_id, &job.file_hash, result.as_deref().ok());
+    // Final word for any screen showing this upload, including a review
+    // screen reopened after the one that started it went away.
+    match &result {
+        Ok(url) => emit_upload(&app_handle, &video_id, 100, "done", Some(url.as_str()), None),
+        Err(e) => emit_upload(&app_handle, &video_id, 0, "error", None, Some(e.as_str())),
+    }
     changed(&app_handle);
     result
+}
+
+/// `youtube-upload-progress` event, tagged with the library video.
+fn emit_upload(app: &AppHandle, video_id: &str, progress: u32, status: &str, url: Option<&str>, error: Option<&str>) {
+    let _ = app.emit(
+        "youtube-upload-progress",
+        serde_json::json!({
+            "video_id": video_id,
+            "progress": progress,
+            "status": status,
+            "url": url,
+            "error": error,
+        }),
+    );
 }
 
 /// Warnings about where the library lives, for Settings.

@@ -61,6 +61,8 @@ struct Inner {
     running: Option<Running>,
     /// Entries with an upload, trash or thumbnail operation in flight.
     busy: HashSet<String>,
+    /// YouTube uploads in flight: entry id → percent.
+    uploads: std::collections::HashMap<String, u32>,
     downloads: Vec<DownloadItem>,
     session: String,
     notice: Option<String>,
@@ -84,6 +86,7 @@ pub enum ViewStatus {
     TooLong,
     Queued,
     Processing,
+    Uploading,
     ReadyForReview,
     Done,
     Error,
@@ -110,6 +113,8 @@ pub struct LibraryVideo {
     pub processing_stage: Option<ProcessingStage>,
     pub processing_progress: Option<f32>,
     pub processing_message: Option<String>,
+    /// Percent of a YouTube upload in progress.
+    pub upload_progress: Option<u32>,
     /// Whether Hide/Trash/Reset are allowed right now.
     pub busy: bool,
 }
@@ -244,6 +249,9 @@ impl Inner {
         if self.queue.iter().any(|q| q == &e.id) {
             return ViewStatus::Queued;
         }
+        if self.uploads.contains_key(&e.id) {
+            return ViewStatus::Uploading;
+        }
         if self.scanned && !self.present(&e.id) {
             return ViewStatus::Missing;
         }
@@ -268,7 +276,7 @@ impl Inner {
         let paths = self.paths.as_ref();
         let status = self.status_of(e);
         let thumbnail = match (status, paths.and_then(|p| p.video_dir(&e.id).ok())) {
-            (ViewStatus::ReadyForReview | ViewStatus::Done | ViewStatus::Error | ViewStatus::Missing, Some(dir)) => {
+            (ViewStatus::ReadyForReview | ViewStatus::Uploading | ViewStatus::Done | ViewStatus::Error | ViewStatus::Missing, Some(dir)) => {
                 let data = manifest::load_video_data(&dir);
                 data.selected_thumbnail
                     .or_else(|| data.thumbnail_options.first().cloned())
@@ -300,6 +308,7 @@ impl Inner {
             processing_stage: running.map(|r| r.stage.clone()),
             processing_progress: running.map(|r| r.progress),
             processing_message: running.map(|r| r.message.clone()),
+            upload_progress: self.uploads.get(&e.id).copied(),
             busy: self.is_busy(&e.id),
         }
     }
@@ -328,6 +337,7 @@ impl Inner {
             processing_stage: None,
             processing_progress: None,
             processing_message: None,
+            upload_progress: None,
             busy: true,
         }
     }
@@ -454,6 +464,7 @@ impl Library {
                 queue: VecDeque::new(),
                 running: None,
                 busy: HashSet::new(),
+                uploads: std::collections::HashMap::new(),
                 downloads: Vec::new(),
                 session: super::new_id(),
                 notice: None,
@@ -1316,15 +1327,25 @@ impl Library {
             })
         };
         let job = prepare();
-        if job.is_err() {
-            self.end_op(id);
+        match &job {
+            Ok(_) => {
+                self.inner().uploads.insert(id.to_string(), 0);
+            }
+            Err(_) => self.end_op(id),
         }
         job
+    }
+
+    pub fn set_upload_progress(&self, id: &str, percent: u32) {
+        if let Some(p) = self.inner().uploads.get_mut(id) {
+            *p = percent;
+        }
     }
 
     pub fn finish_upload(&self, id: &str, file_hash: &str, url: Option<&str>) {
         let mut g = self.inner();
         g.busy.remove(id);
+        g.uploads.remove(id);
         let Some(url) = url else { return };
         if let Ok(e) = g.entry_mut(id) {
             e.uploads.push(UploadRecord {
@@ -1336,6 +1357,25 @@ impl Library {
             e.error = None;
         }
         g.save_logged();
+    }
+
+    /// What would be lost by quitting now, for the quit warning.
+    pub fn work_in_progress(&self) -> Option<String> {
+        let g = self.inner();
+        let mut parts = Vec::new();
+        if !g.uploads.is_empty() {
+            parts.push(match g.uploads.len() {
+                1 => "a YouTube upload".to_string(),
+                n => format!("{} YouTube uploads", n),
+            });
+        }
+        if g.running.is_some() || !g.queue.is_empty() {
+            parts.push("video processing".to_string());
+        }
+        if !g.downloads.is_empty() {
+            parts.push("a download".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join(" and "))
     }
 
     pub fn reveal_path(&self, id: &str) -> Result<PathBuf, String> {
@@ -1594,6 +1634,57 @@ mod tests {
         assert_eq!(std::fs::read(root.join("A [x].mp4")).unwrap(), b"existing");
         assert_eq!(std::fs::read(root.join(&name)).unwrap(), b"new");
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn upload_is_tracked_until_it_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.mp4"), b"video").unwrap();
+        let lib = Library::new(root.to_string_lossy().to_string());
+        lib.open_blocking(false);
+        let id = {
+            let mut g = lib.inner();
+            let fp = fsutil::fingerprint(&root.join("a.mp4")).unwrap();
+            let mut e = Entry::new("a.mp4".into(), fp, Some(60.0));
+            e.status = EntryStatus::ReadyForReview;
+            let id = e.id.clone();
+            g.manifest.entries.push(e);
+            g.last.present.insert(id.clone());
+            g.scanned = true;
+            id
+        };
+        assert!(lib.work_in_progress().is_none());
+
+        let job = lib.begin_upload(&id, None).unwrap();
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.status, ViewStatus::Uploading);
+        assert_eq!(v.upload_progress, Some(0));
+        assert!(v.busy);
+        assert_eq!(lib.work_in_progress().as_deref(), Some("a YouTube upload"));
+        // A second upload, a reset or a trash can't start meanwhile.
+        assert!(lib.begin_upload(&id, None).is_err());
+        assert!(lib.reset(&id).is_err());
+
+        lib.set_upload_progress(&id, 42);
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.upload_progress, Some(42));
+
+        lib.finish_upload(&id, &job.file_hash, Some("https://youtube.com/watch?v=x"));
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.status, ViewStatus::Done);
+        assert_eq!(v.upload_progress, None);
+        assert_eq!(v.uploads.len(), 1);
+        assert!(lib.work_in_progress().is_none());
+
+        // A failed upload goes back to how it was, with nothing recorded.
+        let job = lib.begin_upload(&id, None).unwrap();
+        lib.finish_upload(&id, &job.file_hash, None);
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.status, ViewStatus::Done);
+        assert_eq!(v.uploads.len(), 1);
+        assert!(!v.busy);
     }
 
     #[test]

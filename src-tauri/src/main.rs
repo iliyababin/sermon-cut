@@ -12,9 +12,44 @@ mod youtube;
 
 use library::runtime::Library;
 use state::AppState;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tokio::sync::Mutex;
+
+/// Set once the user chose "Quit Anyway", so the exit that follows isn't asked about again.
+static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
+
+/// Before quitting mid-upload (or mid-processing/download), ask first.
+/// Returns true if quitting should wait for the user's answer.
+fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
+    if QUIT_CONFIRMED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Some(work) = library.work_in_progress() else {
+        return false;
+    };
+    let app = app.clone();
+    app.dialog()
+        .message(format!(
+            "Sermon Cut is still working on {}. Quitting now stops it, and it will have to start over.",
+            work
+        ))
+        .title("Quit Sermon Cut?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom("Quit Anyway".into(), "Keep Working".into()))
+        .show({
+            let app = app.clone();
+            move |quit| {
+                if quit {
+                    QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                    app.exit(0);
+                }
+            }
+        });
+    true
+}
 
 fn main() {
     tools::extend_path();
@@ -37,6 +72,20 @@ fn main() {
             let app_state = app_state.clone();
             move |app| {
                 let handle = app.handle().clone();
+                #[cfg(target_os = "macos")]
+                {
+                    use tauri::menu::{Menu, MenuItem, MenuItemKind};
+                    let menu = Menu::default(&handle)?;
+                    if let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.into_iter().next() {
+                        // The default app menu ends with the built-in Quit.
+                        let count = app_menu.items()?.len();
+                        if count > 0 {
+                            app_menu.remove_at(count - 1)?;
+                        }
+                        app_menu.append(&MenuItem::with_id(&handle, "quit", "Quit Sermon Cut", true, Some("CmdOrCtrl+Q"))?)?;
+                    }
+                    app.set_menu(menu)?;
+                }
                 tauri::async_runtime::spawn(tools::update_ytdlp_if_stale());
                 tauri::async_runtime::spawn({
                     let library = library.clone();
@@ -69,6 +118,27 @@ fn main() {
                     }
                 });
                 Ok(())
+            }
+        })
+        // ⌘Q: macOS's built-in Quit item can't be stopped once chosen (tao only
+        // hears about it after the fact), so the app menu gets its own Quit
+        // item that asks first. Closing the window is handled below.
+        .on_menu_event({
+            let library = library.clone();
+            move |app, event| {
+                if event.id() == "quit" && !ask_before_quitting(app, &library) {
+                    app.exit(0);
+                }
+            }
+        })
+        .on_window_event({
+            let library = library.clone();
+            move |window, event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    if ask_before_quitting(window.app_handle(), &library) {
+                        api.prevent_close();
+                    }
+                }
             }
         })
         .plugin(tauri_plugin_dialog::init())
@@ -120,9 +190,14 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(move |_app, event| {
-        if let tauri::RunEvent::Exit = event {
-            library.release_lock();
+    app.run(move |app, event| match event {
+        // Anything else that asks the app to exit (e.g. closing the last window).
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            if ask_before_quitting(app, &library) {
+                api.prevent_exit();
+            }
         }
+        tauri::RunEvent::Exit => library.release_lock(),
+        _ => {}
     });
 }

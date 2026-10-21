@@ -157,8 +157,10 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
 
   // Upload state
   const [youtubeAuth, setYoutubeAuth] = useState<YouTubeAuthStatus | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
+  // The upload runs in the background; if this screen was reopened while one
+  // is going, pick it up from the library's state.
+  const [isUploading, setIsUploading] = useState(video.status === "uploading");
+  const [uploadProgress, setUploadProgress] = useState(video.upload_progress ?? 0);
   const lastUpload = video.uploads[video.uploads.length - 1];
   const [uploadedUrl, setUploadedUrl] = useState<string | null>(
     video.status === "done" && lastUpload ? lastUpload.url : null
@@ -208,12 +210,27 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
 
   // Listen for upload progress
   useEffect(() => {
-    const unlisten = listen<{ progress: number; status: string }>(
-      "youtube-upload-progress",
-      (event) => {
-        setUploadProgress((prev) => Math.max(prev, event.payload.progress));
+    const unlisten = listen<{
+      video_id: string;
+      progress: number;
+      status: string;
+      url: string | null;
+      error: string | null;
+    }>("youtube-upload-progress", (event) => {
+      const e = event.payload;
+      if (e.video_id !== video.id) return;
+      if (e.status === "done" && e.url) {
+        setUploadedUrl(e.url);
+        setUploadCount((n) => n + 1);
+        setIsUploading(false);
+      } else if (e.status === "error") {
+        setUploadError(e.error || "Upload failed");
+        setIsUploading(false);
+      } else {
+        setIsUploading(true);
+        setUploadProgress((prev) => Math.max(prev, e.progress));
       }
-    );
+    });
 
     return () => {
       unlisten.then((fn) => fn());
@@ -319,8 +336,8 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
         startTime,   // trim start for caption adjustment
         endTime      // trim end for caption adjustment
       );
+      // The "done" event also sets this (and counts the upload).
       setUploadedUrl(url);
-      setUploadCount((n) => n + 1);
       setIsUploading(false);
     } catch (err) {
       console.error("Upload failed:", err);

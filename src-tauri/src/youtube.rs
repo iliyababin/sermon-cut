@@ -1,7 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::Emitter;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -330,7 +329,7 @@ pub async fn upload_video(
     title: &str,
     description: &str,
     privacy: &str,
-    app_handle: Option<&tauri::AppHandle>,
+    on_progress: &(dyn Fn(u32, &str) + Send + Sync),
 ) -> Result<UploadResponse, String> {
     let client = Client::new();
 
@@ -342,12 +341,7 @@ pub async fn upload_video(
     println!("[youtube] Starting upload: {} ({:.1} MB)", video_path, file_size as f64 / 1024.0 / 1024.0);
 
     // Emit initial progress
-    if let Some(handle) = app_handle {
-        let _ = handle.emit("youtube-upload-progress", serde_json::json!({
-            "progress": 0,
-            "status": "preparing"
-        }));
-    }
+    on_progress(0, "preparing");
 
     // Create metadata for resumable upload
     let metadata = VideoMetadata {
@@ -465,32 +459,17 @@ pub async fn upload_video(
             uploaded = chunk_end;
             let progress = ((uploaded as f64 / file_size as f64) * 95.0) as u32;
 
-            if let Some(handle) = app_handle {
-                let _ = handle.emit("youtube-upload-progress", serde_json::json!({
-                    "progress": progress,
-                    "status": "uploading"
-                }));
-            }
+            on_progress(progress, "uploading");
         } else if status.is_success() {
             // Upload complete
-            if let Some(handle) = app_handle {
-                let _ = handle.emit("youtube-upload-progress", serde_json::json!({
-                    "progress": 98,
-                    "status": "processing"
-                }));
-            }
+            on_progress(98, "processing");
 
             let upload_response: UploadResponse = chunk_response
                 .json()
                 .await
                 .map_err(|e| format!("Failed to parse upload response: {}", e))?;
 
-            if let Some(handle) = app_handle {
-                let _ = handle.emit("youtube-upload-progress", serde_json::json!({
-                    "progress": 100,
-                    "status": "complete"
-                }));
-            }
+            on_progress(100, "complete");
 
             println!("[youtube] Video uploaded successfully: {}", upload_response.id);
             return Ok(upload_response);

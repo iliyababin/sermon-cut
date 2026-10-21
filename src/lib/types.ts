@@ -40,6 +40,7 @@ export type LibraryStatus =
   | "too_long"
   | "queued"
   | "processing"
+  | "uploading"
   | "ready_for_review"
   | "done"
   | "error"
@@ -70,6 +71,8 @@ export interface LibraryVideo {
   processing_stage: ProcessingStage | null;
   processing_progress: number | null;
   processing_message: string | null;
+  /** Percent of a YouTube upload in progress. */
+  upload_progress: number | null;
   busy: boolean;
 }
 

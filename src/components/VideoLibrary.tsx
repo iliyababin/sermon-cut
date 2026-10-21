@@ -50,6 +50,12 @@ interface DownloadProgress {
   status: string;
 }
 
+interface UploadProgress {
+  video_id: string;
+  progress: number;
+  status: string;
+}
+
 interface ProcessingProgress {
   video_id: string;
   stage: ProcessingStage;
@@ -72,6 +78,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [progress, setProgress] = useState<Record<string, ProcessingProgress>>({});
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
+  const [uploads, setUploads] = useState<Record<string, number>>({});
   const scanning = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -121,10 +128,16 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
     const unlistenDownload = listen<DownloadProgress>("download-progress", (event) => {
       setDownloads((prev) => ({ ...prev, [event.payload.video_id]: event.payload }));
     });
+    const unlistenUpload = listen<UploadProgress>("youtube-upload-progress", (event) => {
+      const { video_id, progress, status } = event.payload;
+      setUploads((prev) => ({ ...prev, [video_id]: progress }));
+      if (status === "done" || status === "error") refresh();
+    });
     return () => {
       unlistenChanged.then((fn) => fn());
       unlistenProcessing.then((fn) => fn());
       unlistenDownload.then((fn) => fn());
+      unlistenUpload.then((fn) => fn());
     };
   }, [refresh]);
 
@@ -298,6 +311,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
               key={video.id}
               video={video}
               live={progress[video.id]}
+              uploadPercent={uploads[video.id] ?? video.upload_progress ?? 0}
               writable={library.writable}
               maxMinutes={maxMinutes}
               menuOpen={openMenu === video.id}
@@ -385,6 +399,7 @@ function DownloadCard({ item, progress }: { item: DownloadItem; progress?: Downl
 interface VideoCardProps {
   video: LibraryVideo;
   live?: ProcessingProgress;
+  uploadPercent: number;
   writable: boolean;
   maxMinutes: number;
   menuOpen: boolean;
@@ -401,7 +416,7 @@ interface VideoCardProps {
 
 function VideoCard(props: VideoCardProps) {
   const { video, live, writable, maxMinutes } = props;
-  const reviewable = video.status === "ready_for_review" || video.status === "done";
+  const reviewable = video.status === "ready_for_review" || video.status === "done" || video.status === "uploading";
   const pending = video.id.startsWith("pending:");
   const dimmed = video.status === "missing" || video.status === "copying" || video.status === "unreadable";
   const lastUpload = video.uploads[video.uploads.length - 1];
@@ -451,6 +466,17 @@ function VideoCard(props: VideoCardProps) {
               <div className="h-full bg-orange-500 transition-all duration-300" style={{ width: `${pct}%` }} />
             </div>
             <p className="text-xs text-muted-foreground mt-1">{message}</p>
+          </div>
+        )}
+
+        {video.status === "uploading" && (
+          <div className="mt-2">
+            <div className="h-2 bg-muted rounded-full overflow-hidden">
+              <div className="h-full bg-red-600 transition-all duration-300" style={{ width: `${props.uploadPercent}%` }} />
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Uploading to YouTube… {props.uploadPercent}%. You can keep using the app; don't quit until it's done.
+            </p>
           </div>
         )}
 
@@ -608,6 +634,7 @@ const STATUS: Record<LibraryStatus, { label: string; className: string; icon: "c
   too_long: { label: "Too long", className: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400", icon: "alert" },
   queued: { label: "Queued", className: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400", icon: "clock" },
   processing: { label: "Processing", className: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400", icon: "spin" },
+  uploading: { label: "Uploading", className: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400", icon: "spin" },
   ready_for_review: { label: "Ready for Review", className: "bg-primary/10 text-primary", icon: "eye" },
   done: { label: "Uploaded", className: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400", icon: "check" },
   error: { label: "Error", className: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400", icon: "alert" },

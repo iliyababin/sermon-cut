@@ -56,7 +56,7 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
       const info = await getVideoInfo(url);
       setVideoInfo(info);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch video info");
+      setError(err instanceof Error ? err.message : String(err || "Failed to fetch video info"));
       setVideoInfo(null);
     } finally {
       setLoading(false);
@@ -87,7 +87,7 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
       // Redirect to library immediately
       onGoToLibrary();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Download failed");
+      setError(err instanceof Error ? err.message : String(err || "Download failed"));
       setDownloading(false);
       setIsProcessing(false);
       setDownloadProgress(0);

@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 
 /// Format seconds as HH:MM:SS.mmm for ffmpeg.
 fn format_time(seconds: f64) -> String {
@@ -44,7 +43,7 @@ pub async fn extract_candidate_frames(
         let timestamp = sample_start + (i as f64 * interval);
         let frame_path = output_dir.join(format!("frame_{:03}_{:.0}s.png", i, timestamp));
 
-        let output = Command::new("ffmpeg")
+        let output = crate::tools::command("ffmpeg")
             .args([
                 "-ss",
                 &format_time(timestamp),

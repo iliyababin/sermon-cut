@@ -6,6 +6,7 @@ mod ffmpeg;
 mod modal;
 mod state;
 mod thumbnail;
+mod tools;
 mod youtube;
 
 use state::AppState;
@@ -13,13 +14,23 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 fn main() {
+    tools::extend_path();
+
+    let app_state = AppState::load();
+    let settings = app_state.settings.clone();
+
     tauri::Builder::default()
+        .setup(move |app| {
+            commands::allow_user_paths(app.handle(), &settings);
+            tauri::async_runtime::spawn(tools::update_ytdlp_if_stale());
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .manage(Arc::new(Mutex::new(AppState::load())))
+        .manage(Arc::new(Mutex::new(app_state)))
         .invoke_handler(tauri::generate_handler![
             commands::download_video,
             commands::get_video_info,

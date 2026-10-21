@@ -1,5 +1,4 @@
 use std::path::Path;
-use tokio::process::Command;
 
 /// Extract audio from video file as WAV
 pub async fn extract_audio(video_path: &str, output_dir: &str) -> Result<String, String> {
@@ -31,7 +30,7 @@ pub async fn extract_audio(video_path: &str, output_dir: &str) -> Result<String,
     let video_path_str = video_path.to_str().ok_or("video path contains invalid UTF-8")?;
     let output_path_str = output_path.to_str().ok_or("output path contains invalid UTF-8")?;
 
-    let output = Command::new("ffmpeg")
+    let output = crate::tools::command("ffmpeg")
         .args([
             "-i", video_path_str,
             "-vn",                    // No video
@@ -43,7 +42,7 @@ pub async fn extract_audio(video_path: &str, output_dir: &str) -> Result<String,
         ])
         .output()
         .await
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+        .map_err(|e| crate::tools::spawn_error("ffmpeg", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -106,7 +105,7 @@ pub async fn trim_video(
     let video_path_str = video_path.to_str().ok_or("video path contains invalid UTF-8")?;
     let output_path_str = output_path.to_str().ok_or("output path contains invalid UTF-8")?;
 
-    let output = Command::new("ffmpeg")
+    let output = crate::tools::command("ffmpeg")
         .args([
             "-ss", &format_time(start_time),
             "-i", video_path_str,
@@ -118,7 +117,7 @@ pub async fn trim_video(
         ])
         .output()
         .await
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+        .map_err(|e| crate::tools::spawn_error("ffmpeg", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -130,7 +129,7 @@ pub async fn trim_video(
 
 /// Get video duration in seconds
 pub async fn get_duration(video_path: &str) -> Result<f64, String> {
-    let output = Command::new("ffprobe")
+    let output = crate::tools::command("ffprobe")
         .args([
             "-v", "error",
             "-show_entries", "format=duration",
@@ -139,7 +138,7 @@ pub async fn get_duration(video_path: &str) -> Result<f64, String> {
         ])
         .output()
         .await
-        .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+        .map_err(|e| crate::tools::spawn_error("ffprobe", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -159,7 +158,7 @@ pub async fn extract_frame(
     time: f64,
     output_path: &str,
 ) -> Result<(), String> {
-    let output = Command::new("ffmpeg")
+    let output = crate::tools::command("ffmpeg")
         .args([
             "-ss", &format_time(time),
             "-i", video_path,
@@ -169,7 +168,7 @@ pub async fn extract_frame(
         ])
         .output()
         .await
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+        .map_err(|e| crate::tools::spawn_error("ffmpeg", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

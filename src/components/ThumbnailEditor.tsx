@@ -202,7 +202,7 @@ export function ThumbnailEditor({
       onSave(newThumbnailPath);
     } catch (err) {
       console.error("Failed to process thumbnail:", err);
-      setError(err instanceof Error ? err.message : "Failed to process thumbnail");
+      setError(err instanceof Error ? err.message : String(err || "Failed to process thumbnail"));
     } finally {
       setIsSaving(false);
     }

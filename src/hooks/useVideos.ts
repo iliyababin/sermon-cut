@@ -14,7 +14,7 @@ export function useVideos() {
       setVideos(videoList);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load videos");
+      setError(err instanceof Error ? err.message : String(err || "Failed to load videos"));
     } finally {
       setLoading(false);
     }

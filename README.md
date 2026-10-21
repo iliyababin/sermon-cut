@@ -2,31 +2,31 @@
 
 AI-powered sermon video processing and thumbnail generation. Download YouTube videos, transcribe with AI, trim, generate thumbnails, and upload back to YouTube.
 
-## Download
+## Install on macOS
 
-Grab the latest release for your platform from [Releases](https://github.com/iliyababin/sermon-cut/releases).
+Open **Terminal** (press ⌘ Space, type "Terminal", press Return), paste this line, and press Return:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iliyababin/sermon-cut/main/install.sh | bash
+```
+
+That's it. It takes about a minute and opens Sermon Cut when it's done. It installs:
+
+- **Sermon Cut** into `/Applications`
+- **ffmpeg**, **ffprobe**, **yt-dlp** and **QuickJS** (which yt-dlp needs for YouTube) into `~/Library/Application Support/com.youthscc.sermon-cut/bin`
+
+No Homebrew or admin password needed. The app updates itself, and keeps yt-dlp up to date in the background. If something ever breaks, run the same line again to reinstall everything.
+
+Requires an Apple Silicon Mac (M1 or newer).
+
+## Install on Windows and Linux
+
+Grab the latest release for your platform from [Releases](https://github.com/iliyababin/sermon-cut/releases):
 
 - **Windows:** `.exe` or `.msi` installer
-- **macOS:** `.dmg`
 - **Linux:** `.AppImage` or `.deb`
 
-## Prerequisites
-
-Sermon Cut requires **yt-dlp** and **ffmpeg** to be installed on your system.
-
-### macOS
-
-1. Install [Homebrew](https://brew.sh) (if you don't have it):
-
-   ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-
-2. Install yt-dlp and ffmpeg:
-
-   ```bash
-   brew install yt-dlp ffmpeg
-   ```
+Then install **yt-dlp**, **ffmpeg**, and **Deno** (yt-dlp needs a JavaScript runtime for YouTube).
 
 ### Windows
 
@@ -37,10 +37,10 @@ Sermon Cut requires **yt-dlp** and **ffmpeg** to be installed on your system.
    Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
    ```
 
-2. Install yt-dlp and ffmpeg:
+2. Install yt-dlp, ffmpeg and Deno:
 
    ```powershell
-   scoop install yt-dlp ffmpeg
+   scoop install yt-dlp ffmpeg deno
    ```
 
 ### Linux
@@ -50,14 +50,22 @@ Sermon Cut requires **yt-dlp** and **ffmpeg** to be installed on your system.
 sudo apt install ffmpeg
 sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
 sudo chmod a+rx /usr/local/bin/yt-dlp
+curl -fsSL https://deno.land/install.sh | sh
 ```
 
-## macOS Gatekeeper
+## Developing
 
-Since the app is not code-signed, macOS will block it. After downloading, run:
+Requires Node.js 22+ and Rust (stable).
 
 ```bash
-xattr -cr "/Applications/Sermon Cut.app"
+npm ci
+npm run tauri dev
 ```
 
-Then open the app normally.
+On macOS, run `install.sh` once first so the app can find ffmpeg and yt-dlp (or `brew install ffmpeg yt-dlp deno`).
+
+YouTube sign-in needs `src-tauri/resources/youtube_client_secrets.json`, which CI writes from the `YOUTUBE_CLIENT_SECRETS` secret. Without it everything else still works.
+
+### Releasing
+
+Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, then push a `v*` tag. CI builds every platform into a **draft** release; publish it so the installer and in-app updater pick it up.

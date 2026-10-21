@@ -24,7 +24,7 @@
       "csp": "default-src 'self' ipc: http://ipc.localhost https://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/Videos/**", "$APPDATA/**", "$TEMP/**"]
+        "scope": ["$VIDEO/**", "$HOME/Videos/**", "$APPDATA/**", "$TEMP/**"]
       }
     }
   },
@@ -39,7 +39,10 @@
       "icons/icon.ico"
     ],
     "resources": ["resources/*"],
-    "createUpdaterArtifacts": "v1Compatible"
+    "createUpdaterArtifacts": "v1Compatible",
+    "macOS": {
+      "signingIdentity": "-"
+    }
   },
   "plugins": {
     "shell": {

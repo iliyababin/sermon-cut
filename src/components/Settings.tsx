@@ -179,7 +179,7 @@ export function Settings() {
               </button>
             </div>
             <p className="mt-2 text-sm text-muted-foreground">
-              Default: ~/Videos/sermon-cut
+              Default: Movies/sermon-cut on Mac, Videos/sermon-cut on Windows and Linux
             </p>
           </div>
         </div>

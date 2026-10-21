@@ -90,8 +90,8 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
         },
       }));
 
-      // Reload videos when processing completes
-      if (event.payload.stage === "complete") {
+      // Reload videos when processing completes or fails
+      if (event.payload.stage === "complete" || event.payload.stage === "error") {
         loadVideos();
       }
     });
@@ -109,7 +109,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
       setVideos(videoList);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load videos");
+      setError(err instanceof Error ? err.message : String(err || "Failed to load videos"));
     } finally {
       setLoading(false);
     }
@@ -145,7 +145,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
       }
     } catch (err) {
       console.error("Failed to add local video:", err);
-      setError(err instanceof Error ? err.message : "Failed to add video");
+      setError(err instanceof Error ? err.message : String(err || "Failed to add video"));
     }
   }
 
@@ -306,6 +306,13 @@ function VideoCard({ video, progressInfo, onClick, onDelete }: VideoCardProps) {
               {progressInfo.processingMessage || "Processing..."}
             </p>
           </div>
+        )}
+
+        {/* Processing Error */}
+        {video.status === "error" && progressInfo.processingStage === "error" && progressInfo.processingMessage && (
+          <p className="mt-2 text-xs text-destructive line-clamp-3" title={progressInfo.processingMessage}>
+            {progressInfo.processingMessage}
+          </p>
         )}
       </div>
 

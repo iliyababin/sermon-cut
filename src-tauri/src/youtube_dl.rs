@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::watch;
 
 #[derive(Clone, Serialize)]
@@ -27,7 +26,7 @@ struct YtDlpInfo {
 }
 
 pub async fn get_video_info(url: &str) -> Result<VideoInfo, String> {
-    let output = Command::new("yt-dlp")
+    let output = crate::tools::command("yt-dlp")
         .args([
             "--dump-json",
             "--no-download",
@@ -36,7 +35,7 @@ pub async fn get_video_info(url: &str) -> Result<VideoInfo, String> {
         ])
         .output()
         .await
-        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+        .map_err(|e| crate::tools::spawn_error("yt-dlp", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -104,7 +103,7 @@ pub async fn download_video(
         _ => "bestvideo+bestaudio/best",
     };
 
-    let mut child = Command::new("yt-dlp")
+    let mut child = crate::tools::command("yt-dlp")
         .args([
             "--format", format,
             "--output", output_template_str,
@@ -117,10 +116,25 @@ pub async fn download_video(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to start yt-dlp: {}", e))?;
+        .map_err(|e| crate::tools::spawn_error("yt-dlp", e))?;
 
     let stdout = child.stdout.take().ok_or("Failed to capture yt-dlp stdout")?;
     let mut reader = BufReader::new(stdout).lines();
+
+    // Drain stderr concurrently: if nobody reads it, yt-dlp blocks once the
+    // pipe buffer fills. Keep the tail for the error message.
+    let stderr = child.stderr.take().ok_or("Failed to capture yt-dlp stderr")?;
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut tail = std::collections::VecDeque::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tail.len() == 20 {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        Vec::from(tail).join("\n")
+    });
 
     // Capture the output path
     let mut output_path = String::new();
@@ -191,7 +205,8 @@ pub async fn download_video(
     let status = child.wait().await.map_err(|e| e.to_string())?;
 
     if !status.success() {
-        return Err("Download failed".to_string());
+        let stderr_tail = stderr_task.await.unwrap_or_default();
+        return Err(format!("Download failed: {}", stderr_tail.trim()));
     }
 
     // If we didn't capture the path, try to find it

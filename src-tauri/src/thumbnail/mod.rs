@@ -73,18 +73,11 @@ async fn run_pipeline(
 ) -> Result<Vec<String>, String> {
     let model_path = find_model_path()?;
 
-    // Decide where to put candidate frames
-    let temp_dir_holder;
-    let frame_dir = if count > 1 {
-        let d = output_dir.join("candidates");
-        std::fs::create_dir_all(&d)
-            .map_err(|e| format!("Failed to create candidates dir: {}", e))?;
-        d
-    } else {
-        temp_dir_holder = tempfile::tempdir()
-            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
-        temp_dir_holder.path().to_path_buf()
-    };
+    // Candidate frames are only needed during this run (60 full-size PNGs),
+    // so keep them in a temp dir that's deleted when we return.
+    let temp_dir_holder = tempfile::tempdir()
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    let frame_dir = temp_dir_holder.path().to_path_buf();
 
     // Step 1: Extract candidate frames
     let frame_data =
@@ -195,7 +188,7 @@ async fn run_pipeline(
         // Save raw crop for editor use (multi-thumbnail mode)
         if count > 1 {
             let raw_cropped = crop_image(&img, &person_crop);
-            let raw_path = output_dir.join(format!("thumbnail_option_{}_raw.jpg", idx + 1));
+            let raw_path = output_dir.join(format!("{}_thumbnail_option_{}_raw.jpg", output_stem, idx + 1));
             save_jpeg(&raw_cropped, &raw_path)?;
         }
 
@@ -217,7 +210,7 @@ async fn run_pipeline(
         );
 
         let debug_name = if count > 1 {
-            format!("thumbnail_option_{}_debug.jpg", idx + 1)
+            format!("{}_thumbnail_option_{}_debug.jpg", output_stem, idx + 1)
         } else {
             format!("{}_thumbnail_debug.jpg", output_stem)
         };
@@ -232,7 +225,7 @@ async fn run_pipeline(
         }
 
         let out_name = if count > 1 {
-            format!("thumbnail_option_{}.jpg", idx + 1)
+            format!("{}_thumbnail_option_{}.jpg", output_stem, idx + 1)
         } else {
             format!("{}_thumbnail.jpg", output_stem)
         };

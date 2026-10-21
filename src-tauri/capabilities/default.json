@@ -13,6 +13,7 @@
       "identifier": "fs:allow-read",
       "allow": [
         { "path": "$APPDATA/**" },
+        { "path": "$VIDEO/**" },
         { "path": "$HOME/Videos/**" },
         { "path": "$TEMP/**" }
       ]
@@ -21,6 +22,7 @@
       "identifier": "fs:allow-write",
       "allow": [
         { "path": "$APPDATA/**" },
+        { "path": "$VIDEO/**" },
         { "path": "$HOME/Videos/**" },
         { "path": "$TEMP/**" }
       ]

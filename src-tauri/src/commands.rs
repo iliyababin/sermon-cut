@@ -9,6 +9,41 @@ use tokio::sync::Mutex;
 
 type AppStateHandle = Arc<Mutex<AppState>>;
 
+/// Delete the files the app made for a video. Local videos keep their
+/// original file, since that's the user's own recording.
+fn remove_generated_files(video: &VideoInfo) {
+    let is_local = video.id.starts_with("local_");
+    let paths = [
+        if is_local { None } else { video.file_path.as_ref() },
+        video.audio_path.as_ref(),
+        video.trimmed_path.as_ref(),
+        video.thumbnail_path.as_ref(),
+    ];
+    for path in paths.into_iter().flatten() {
+        let _ = std::fs::remove_file(path);
+    }
+    // Generated options also have _raw (for the editor) and _debug siblings.
+    for path in video.thumbnail_options.iter().flatten() {
+        let _ = std::fs::remove_file(path);
+        if let Some(base) = path.strip_suffix(".jpg") {
+            let _ = std::fs::remove_file(format!("{}_raw.jpg", base));
+            let _ = std::fs::remove_file(format!("{}_debug.jpg", base));
+        }
+    }
+}
+
+/// Let the webview load files (thumbnails, logo) from wherever the user
+/// pointed the app, not just the default folders in tauri.conf.json.
+pub fn allow_user_paths(app_handle: &AppHandle, settings: &Settings) {
+    let scope = app_handle.asset_protocol_scope();
+    if !settings.output_folder.is_empty() {
+        let _ = scope.allow_directory(&settings.output_folder, true);
+    }
+    if let Some(logo) = settings.logo_path.as_deref().filter(|p| !p.is_empty()) {
+        let _ = scope.allow_file(logo);
+    }
+}
+
 #[tauri::command]
 pub async fn get_video_info(url: String) -> Result<VideoInfo, String> {
     youtube_dl::get_video_info(&url).await
@@ -226,13 +261,7 @@ pub async fn delete_video(
     let mut state = state.lock().await;
 
     if let Some(video) = state.videos.remove(&video_id) {
-        // Delete files
-        if let Some(path) = video.file_path {
-            let _ = std::fs::remove_file(&path);
-        }
-        if let Some(path) = video.audio_path {
-            let _ = std::fs::remove_file(&path);
-        }
+        remove_generated_files(&video);
     }
     if let Err(e) = state.save() { eprintln!("[warn] Failed to save state: {}", e); }
 
@@ -248,8 +277,10 @@ pub async fn get_settings(state: State<'_, AppStateHandle>) -> Result<Settings, 
 #[tauri::command]
 pub async fn save_settings(
     state: State<'_, AppStateHandle>,
+    app_handle: AppHandle,
     settings: Settings,
 ) -> Result<(), String> {
+    allow_user_paths(&app_handle, &settings);
     let mut state = state.lock().await;
     state.settings = settings;
     state.save()
@@ -259,19 +290,15 @@ pub async fn save_settings(
 pub async fn reset_state(state: State<'_, AppStateHandle>) -> Result<(), String> {
     let mut state = state.lock().await;
 
-    // Delete everything inside the output folder
+    // Only delete what the app created. The output folder may be one the user
+    // picked (e.g. ~/Movies or Desktop), so never wipe it wholesale.
+    for video in state.videos.values() {
+        remove_generated_files(video);
+    }
     let output_folder = std::path::Path::new(&state.settings.output_folder);
-    if output_folder.exists() {
-        if let Ok(entries) = std::fs::read_dir(output_folder) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&path);
-                } else {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
+    for subdir in ["audio", "trimmed", "thumbnails"] {
+        // remove_dir only succeeds on empty folders
+        let _ = std::fs::remove_dir(output_folder.join(subdir));
     }
 
     state.videos.clear();
@@ -822,6 +849,28 @@ pub async fn process_video_full(
     app_handle: AppHandle,
     video_id: String,
 ) -> Result<VideoInfo, String> {
+    let result = process_video_full_inner(&state, &app_handle, &video_id).await;
+
+    // Don't leave the video stuck in "processing" if a step failed.
+    if let Err(ref e) = result {
+        emit_processing_progress(&app_handle, &video_id, ProcessingStage::Error, 0.0, e);
+        let mut state_guard = state.lock().await;
+        if let Some(video) = state_guard.videos.get_mut(&video_id) {
+            video.status = VideoStatus::Error;
+            video.processing_stage = Some(ProcessingStage::Error);
+        }
+        if let Err(e) = state_guard.save() { eprintln!("[warn] Failed to save state: {}", e); }
+    }
+
+    result
+}
+
+async fn process_video_full_inner(
+    state: &State<'_, AppStateHandle>,
+    app_handle: &AppHandle,
+    video_id: &str,
+) -> Result<VideoInfo, String> {
+    let video_id = video_id.to_string();
     println!("[process_video_full] Starting full processing for video: {}", video_id);
 
     // Update status to processing

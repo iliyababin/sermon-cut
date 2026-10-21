@@ -13,7 +13,7 @@ use image::RgbImage;
 use scoring::{score_detection, DetectionStatus, ScoredDetection};
 use std::path::{Path, PathBuf};
 
-const NUM_CANDIDATES: u32 = 60;
+const NUM_CANDIDATES: u32 = 100;
 
 /// Resolve the bundled ONNX model path.
 /// In dev mode it's at `src-tauri/resources/yolov8n-pose.onnx`.
@@ -382,3 +382,4 @@ pub async fn process_custom_thumbnail(
 
     Ok(absolute_path.to_string_lossy().to_string())
 }
+

@@ -36,9 +36,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Extensions (compared case-insensitively) that count as videos.
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "mts"];
 
-/// The transcription server gets the whole audio track as base64 WAV, and
-/// long services fail partway through. Refuse them up front instead.
-pub const MAX_TRANSCRIBE_SECS: f64 = 75.0 * 60.0;
+/// Longest video the app will send for transcription. The server
+/// (backend/app.py) has a 30-minute limit per request; a 2-hour service
+/// takes well under 10 minutes on its GPU.
+pub const MAX_TRANSCRIBE_SECS: f64 = 2.0 * 60.0 * 60.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {

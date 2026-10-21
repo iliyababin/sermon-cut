@@ -25,7 +25,7 @@ Everything lives in one **library folder** (by default `Movies/sermon-cut`; chan
 
 The app keeps its own files in a hidden `.sermon-cut` folder inside the library (transcripts, trimmed videos, thumbnails and the list of what's been done). Your video files are never changed unless you choose **Move to Trash**. Copying the whole library folder, including `.sermon-cut`, to another Mac brings its progress along.
 
-Videos longer than 75 minutes can't be transcribed yet; trim them to the sermon first.
+Videos up to 2 hours long can be processed; trim longer recordings first.
 
 ## Install on Windows and Linux
 

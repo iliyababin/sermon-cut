@@ -62,9 +62,10 @@ To retarget the analysis at a different kind of service, edit
 
 **POST** `/` → `{"audio_base64": "<base64>"}`
 
-16kHz mono PCM WAV works best; that's what the desktop app sends
-(`ffmpeg -vn -acodec pcm_s16le -ar 16000 -ac 1`). The app caps uploads at
-200 MB.
+Any format ffmpeg can read works. The desktop app sends 16 kHz mono Opus at
+24 kb/s (`ffmpeg -vn -ar 16000 -ac 1 -c:a libopus -b:a 24k -application voip`),
+about 11 MB for a 2-hour service; in testing it transcribed the same as WAV.
+The app caps uploads at 200 MB and videos at 2 hours.
 
 ```json
 {

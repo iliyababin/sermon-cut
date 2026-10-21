@@ -71,7 +71,10 @@ pub async fn transcribe_audio(
     let request_body = TranscribeRequest { audio_base64 };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30 * 60)) // upload + transcription + analysis of a long service
+        .timeout(std::time::Duration::from_secs(40 * 60)) // upload + transcription + analysis of a long service
+        // Modal answers requests that run past 150 s with a redirect to wait
+        // on; each hop is another 150 s, so allow enough for a long service.
+        .redirect(reqwest::redirect::Policy::limited(20))
         .connect_timeout(std::time::Duration::from_secs(30))
         .pool_idle_timeout(std::time::Duration::from_secs(600))
         .tcp_keepalive(std::time::Duration::from_secs(60))

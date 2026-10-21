@@ -942,12 +942,12 @@ impl Library {
             }
             None => {
                 self.set_progress(app, id, ProcessingStage::ExtractingAudio, 5.0, "Extracting audio from video...");
-                let wav = staging.join("audio.wav");
-                crate::ffmpeg::extract_audio(&video_path, &wav).await?;
+                let audio = staging.join("audio.ogg");
+                crate::ffmpeg::extract_audio(&video_path, &audio).await?;
 
                 self.set_progress(app, id, ProcessingStage::Transcribing, 25.0, "Transcribing audio with AI...");
-                let result = crate::modal::transcribe_audio(&path_string(&wav), &api_url, api_key.as_deref()).await;
-                let _ = std::fs::remove_file(&wav);
+                let result = crate::modal::transcribe_audio(&path_string(&audio), &api_url, api_key.as_deref()).await;
+                let _ = std::fs::remove_file(&audio);
                 let transcription = result?;
                 manifest::save_transcript(
                     &video_dir,

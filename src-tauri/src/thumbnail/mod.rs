@@ -160,7 +160,7 @@ async fn run_pipeline(
             logo::apply_logo_overlay(&mut cropped, lp);
         }
 
-        let out_path = output_dir.join(format!("{}_thumbnail.jpg", output_stem));
+        let out_path = output_dir.join(format!("{}thumbnail_option_1.jpg", output_stem));
         save_jpeg(&cropped, &out_path)?;
 
         let abs = out_path
@@ -188,7 +188,7 @@ async fn run_pipeline(
         // Save raw crop for editor use (multi-thumbnail mode)
         if count > 1 {
             let raw_cropped = crop_image(&img, &person_crop);
-            let raw_path = output_dir.join(format!("{}_thumbnail_option_{}_raw.jpg", output_stem, idx + 1));
+            let raw_path = output_dir.join(format!("{}thumbnail_option_{}_raw.jpg", output_stem, idx + 1));
             save_jpeg(&raw_cropped, &raw_path)?;
         }
 
@@ -210,9 +210,9 @@ async fn run_pipeline(
         );
 
         let debug_name = if count > 1 {
-            format!("{}_thumbnail_option_{}_debug.jpg", output_stem, idx + 1)
+            format!("{}thumbnail_option_{}_debug.jpg", output_stem, idx + 1)
         } else {
-            format!("{}_thumbnail_debug.jpg", output_stem)
+            format!("{}thumbnail_debug.jpg", output_stem)
         };
         let debug_path = output_dir.join(&debug_name);
         save_jpeg(&debug_img, &debug_path)?;
@@ -225,9 +225,9 @@ async fn run_pipeline(
         }
 
         let out_name = if count > 1 {
-            format!("{}_thumbnail_option_{}.jpg", output_stem, idx + 1)
+            format!("{}thumbnail_option_{}.jpg", output_stem, idx + 1)
         } else {
-            format!("{}_thumbnail.jpg", output_stem)
+            format!("{}thumbnail.jpg", output_stem)
         };
         let out_path = output_dir.join(&out_name);
         save_jpeg(&result, &out_path)?;
@@ -266,92 +266,33 @@ fn crop_image(img: &RgbImage, rect: &CropRect) -> RgbImage {
 // Public API — same signatures as the old thumbnail.rs
 // =====================================================================
 
-/// Generate a single best thumbnail for a video.
-pub async fn generate_thumbnail(
-    video_path: &str,
-    start_time: f64,
-    end_time: f64,
-    title: &str,
-    output_dir: &str,
-    logo_path: Option<&str>,
-) -> Result<String, String> {
-    let video_path_obj = Path::new(video_path);
-    if !video_path_obj.exists() {
-        return Err(format!("Video file not found: {}", video_path));
-    }
-
-    println!("[thumbnail] Generating thumbnail for: {}", title);
-
-    let video_stem = video_path_obj
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("thumbnail");
-
-    let effective_output_dir: PathBuf = if output_dir.is_empty() {
-        dirs::video_dir()
-            .map(|p| p.join("sermon-cut"))
-            .unwrap_or_else(|| video_path_obj.parent().unwrap_or(Path::new(".")).to_path_buf())
-    } else {
-        PathBuf::from(output_dir)
-    };
-
-    let thumbnail_dir = effective_output_dir.join("thumbnails");
-    std::fs::create_dir_all(&thumbnail_dir)
-        .map_err(|e| format!("Failed to create thumbnails directory: {}", e))?;
-
-    let paths =
-        run_pipeline(video_path, start_time, end_time, &thumbnail_dir, video_stem, logo_path, 1)
-            .await?;
-
-    paths
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No thumbnail generated".to_string())
-}
-
-/// Generate multiple thumbnail options for review.
+/// Generate thumbnail options for review, written straight into `output_dir`
+/// as thumbnail_option_N.jpg (plus _raw and _debug variants).
 pub async fn generate_thumbnail_options(
-    video_path: &str,
+    video_path: &Path,
     start_time: f64,
     end_time: f64,
     title: &str,
-    output_dir: &str,
+    output_dir: &Path,
     count: u32,
     logo_path: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let video_path_obj = Path::new(video_path);
-    if !video_path_obj.exists() {
-        return Err(format!("Video file not found: {}", video_path));
+    if !video_path.exists() {
+        return Err(format!("Video file not found: {}", video_path.display()));
     }
+    let video_path = video_path.to_str().ok_or("video path contains invalid UTF-8")?;
 
     println!(
         "[thumbnail] Generating {} thumbnail options for: {}",
         count, title
     );
 
-    let effective_output_dir: PathBuf = if output_dir.is_empty() {
-        dirs::video_dir()
-            .map(|p| p.join("sermon-cut"))
-            .unwrap_or_else(|| video_path_obj.parent().unwrap_or(Path::new(".")).to_path_buf())
-    } else {
-        PathBuf::from(output_dir)
-    };
-
-    let thumbnail_dir = effective_output_dir.join("thumbnails");
-    std::fs::create_dir_all(&thumbnail_dir)
-        .map_err(|e| format!("Failed to create thumbnails directory: {}", e))?;
-
-    let video_stem = video_path_obj
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("thumbnail");
-
     run_pipeline(
         video_path,
         start_time,
         end_time,
-        &thumbnail_dir,
-        video_stem,
+        output_dir,
+        "",
         logo_path,
         count,
     )
@@ -361,7 +302,7 @@ pub async fn generate_thumbnail_options(
 /// Process a custom image as a thumbnail with crop, color grading, and logo overlay.
 pub async fn process_custom_thumbnail(
     source_path: &str,
-    output_dir: &str,
+    output_dir: &Path,
     crop_rect: &CropRect,
     apply_color_grading_flag: bool,
     logo_path: Option<&str>,
@@ -371,23 +312,11 @@ pub async fn process_custom_thumbnail(
         return Err(format!("Source image not found: {}", source_path));
     }
 
-    let effective_output_dir = if output_dir.is_empty() {
-        dirs::video_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("sermon-cut")
-    } else {
-        PathBuf::from(output_dir)
-    };
-
-    let thumbnail_dir = effective_output_dir.join("thumbnails");
-    std::fs::create_dir_all(&thumbnail_dir)
-        .map_err(|e| format!("Failed to create thumbnails directory: {}", e))?;
-
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let output_path = thumbnail_dir.join(format!("custom_thumbnail_{}.jpg", timestamp));
+    let output_path = output_dir.join(format!("custom_thumbnail_{}.jpg", timestamp));
 
     println!(
         "[thumbnail] Processing custom thumbnail from: {}",

@@ -1,18 +1,45 @@
-import { useEffect, useState } from "react";
-import { getVideos, deleteVideo, addLocalVideo } from "@/lib/tauri";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  getLibrary,
+  rescanLibrary,
+  processVideo,
+  cancelProcessing,
+  resetVideo,
+  hideVideo,
+  trashVideo,
+  forgetVideo,
+  revealVideo,
+  openLibraryFolder,
+  dismissNotices,
+  takeOverLibrary,
+  cancelDownload,
+  errorMessage,
+} from "@/lib/tauri";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
-import type { VideoInfo, ProcessingStage } from "@/lib/types";
+import type { LibraryVideo, LibraryView, LibraryStatus, ProcessingStage, DownloadItem } from "@/lib/types";
+import { LocalImage } from "./LocalImage";
 import {
   Film,
-  Trash2,
   Clock,
   CheckCircle,
   Loader2,
   AlertCircle,
-  Music,
-  FolderPlus,
   Eye,
+  EyeOff,
+  FolderOpen,
+  Play,
+  X,
+  RotateCcw,
+  MoreHorizontal,
+  Trash2,
+  Search,
+  HardDrive,
+  Lock,
+  Info,
+  ExternalLink,
+  Download,
 } from "lucide-react";
 
 interface DownloadProgress {
@@ -30,214 +57,368 @@ interface ProcessingProgress {
   message: string;
 }
 
-interface ProgressInfo {
-  progress: number;
-  speed: string | null;
-  eta: string | null;
-  status: string;
-  // Processing info
-  processingStage?: ProcessingStage;
-  processingMessage?: string;
-}
+const RESCAN_MS = 5000;
 
 interface VideoLibraryProps {
-  onVideoSelect: (video: VideoInfo) => void;
+  onVideoSelect: (video: LibraryVideo) => void;
   visible?: boolean;
 }
 
 export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProps) {
-  const [videos, setVideos] = useState<VideoInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [progressMap, setProgressMap] = useState<Record<string, ProgressInfo>>({});
+  const [library, setLibrary] = useState<LibraryView | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [showHidden, setShowHidden] = useState(false);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Record<string, ProcessingProgress>>({});
+  const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
+  const scanning = useRef(false);
 
-  useEffect(() => {
-    loadVideos();
-  }, []);
-
-  // Reload videos when the library becomes visible
-  useEffect(() => {
-    if (visible) {
-      loadVideos();
-    }
-  }, [visible]);
-
-  useEffect(() => {
-    const unlistenDownload = listen<DownloadProgress>("download-progress", (event) => {
-      setProgressMap((prev) => ({
-        ...prev,
-        [event.payload.video_id]: {
-          ...prev[event.payload.video_id],
-          progress: event.payload.progress,
-          speed: event.payload.speed,
-          eta: event.payload.eta,
-          status: event.payload.status,
-        },
-      }));
-    });
-
-    const unlistenProcessing = listen<ProcessingProgress>("processing-progress", (event) => {
-      setProgressMap((prev) => ({
-        ...prev,
-        [event.payload.video_id]: {
-          ...prev[event.payload.video_id],
-          progress: event.payload.progress,
-          speed: null,
-          eta: null,
-          status: "processing",
-          processingStage: event.payload.stage,
-          processingMessage: event.payload.message,
-        },
-      }));
-
-      // Reload videos when processing completes or fails
-      if (event.payload.stage === "complete" || event.payload.stage === "error") {
-        loadVideos();
-      }
-    });
-
-    return () => {
-      unlistenDownload.then((fn) => fn());
-      unlistenProcessing.then((fn) => fn());
-    };
-  }, []);
-
-  async function loadVideos() {
+  const refresh = useCallback(async () => {
     try {
-      setLoading(true);
-      const videoList = await getVideos();
-      setVideos(videoList);
-      setError(null);
+      setLibrary(await getLibrary());
+      setLoadError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err || "Failed to load videos"));
+      setLoadError(errorMessage(err, "Failed to load the library"));
+    }
+  }, []);
+
+  const rescan = useCallback(async () => {
+    if (scanning.current) return;
+    scanning.current = true;
+    try {
+      setLibrary(await rescanLibrary());
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Failed to read the library folder"));
     } finally {
-      setLoading(false);
+      scanning.current = false;
     }
-  }
+  }, []);
 
-  async function handleDelete(video: VideoInfo, e: React.MouseEvent) {
-    e.stopPropagation();
-    if (confirm(`Delete "${video.title}"? This will remove the video files.`)) {
-      try {
-        await deleteVideo(video.id);
-        setVideos(videos.filter((v) => v.id !== video.id));
-      } catch (err) {
-        console.error("Failed to delete video:", err);
+  // Look at the folder when shown, every few seconds while shown, and
+  // whenever the window comes back to the front (e.g. after using Finder).
+  useEffect(() => {
+    if (!visible) return;
+    rescan();
+    const timer = setInterval(rescan, RESCAN_MS);
+    const onFocus = () => rescan();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [visible, rescan]);
+
+  useEffect(() => {
+    const unlistenChanged = listen("library-changed", () => refresh());
+    const unlistenProcessing = listen<ProcessingProgress>("processing-progress", (event) => {
+      setProgress((prev) => ({ ...prev, [event.payload.video_id]: event.payload }));
+      if (event.payload.stage === "complete" || event.payload.stage === "error") {
+        refresh();
       }
-    }
-  }
+    });
+    const unlistenDownload = listen<DownloadProgress>("download-progress", (event) => {
+      setDownloads((prev) => ({ ...prev, [event.payload.video_id]: event.payload }));
+    });
+    return () => {
+      unlistenChanged.then((fn) => fn());
+      unlistenProcessing.then((fn) => fn());
+      unlistenDownload.then((fn) => fn());
+    };
+  }, [refresh]);
 
-  async function handleAddLocalVideo() {
+  // Close the actions menu on any outside click.
+  useEffect(() => {
+    if (!openMenu) return;
+    const close = () => setOpenMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [openMenu]);
+
+  async function run(action: () => Promise<unknown>) {
     try {
-      const selected = await open({
-        multiple: false,
-        filters: [
-          {
-            name: "Video",
-            extensions: ["mp4", "mkv", "webm", "avi", "mov", "m4v"],
-          },
-        ],
-      });
-
-      if (selected) {
-        const video = await addLocalVideo(selected as string);
-        setVideos((prev) => [...prev, video]);
-      }
+      setActionError(null);
+      await action();
     } catch (err) {
-      console.error("Failed to add local video:", err);
-      setError(err instanceof Error ? err.message : String(err || "Failed to add video"));
+      setActionError(errorMessage(err));
+    } finally {
+      refresh();
     }
   }
 
-  if (loading) {
+  async function handleTrash(video: LibraryVideo) {
+    const confirmed = await ask(
+      `Move "${video.file_name}" to the Trash?\n\nSermon Cut's transcript, trimmed video and thumbnails for it are deleted too.`,
+      { title: "Move to Trash", kind: "warning", okLabel: "Move to Trash", cancelLabel: "Cancel" }
+    );
+    if (confirmed) run(() => trashVideo(video.id));
+  }
+
+  async function handleReset(video: LibraryVideo) {
+    const confirmed = await ask(
+      `Start over with "${video.title}"?\n\nThis deletes its transcript, trimmed video and thumbnails. The video file itself is kept.`,
+      { title: "Reset", kind: "warning", okLabel: "Reset", cancelLabel: "Cancel" }
+    );
+    if (confirmed) run(() => resetVideo(video.id));
+  }
+
+  if (!library) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+      <div className="flex flex-col items-center justify-center h-full gap-4 py-24">
+        {loadError ? (
+          <>
+            <AlertCircle className="w-12 h-12 text-destructive" />
+            <p className="text-destructive">{loadError}</p>
+            <button onClick={rescan} className="px-4 py-2 bg-primary text-primary-foreground rounded-lg">
+              Retry
+            </button>
+          </>
+        ) : (
+          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+        )}
       </div>
     );
   }
 
-  if (error) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-4">
-        <AlertCircle className="w-12 h-12 text-destructive" />
-        <p className="text-destructive">{error}</p>
-        <button
-          onClick={loadVideos}
-          className="px-4 py-2 bg-primary text-primary-foreground rounded-lg"
-        >
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  if (videos.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-4 text-muted-foreground">
-        <Film className="w-16 h-16" />
-        <p>No videos yet</p>
-        <p className="text-sm">Download a video or add a local file to get started</p>
-        <button
-          onClick={handleAddLocalVideo}
-          className="flex items-center gap-2 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
-        >
-          <FolderPlus className="w-5 h-5" />
-          Add Local Video
-        </button>
-      </div>
-    );
-  }
+  const hiddenCount = library.videos.filter((v) => v.hidden).length;
+  const videos = library.videos.filter((v) => showHidden || !v.hidden);
+  const maxMinutes = Math.round(library.max_transcribe_secs / 60);
 
   return (
     <div className="p-6">
-      <div className="flex items-center justify-between mb-6">
-        <h2 className="text-2xl font-bold">Video Library</h2>
-        <button
-          onClick={handleAddLocalVideo}
-          className="flex items-center gap-2 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
-        >
-          <FolderPlus className="w-5 h-5" />
-          Add Local Video
-        </button>
+      <div className="flex items-start justify-between gap-4 mb-6">
+        <div className="min-w-0">
+          <h2 className="text-2xl font-bold">Video Library</h2>
+          <p className="text-sm text-muted-foreground truncate" title={library.folder}>
+            {library.folder}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {hiddenCount > 0 && (
+            <button
+              onClick={() => setShowHidden(!showHidden)}
+              className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground rounded-lg hover:bg-secondary transition-colors"
+            >
+              {showHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              {showHidden ? "Hide hidden" : `Show hidden (${hiddenCount})`}
+            </button>
+          )}
+          <button
+            onClick={() => run(openLibraryFolder)}
+            disabled={!library.available}
+            className="flex items-center gap-2 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 transition-colors"
+          >
+            <FolderOpen className="w-5 h-5" />
+            Open Folder
+          </button>
+        </div>
       </div>
 
-      <div className="grid gap-4">
-        {videos.map((video) => (
-          <VideoCard
-            key={video.id}
-            video={video}
-            progressInfo={progressMap[video.id] ?? { progress: video.download_progress, speed: null, eta: null, status: "downloading" }}
-            onClick={() => onVideoSelect(video)}
-            onDelete={(e) => handleDelete(video, e)}
-          />
+      <div className="space-y-3 mb-4">
+        {library.tool_problem && (
+          <Banner tone="error" icon={<AlertCircle className="w-5 h-5" />}>
+            <span className="whitespace-pre-line">{library.tool_problem}</span>
+          </Banner>
+        )}
+        {library.message && (
+          <Banner
+            tone={library.available ? "warning" : "error"}
+            icon={library.locked_by ? <Lock className="w-5 h-5" /> : library.available ? <Info className="w-5 h-5" /> : <HardDrive className="w-5 h-5" />}
+            action={
+              library.locked_by ? (
+                <button
+                  onClick={async () => {
+                    const confirmed = await ask(
+                      `Only do this if Sermon Cut is closed on ${library.locked_by}. If both computers change the library at once, one of them loses its changes.`,
+                      { title: "Use this library here", kind: "warning", okLabel: "Use Here", cancelLabel: "Cancel" }
+                    );
+                    if (confirmed) run(async () => setLibrary(await takeOverLibrary()));
+                  }}
+                  className="px-3 py-1.5 text-sm bg-secondary rounded-lg hover:bg-secondary/80"
+                >
+                  Use Here
+                </button>
+              ) : undefined
+            }
+          >
+            {library.message}
+          </Banner>
+        )}
+        {library.notices.map((notice, i) => (
+          <Banner
+            key={i}
+            tone="info"
+            icon={<Info className="w-5 h-5" />}
+            action={
+              <button onClick={() => run(dismissNotices)} className="p-1 rounded hover:bg-secondary" title="Dismiss">
+                <X className="w-4 h-4" />
+              </button>
+            }
+          >
+            {notice}
+          </Banner>
         ))}
+        {actionError && (
+          <Banner
+            tone="error"
+            icon={<AlertCircle className="w-5 h-5" />}
+            action={
+              <button onClick={() => setActionError(null)} className="p-1 rounded hover:bg-secondary" title="Dismiss">
+                <X className="w-4 h-4" />
+              </button>
+            }
+          >
+            {actionError}
+          </Banner>
+        )}
+      </div>
+
+      {library.downloads.length > 0 && (
+        <div className="grid gap-4 mb-4">
+          {library.downloads.map((d) => (
+            <DownloadCard key={d.job_id} item={d} progress={downloads[d.youtube_id]} />
+          ))}
+        </div>
+      )}
+
+      {videos.length === 0 && library.downloads.length === 0 ? (
+        <div className="flex flex-col items-center justify-center gap-3 py-24 text-muted-foreground text-center">
+          <Film className="w-16 h-16" />
+          <p>No videos yet</p>
+          <p className="text-sm max-w-md">
+            Drop video files into <span className="font-medium text-foreground">{library.folder}</span> and
+            they'll appear here, or download one from YouTube.
+          </p>
+        </div>
+      ) : (
+        <div className="grid gap-4">
+          {videos.map((video) => (
+            <VideoCard
+              key={video.id}
+              video={video}
+              live={progress[video.id]}
+              writable={library.writable}
+              maxMinutes={maxMinutes}
+              menuOpen={openMenu === video.id}
+              onToggleMenu={() => setOpenMenu(openMenu === video.id ? null : video.id)}
+              onOpen={() => onVideoSelect(video)}
+              onProcess={() => run(() => processVideo(video.id))}
+              onCancel={() => run(() => cancelProcessing(video.id))}
+              onReveal={() => run(() => revealVideo(video.id))}
+              onReset={() => handleReset(video)}
+              onHide={() => run(() => hideVideo(video.id, !video.hidden))}
+              onTrash={() => handleTrash(video)}
+              onForget={() => run(() => forgetVideo(video.id))}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Banner({
+  tone,
+  icon,
+  action,
+  children,
+}: {
+  tone: "error" | "warning" | "info";
+  icon: React.ReactNode;
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  const colors = {
+    error: "bg-destructive/10 text-destructive",
+    warning: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300",
+    info: "bg-blue-50 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300",
+  }[tone];
+  return (
+    <div className={`flex items-start gap-3 p-3 rounded-lg text-sm ${colors}`}>
+      <span className="flex-shrink-0 mt-0.5">{icon}</span>
+      <div className="flex-1 min-w-0 break-words">{children}</div>
+      {action && <div className="flex-shrink-0">{action}</div>}
+    </div>
+  );
+}
+
+function DownloadCard({ item, progress }: { item: DownloadItem; progress?: DownloadProgress }) {
+  const merging = progress?.status === "processing";
+  const pct = progress?.progress ?? 0;
+  return (
+    <div className="flex gap-4 p-4 bg-card border border-border rounded-lg">
+      <div className="w-48 h-28 bg-muted rounded-lg flex items-center justify-center flex-shrink-0">
+        <Download className="w-8 h-8 text-muted-foreground" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <h3 className="font-semibold truncate">{item.title}</h3>
+        <div className="mt-2 text-sm text-muted-foreground flex items-center gap-2">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          {merging ? "Finishing download..." : "Downloading from YouTube"}
+        </div>
+        <div className="mt-2 h-2 bg-muted rounded-full overflow-hidden">
+          <div
+            className={`h-full transition-all duration-300 ${merging ? "bg-yellow-500 animate-pulse" : "bg-primary"}`}
+            style={{ width: `${merging ? 100 : pct}%` }}
+          />
+        </div>
+        {!merging && (
+          <p className="text-xs text-muted-foreground mt-1">
+            {pct.toFixed(1)}% {progress?.speed && `• ${progress.speed}`} {progress?.eta && `• ETA ${progress.eta}`}
+          </p>
+        )}
+      </div>
+      <div>
+        <button
+          onClick={() => cancelDownload(item.youtube_id)}
+          className="p-2 text-muted-foreground hover:text-destructive rounded-lg hover:bg-destructive/10 transition-colors"
+          title="Cancel download"
+        >
+          <X className="w-5 h-5" />
+        </button>
       </div>
     </div>
   );
 }
 
 interface VideoCardProps {
-  video: VideoInfo;
-  progressInfo: ProgressInfo;
-  onClick: () => void;
-  onDelete: (e: React.MouseEvent) => void;
+  video: LibraryVideo;
+  live?: ProcessingProgress;
+  writable: boolean;
+  maxMinutes: number;
+  menuOpen: boolean;
+  onToggleMenu: () => void;
+  onOpen: () => void;
+  onProcess: () => void;
+  onCancel: () => void;
+  onReveal: () => void;
+  onReset: () => void;
+  onHide: () => void;
+  onTrash: () => void;
+  onForget: () => void;
 }
 
-function VideoCard({ video, progressInfo, onClick, onDelete }: VideoCardProps) {
+function VideoCard(props: VideoCardProps) {
+  const { video, live, writable, maxMinutes } = props;
+  const reviewable = video.status === "ready_for_review" || video.status === "done";
+  const pending = video.id.startsWith("pending:");
+  const dimmed = video.status === "missing" || video.status === "copying" || video.status === "unreadable";
+  const lastUpload = video.uploads[video.uploads.length - 1];
+  const processing = video.status === "processing";
+  const pct = (processing && live?.progress) || video.processing_progress || 0;
+  const message = (processing && live?.message) || video.processing_message || "Processing...";
+
   return (
     <div
-      onClick={onClick}
-      className="flex gap-4 p-4 bg-card border border-border rounded-lg cursor-pointer hover:bg-accent transition-colors"
+      onClick={reviewable ? props.onOpen : undefined}
+      className={`flex gap-4 p-4 bg-card border border-border rounded-lg transition-colors ${
+        reviewable ? "cursor-pointer hover:bg-accent" : ""
+      } ${dimmed ? "opacity-60" : ""} ${video.hidden ? "border-dashed" : ""}`}
     >
-      {/* Thumbnail */}
       <div className="w-48 h-28 bg-muted rounded-lg overflow-hidden flex-shrink-0">
         {video.thumbnail ? (
-          <img
-            src={video.thumbnail}
-            alt={video.title}
-            className="w-full h-full object-cover"
-          />
+          <LocalImage path={video.thumbnail} alt={video.title} className="w-full h-full object-cover" />
         ) : (
           <div className="w-full h-full flex items-center justify-center">
             <Film className="w-8 h-8 text-muted-foreground" />
@@ -245,158 +426,206 @@ function VideoCard({ video, progressInfo, onClick, onDelete }: VideoCardProps) {
         )}
       </div>
 
-      {/* Info */}
       <div className="flex-1 min-w-0">
-        <h3 className="font-semibold truncate">{video.title}</h3>
+        <h3 className="font-semibold truncate" title={video.title}>
+          {video.title}
+        </h3>
+        <p className="text-sm text-muted-foreground truncate" title={video.file_name}>
+          {video.title !== video.file_name.replace(/\.[^.]+$/, "") ? video.file_name : video.channel}
+        </p>
 
-        {video.channel && (
-          <p className="text-sm text-muted-foreground">{video.channel}</p>
-        )}
-
-        <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
-          {video.duration && (
+        <div className="flex items-center gap-3 mt-2 text-sm text-muted-foreground flex-wrap">
+          {video.duration ? (
             <span className="flex items-center gap-1">
               <Clock className="w-4 h-4" />
               {formatDuration(video.duration)}
             </span>
-          )}
-
-          <StatusBadge
-            status={video.status}
-            processingStage={progressInfo.processingStage || video.processing_stage || undefined}
-          />
+          ) : null}
+          <StatusBadge status={video.status} stage={live?.stage ?? video.processing_stage} />
+          {video.hidden && <span className="text-xs">Hidden</span>}
         </div>
 
-        {/* Download Progress */}
-        {video.status === "downloading" && (
+        {processing && (
           <div className="mt-2">
             <div className="h-2 bg-muted rounded-full overflow-hidden">
-              <div
-                className={`h-full transition-all duration-300 ${progressInfo.status === "processing" ? "bg-yellow-500 animate-pulse" : "bg-primary"}`}
-                style={{ width: `${progressInfo.progress}%` }}
-              />
+              <div className="h-full bg-orange-500 transition-all duration-300" style={{ width: `${pct}%` }} />
             </div>
-            <div className="flex items-center justify-between mt-1">
-              {progressInfo.status === "processing" ? (
-                <p className="text-xs text-muted-foreground">Processing... (merging streams)</p>
-              ) : (
-                <>
-                  <p className="text-xs text-muted-foreground">
-                    {progressInfo.progress.toFixed(1)}% {progressInfo.speed && `• ${progressInfo.speed}`}
-                  </p>
-                  {progressInfo.eta && (
-                    <p className="text-xs text-muted-foreground">ETA: {progressInfo.eta}</p>
-                  )}
-                </>
-              )}
-            </div>
+            <p className="text-xs text-muted-foreground mt-1">{message}</p>
           </div>
         )}
 
-        {/* Processing Progress */}
-        {video.status === "processing" && (
-          <div className="mt-2">
-            <div className="h-2 bg-muted rounded-full overflow-hidden">
-              <div
-                className="h-full bg-orange-500 transition-all duration-300"
-                style={{ width: `${progressInfo.progress || video.processing_progress || 0}%` }}
-              />
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">
-              {progressInfo.processingMessage || "Processing..."}
-            </p>
-          </div>
-        )}
-
-        {/* Processing Error */}
-        {video.status === "error" && progressInfo.processingStage === "error" && progressInfo.processingMessage && (
-          <p className="mt-2 text-xs text-destructive line-clamp-3" title={progressInfo.processingMessage}>
-            {progressInfo.processingMessage}
+        {video.status === "error" && video.error && (
+          <p className="mt-2 text-xs text-destructive line-clamp-3" title={video.error}>
+            {video.error}
           </p>
         )}
+        {video.status === "unreadable" && video.error && (
+          <p className="mt-2 text-xs text-destructive">{video.error}</p>
+        )}
+        {video.status === "too_long" && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            Longer than {maxMinutes} minutes, so it can't be transcribed yet. Trim it to the sermon and drop the
+            shorter file into the folder.
+          </p>
+        )}
+        {video.status === "missing" && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            The file isn't in the library folder any more. Put it back, or Forget this video.
+          </p>
+        )}
+        {lastUpload && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              openUrl(lastUpload.url);
+            }}
+            className="mt-2 text-xs text-primary hover:underline flex items-center gap-1"
+          >
+            {video.status === "done" ? "On YouTube" : "A previous version was uploaded"}
+            <ExternalLink className="w-3 h-3" />
+          </button>
+        )}
       </div>
 
-      {/* Actions */}
-      <div className="flex items-start gap-2">
-        <button
-          onClick={onDelete}
-          className="p-2 text-muted-foreground hover:text-destructive rounded-lg hover:bg-destructive/10 transition-colors"
-        >
-          <Trash2 className="w-5 h-5" />
-        </button>
-      </div>
+      {!pending && (
+        <div className="flex items-start gap-2" onClick={(e) => e.stopPropagation()}>
+          {(video.status === "new" || video.status === "error") && (
+            <button
+              onClick={props.onProcess}
+              disabled={!writable}
+              className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 transition-colors"
+            >
+              {video.status === "error" ? <RotateCcw className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+              {video.status === "error" ? "Retry" : "Process"}
+            </button>
+          )}
+          {(video.status === "queued" || processing) && (
+            <button
+              onClick={props.onCancel}
+              className="flex items-center gap-2 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+            >
+              <X className="w-4 h-4" />
+              Cancel
+            </button>
+          )}
+          {reviewable && (
+            <button
+              onClick={props.onOpen}
+              className="flex items-center gap-2 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+            >
+              <Eye className="w-4 h-4" />
+              Review
+            </button>
+          )}
+          {video.status === "missing" && (
+            <button
+              onClick={props.onForget}
+              disabled={!writable || video.busy}
+              className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 transition-colors"
+            >
+              Forget
+            </button>
+          )}
+
+          {video.status !== "missing" && (
+            <div className="relative">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  props.onToggleMenu();
+                }}
+                className="p-2 text-muted-foreground rounded-lg hover:bg-secondary transition-colors"
+                title="More"
+              >
+                <MoreHorizontal className="w-5 h-5" />
+              </button>
+              {props.menuOpen && (
+                <div
+                  onClick={props.onToggleMenu}
+                  className="absolute right-0 top-10 z-10 w-48 bg-card border border-border rounded-lg shadow-lg py-1 text-sm"
+                >
+                  <MenuItem icon={<Search className="w-4 h-4" />} label="Show in Finder" onClick={props.onReveal} />
+                  <MenuItem
+                    icon={<RotateCcw className="w-4 h-4" />}
+                    label="Reset"
+                    disabled={!writable || video.busy || video.status === "new" || video.status === "too_long"}
+                    onClick={props.onReset}
+                  />
+                  <MenuItem
+                    icon={video.hidden ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                    label={video.hidden ? "Unhide" : "Hide"}
+                    disabled={!writable || video.busy}
+                    onClick={props.onHide}
+                  />
+                  <MenuItem
+                    icon={<Trash2 className="w-4 h-4" />}
+                    label="Move to Trash"
+                    danger
+                    disabled={!writable || video.busy}
+                    onClick={props.onTrash}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
-function StatusBadge({ status, processingStage }: { status: VideoInfo["status"]; processingStage?: ProcessingStage }) {
-  const config: Record<
-    VideoInfo["status"],
-    { icon: React.ReactNode; label: string; className: string }
-  > = {
-    pending: {
-      icon: <Clock className="w-4 h-4" />,
-      label: "Pending",
-      className: "bg-muted text-muted-foreground",
-    },
-    downloading: {
-      icon: <Loader2 className="w-4 h-4 animate-spin" />,
-      label: "Downloading",
-      className: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
-    },
-    downloaded: {
-      icon: <CheckCircle className="w-4 h-4" />,
-      label: "Downloaded",
-      className: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400",
-    },
-    extracting_audio: {
-      icon: <Loader2 className="w-4 h-4 animate-spin" />,
-      label: "Extracting Audio",
-      className: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400",
-    },
-    audio_ready: {
-      icon: <Music className="w-4 h-4" />,
-      label: "Audio Ready",
-      className: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400",
-    },
-    transcribing: {
-      icon: <Loader2 className="w-4 h-4 animate-spin" />,
-      label: "Transcribing",
-      className: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400",
-    },
-    transcribed: {
-      icon: <CheckCircle className="w-4 h-4" />,
-      label: "Transcribed",
-      className: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400",
-    },
-    processing: {
-      icon: <Loader2 className="w-4 h-4 animate-spin" />,
-      label: getProcessingLabel(processingStage),
-      className: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400",
-    },
-    ready: {
-      icon: <CheckCircle className="w-4 h-4" />,
-      label: "Ready",
-      className: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400",
-    },
-    ready_for_review: {
-      icon: <Eye className="w-4 h-4" />,
-      label: "Ready for Review",
-      className: "bg-primary/10 text-primary",
-    },
-    error: {
-      icon: <AlertCircle className="w-4 h-4" />,
-      label: "Error",
-      className: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
-    },
-  };
-
-  const { icon, label, className } = config[status];
-
+function MenuItem({
+  icon,
+  label,
+  onClick,
+  disabled,
+  danger,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+}) {
   return (
-    <span
-      className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${className}`}
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-secondary disabled:opacity-40 disabled:hover:bg-transparent ${
+        danger ? "text-destructive" : ""
+      }`}
     >
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+const STATUS: Record<LibraryStatus, { label: string; className: string; icon: "clock" | "check" | "eye" | "alert" | "spin" }> = {
+  copying: { label: "Copying…", className: "bg-muted text-muted-foreground", icon: "spin" },
+  unreadable: { label: "Can't read", className: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400", icon: "alert" },
+  new: { label: "Not processed", className: "bg-muted text-muted-foreground", icon: "clock" },
+  too_long: { label: "Too long", className: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400", icon: "alert" },
+  queued: { label: "Queued", className: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400", icon: "clock" },
+  processing: { label: "Processing", className: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400", icon: "spin" },
+  ready_for_review: { label: "Ready for Review", className: "bg-primary/10 text-primary", icon: "eye" },
+  done: { label: "Uploaded", className: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400", icon: "check" },
+  error: { label: "Error", className: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400", icon: "alert" },
+  missing: { label: "Missing", className: "bg-muted text-muted-foreground", icon: "alert" },
+};
+
+function StatusBadge({ status, stage }: { status: LibraryStatus; stage?: ProcessingStage | null }) {
+  const config = STATUS[status];
+  const label = status === "processing" ? getProcessingLabel(stage ?? undefined) : config.label;
+  const icon = {
+    clock: <Clock className="w-4 h-4" />,
+    check: <CheckCircle className="w-4 h-4" />,
+    eye: <Eye className="w-4 h-4" />,
+    alert: <AlertCircle className="w-4 h-4" />,
+    spin: <Loader2 className="w-4 h-4 animate-spin" />,
+  }[config.icon];
+  return (
+    <span className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${config.className}`}>
       {icon}
       {label}
     </span>
@@ -415,8 +644,6 @@ function getProcessingLabel(stage?: ProcessingStage): string {
       return "Generating Thumbnails";
     case "complete":
       return "Complete";
-    case "error":
-      return "Error";
     default:
       return "Processing";
   }

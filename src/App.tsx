@@ -4,8 +4,8 @@ import { VideoLibrary } from "./components/VideoLibrary";
 import { DownloadForm } from "./components/DownloadForm";
 import { ReviewScreen } from "./components/ReviewScreen";
 import { Settings } from "./components/Settings";
-import { ProcessingProvider } from "./lib/processing-context";
-import { VideoInfo } from "./lib/types";
+import { getVideo, errorMessage } from "./lib/tauri";
+import type { LibraryVideo, VideoDetail } from "./lib/types";
 import { Download, Film, Settings as SettingsIcon, Clapperboard, ArrowUpCircle } from "lucide-react";
 import { useUpdater } from "./hooks/useUpdater";
 
@@ -13,7 +13,9 @@ type View = "library" | "download" | "review" | "settings";
 
 export default function App() {
   const [currentView, setCurrentView] = useState<View>("library");
-  const [selectedVideo, setSelectedVideo] = useState<VideoInfo | null>(null);
+  const [selectedVideo, setSelectedVideo] = useState<VideoDetail | null>(null);
+  // Bumped on every open so the review screen starts fresh from saved data.
+  const [reviewKey, setReviewKey] = useState(0);
   const [appVersion, setAppVersion] = useState("");
   const updater = useUpdater();
 
@@ -22,22 +24,20 @@ export default function App() {
     updater.checkForUpdates();
   }, []);
 
-  const handleVideoSelect = (video: VideoInfo) => {
-    // Only open review screen for videos that are ready for review
-    if (video.status === "ready_for_review" || video.status === "ready") {
-      setSelectedVideo(video);
+  const handleVideoSelect = async (video: LibraryVideo) => {
+    // Only processed videos have something to review
+    if (video.status !== "ready_for_review" && video.status !== "done") return;
+    try {
+      setSelectedVideo(await getVideo(video.id));
+      setReviewKey((k) => k + 1);
       setCurrentView("review");
+    } catch (err) {
+      alert(errorMessage(err, "Couldn't open this video"));
     }
-    // For processing videos, just stay on library - they can watch progress
-    // For downloaded videos, could optionally trigger processing here
   };
 
   const handleGoToLibrary = () => {
     setCurrentView("library");
-  };
-
-  const handleVideoUpdate = (updatedVideo: VideoInfo) => {
-    setSelectedVideo(updatedVideo);
   };
 
   return (
@@ -90,26 +90,24 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 overflow-auto relative">
-        <ProcessingProvider>
-          <div className={currentView === "library" ? "" : "hidden"}>
-            <VideoLibrary onVideoSelect={handleVideoSelect} visible={currentView === "library"} />
+        <div className={currentView === "library" ? "" : "hidden"}>
+          <VideoLibrary onVideoSelect={handleVideoSelect} visible={currentView === "library"} />
+        </div>
+        <div className={currentView === "download" ? "" : "hidden"}>
+          <DownloadForm onGoToLibrary={handleGoToLibrary} />
+        </div>
+        {selectedVideo && (
+          <div className={currentView === "review" ? "" : "hidden"}>
+            <ReviewScreen
+              key={`${selectedVideo.id}-${reviewKey}`}
+              video={selectedVideo}
+              onBack={handleGoToLibrary}
+            />
           </div>
-          <div className={currentView === "download" ? "" : "hidden"}>
-            <DownloadForm onGoToLibrary={handleGoToLibrary} />
-          </div>
-          {selectedVideo && (
-            <div className={currentView === "review" ? "" : "hidden"}>
-              <ReviewScreen
-                video={selectedVideo}
-                onBack={() => setCurrentView("library")}
-                onVideoUpdate={handleVideoUpdate}
-              />
-            </div>
-          )}
-          <div className={currentView === "settings" ? "" : "hidden"}>
-            <Settings />
-          </div>
-        </ProcessingProvider>
+        )}
+        <div className={currentView === "settings" ? "" : "hidden"}>
+          <Settings />
+        </div>
       </main>
     </div>
   );

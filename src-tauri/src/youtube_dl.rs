@@ -1,5 +1,6 @@
 use crate::state::{VideoInfo, VideoStatus};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -71,21 +72,12 @@ pub async fn download_video(
     url: &str,
     quality: &str,
     video_id: &str,
-    output_dir: &str,
+    output_dir: &Path,
     mut cancel_rx: watch::Receiver<bool>,
     app_handle: AppHandle,
-) -> Result<String, String> {
-    // Get output directory: use provided setting, or fall back to ~/Videos/sermon-cut
-    let output_dir = if output_dir.is_empty() {
-        let base = dirs::video_dir()
-            .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        base.join("sermon-cut")
-    } else {
-        std::path::PathBuf::from(output_dir)
-    };
-    std::fs::create_dir_all(&output_dir)
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+) -> Result<PathBuf, String> {
+    // output_dir is a private, empty folder for this download (inside the
+    // library's .sermon-cut/tmp), so whatever video ends up in it is ours.
 
     let output_template = output_dir.join("%(id)s.%(ext)s");
     let output_template_str = output_template.to_str()
@@ -136,9 +128,6 @@ pub async fn download_video(
         Vec::from(tail).join("\n")
     });
 
-    // Capture the output path
-    let mut output_path = String::new();
-
     // Throttle progress updates to avoid UI jitter
     let mut last_update = std::time::Instant::now();
     let update_interval = std::time::Duration::from_secs(2);
@@ -183,17 +172,6 @@ pub async fn download_video(
                                 });
                             }
                         }
-                        // Check for output path in line
-                        if line.contains("[download] Destination:") {
-                            if let Some(path) = line.strip_prefix("[download] Destination: ") {
-                                output_path = path.trim().to_string();
-                            }
-                        }
-                        if line.contains("[Merger] Merging formats into") {
-                            if let Some(path) = line.strip_prefix("[Merger] Merging formats into \"") {
-                                output_path = path.trim_end_matches('"').to_string();
-                            }
-                        }
                     }
                     Ok(None) => break,
                     Err(e) => return Err(format!("Error reading output: {}", e)),
@@ -209,29 +187,20 @@ pub async fn download_video(
         return Err(format!("Download failed: {}", stderr_tail.trim()));
     }
 
-    // If we didn't capture the path, try to find it
-    if output_path.is_empty() {
-        // Get video ID from URL and find the file
-        let info = get_video_info(url).await?;
-        let pattern = output_dir.join(format!("{}.*", info.id));
+    find_downloaded_file(output_dir)
+}
 
-        if let Some(pattern_str) = pattern.to_str() {
-            if let Ok(entries) = glob::glob(pattern_str) {
-                for entry in entries.flatten() {
-                    if entry.extension().map_or(false, |e| e == "mp4" || e == "mkv" || e == "webm") {
-                        output_path = entry.to_string_lossy().to_string();
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if output_path.is_empty() {
-        return Err("Could not determine output file path".to_string());
-    }
-
-    Ok(output_path)
+/// The finished video in a download folder: the largest file with a video
+/// extension (yt-dlp removes its .part and per-format files once merged).
+fn find_downloaded_file(dir: &Path) -> Result<PathBuf, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read download folder: {}", e))?;
+    entries
+        .flatten()
+        .filter(|e| crate::library::is_candidate_video(&e.file_name().to_string_lossy()))
+        .filter_map(|e| Some((e.metadata().ok()?.len(), e.path())))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, path)| path)
+        .ok_or_else(|| "Download finished but no video file was found".to_string())
 }
 
 fn parse_progress(line: &str) -> Option<(f32, Option<String>, Option<String>)> {

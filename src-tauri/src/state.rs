@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Video metadata from yt-dlp. Also the shape of videos in the pre-0.4
+/// state.json, which the library migration reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoInfo {
     pub id: String,
@@ -92,6 +93,7 @@ pub struct YouTubeAuth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub download_quality: String,
+    /// The library folder (named before the library existed).
     pub output_folder: String,
     pub modal_api_url: String,
     pub modal_api_key: Option<String>,
@@ -103,13 +105,19 @@ pub struct Settings {
     pub youtube_playlist_id: Option<String>,
 }
 
+/// ~/Movies/sermon-cut on macOS, ~/Videos/sermon-cut elsewhere.
+pub fn default_library_dir() -> String {
+    dirs::video_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
+        .map(|p| p.join("sermon-cut").to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             download_quality: "best".to_string(),
-            output_folder: dirs::video_dir()
-                .map(|p| p.join("sermon-cut").to_string_lossy().to_string())
-                .unwrap_or_default(),
+            output_folder: default_library_dir(),
             modal_api_url: "https://sccyouthcenter--youtube-clipper-transcribe-audio.modal.run".to_string(),
             modal_api_key: None,
             logo_path: None,
@@ -119,50 +127,70 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    pub fn library_folder(&self) -> String {
+        if self.output_folder.trim().is_empty() {
+            default_library_dir()
+        } else {
+            self.output_folder.clone()
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AppState {
-    pub videos: HashMap<String, VideoInfo>,
-    pub active_downloads: HashMap<String, tokio::sync::watch::Sender<bool>>,
     pub settings: Settings,
+    /// Videos from the pre-0.4 state.json, kept verbatim (and written back
+    /// on every save) until the library migration has fully succeeded.
+    pub legacy_videos: serde_json::Map<String, serde_json::Value>,
+    /// One-time messages for the library screen.
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
-    videos: HashMap<String, VideoInfo>,
-    settings: Settings,
+    #[serde(default)]
+    settings: Option<Settings>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    videos: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notices: Vec<String>,
 }
 
-fn get_state_file_path() -> PathBuf {
+pub fn state_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sermon-cut")
-        .join("state.json")
+}
+
+fn get_state_file_path() -> PathBuf {
+    state_dir().join("state.json")
 }
 
 impl AppState {
     pub fn load() -> Self {
         let path = get_state_file_path();
 
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match serde_json::from_str::<PersistedState>(&contents) {
-                        Ok(persisted) => {
-                            return AppState {
-                                videos: persisted.videos,
-                                active_downloads: HashMap::new(),
-                                settings: persisted.settings,
-                            };
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to parse state file: {}", e);
-                        }
-                    }
+        match std::fs::read(&path) {
+            Ok(contents) => match serde_json::from_slice::<PersistedState>(&contents) {
+                Ok(persisted) => {
+                    return AppState {
+                        settings: persisted.settings.unwrap_or_default(),
+                        legacy_videos: persisted.videos,
+                        notices: persisted.notices,
+                    };
                 }
                 Err(e) => {
-                    eprintln!("Failed to read state file: {}", e);
+                    // Keep the unreadable file for recovery instead of
+                    // overwriting it with defaults on the next save.
+                    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                    let aside = path.with_file_name(format!("state.json.corrupt-{}", stamp));
+                    eprintln!("Failed to parse state file ({}); moved to {}", e, aside.display());
+                    let _ = std::fs::rename(&path, &aside);
                 }
-            }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Failed to read state file: {}", e),
         }
 
         AppState::default()
@@ -184,16 +212,24 @@ impl AppState {
         }
 
         let persisted = PersistedState {
-            videos: self.videos.clone(),
-            settings: settings_to_save,
+            settings: Some(settings_to_save),
+            videos: self.legacy_videos.clone(),
+            notices: self.notices.clone(),
         };
 
-        let contents = serde_json::to_string_pretty(&persisted)
-            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+        crate::library::fsutil::write_json_atomic(&path, &persisted)
+    }
 
-        std::fs::write(&path, contents)
-            .map_err(|e| format!("Failed to write state file: {}", e))?;
-
-        Ok(())
+    /// Before dropping the old videos from state.json, keep a copy of the
+    /// original file (once: a later run must not overwrite the real original).
+    pub fn backup_pre_library_state() -> Result<(), String> {
+        let path = get_state_file_path();
+        let backup = path.with_file_name("state.v0.json");
+        if backup.exists() || !path.exists() {
+            return Ok(());
+        }
+        std::fs::copy(&path, &backup)
+            .map(|_| ())
+            .map_err(|e| format!("Failed to back up state.json: {}", e))
     }
 }

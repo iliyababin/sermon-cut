@@ -19,6 +19,14 @@ No Homebrew or admin password needed. The app updates itself, and keeps yt-dlp u
 
 Requires an Apple Silicon Mac (M1 or newer).
 
+## Using the library
+
+Everything lives in one **library folder** (by default `Movies/sermon-cut`; change it in Settings). Drop a recording into that folder and it shows up in the app as **Not processed**. Click **Process** to transcribe it, trim it to the sermon and make thumbnails; it then shows as **Ready for Review**, and after you upload it, **Uploaded**. Videos downloaded from YouTube land in the same folder.
+
+The app keeps its own files in a hidden `.sermon-cut` folder inside the library (transcripts, trimmed videos, thumbnails and the list of what's been done). Your video files are never changed unless you choose **Move to Trash**. Copying the whole library folder, including `.sermon-cut`, to another Mac brings its progress along.
+
+Videos longer than 75 minutes can't be transcribed yet; trim them to the sermon first.
+
 ## Install on Windows and Linux
 
 Grab the latest release for your platform from [Releases](https://github.com/iliyababin/sermon-cut/releases):

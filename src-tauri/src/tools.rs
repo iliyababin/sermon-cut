@@ -17,12 +17,45 @@ fn installed(name: &str) -> Option<PathBuf> {
 }
 
 /// Build a command for an external tool, preferring the copy from install.sh
-/// and falling back to whatever is on PATH.
+/// and falling back to whatever is on PATH. The process is killed if the
+/// future running it is dropped (e.g. a cancelled job).
 pub fn command(name: &str) -> Command {
-    match installed(name) {
+    let mut command = match installed(name) {
         Some(path) => Command::new(path),
         None => Command::new(name),
+    };
+    command.kill_on_drop(true);
+    command
+}
+
+/// Blocking version of `command`, for code already on a blocking thread.
+pub fn std_command(name: &str) -> std::process::Command {
+    match installed(name) {
+        Some(path) => std::process::Command::new(path),
+        None => std::process::Command::new(name),
     }
+}
+
+static MISSING_TOOL: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+/// Remember that a tool couldn't be started, so the UI can say so once
+/// instead of showing every video as unreadable.
+pub fn mark_missing(name: &'static str) {
+    *MISSING_TOOL.lock().unwrap() = Some(name);
+}
+
+pub fn clear_missing(name: &str) {
+    let mut missing = MISSING_TOOL.lock().unwrap();
+    if *missing == Some(name) {
+        *missing = None;
+    }
+}
+
+pub fn missing_tool_message() -> Option<String> {
+    MISSING_TOOL
+        .lock()
+        .unwrap()
+        .map(|name| format!("{} isn't installed. {}", name, INSTALL_HINT))
 }
 
 /// Turn a failure to start a tool into a message a non-technical user can act on.

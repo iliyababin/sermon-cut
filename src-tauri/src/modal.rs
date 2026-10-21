@@ -71,7 +71,7 @@ pub async fn transcribe_audio(
     let request_body = TranscribeRequest { audio_base64 };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600)) // 10 min total timeout
+        .timeout(std::time::Duration::from_secs(30 * 60)) // upload + transcription + analysis of a long service
         .connect_timeout(std::time::Duration::from_secs(30))
         .pool_idle_timeout(std::time::Duration::from_secs(600))
         .tcp_keepalive(std::time::Duration::from_secs(60))

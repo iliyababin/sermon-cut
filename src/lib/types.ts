@@ -33,6 +33,82 @@ export type VideoStatus =
   | "ready_for_review"
   | "error";
 
+export type LibraryStatus =
+  | "copying"
+  | "unreadable"
+  | "new"
+  | "too_long"
+  | "queued"
+  | "processing"
+  | "ready_for_review"
+  | "done"
+  | "error"
+  | "missing";
+
+export interface UploadRecord {
+  url: string;
+  uploaded_at: string;
+  file_hash: string;
+}
+
+/** A video in the library folder. */
+export interface LibraryVideo {
+  id: string;
+  file_name: string;
+  file_path: string;
+  title: string;
+  status: LibraryStatus;
+  error: string | null;
+  duration: number | null;
+  size: number;
+  channel: string | null;
+  source_url: string | null;
+  hidden: boolean;
+  uploads: UploadRecord[];
+  added_at: string;
+  thumbnail: string | null;
+  processing_stage: ProcessingStage | null;
+  processing_progress: number | null;
+  processing_message: string | null;
+  busy: boolean;
+}
+
+export interface DownloadItem {
+  job_id: string;
+  youtube_id: string;
+  title: string;
+}
+
+export interface LibraryView {
+  folder: string;
+  available: boolean;
+  writable: boolean;
+  message: string | null;
+  locked_by: string | null;
+  tool_problem: string | null;
+  videos: LibraryVideo[];
+  downloads: DownloadItem[];
+  notices: string[];
+  max_transcribe_secs: number;
+}
+
+export interface Review {
+  title: string | null;
+  description: string | null;
+  preacher: string | null;
+}
+
+/** Everything the review screen needs. */
+export interface VideoDetail extends LibraryVideo {
+  transcription: TranscriptionResult | null;
+  trimmed_path: string | null;
+  trim_start: number | null;
+  trim_end: number | null;
+  thumbnail_options: string[];
+  selected_thumbnail: string | null;
+  review: Review;
+}
+
 export type ProcessingStage =
   | "extracting_audio"
   | "transcribing"
@@ -40,21 +116,6 @@ export type ProcessingStage =
   | "generating_thumbnails"
   | "complete"
   | "error";
-
-export interface ProcessingProgress {
-  videoId: string;
-  stage: ProcessingStage;
-  progress: number;
-  message: string;
-}
-
-export interface ProcessedResult {
-  trimmedPath: string;
-  thumbnailOptions: string[];
-  transcription: TranscriptionResult;
-  sermonStart: number;
-  sermonEnd: number;
-}
 
 export interface TranscriptSegment {
   start: number;

@@ -1,13 +1,18 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   regenerateThumbnails,
-  openFolder,
+  revealVideo,
   youtubeGetAuthStatus,
   youtubeUploadVideo,
-  processVideoFull,
+  processVideo,
+  resetVideo,
+  saveReview,
+  errorMessage,
 } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
-import type { VideoInfo, YouTubeAuthStatus, Chapter } from "@/lib/types";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
+import type { VideoDetail, YouTubeAuthStatus, Chapter } from "@/lib/types";
 import { LocalImage } from "./LocalImage";
 import { ThumbnailEditor } from "./ThumbnailEditor";
 import {
@@ -33,38 +38,31 @@ const SOCIAL_LINKS = [
 ].join("\n");
 
 interface ReviewScreenProps {
-  video: VideoInfo;
+  video: VideoDetail;
   onBack: () => void;
-  onVideoUpdate: (video: VideoInfo) => void;
 }
 
-export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps) {
-  // Metadata editing
+const AUTOSAVE_MS = 1000;
+
+export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
+  // Metadata editing: saved edits first, then the AI's suggestions
   const [title, setTitle] = useState(
-    video.transcription?.suggested_title || video.title
+    video.review.title ?? video.transcription?.suggested_title ?? video.title
   );
   const [description, setDescription] = useState(
-    video.transcription?.suggested_description || ""
+    video.review.description ?? video.transcription?.suggested_description ?? ""
   );
-  const [chapters, setChapters] = useState<Chapter[]>(
-    video.transcription?.suggested_chapters || []
-  );
-  const [preacher, setPreacher] = useState("");
+  const chapters: Chapter[] = video.transcription?.suggested_chapters || [];
+  const [preacher, setPreacher] = useState(video.review.preacher ?? "");
 
-  // Trim boundaries (from transcription, used for chapter calculation)
-  const [startTime, setStartTime] = useState(
-    video.transcription?.sermon_start || 0
-  );
-  const [endTime, setEndTime] = useState(
-    video.transcription?.sermon_end || video.duration || 0
-  );
+  // Trim boundaries (what the trimmed video was cut to, used for chapters and captions)
+  const startTime = video.trim_start ?? video.transcription?.sermon_start ?? 0;
+  const endTime = video.trim_end ?? video.transcription?.sermon_end ?? video.duration ?? 0;
 
   // Thumbnails
-  const [thumbnailOptions, setThumbnailOptions] = useState<string[]>(
-    video.thumbnail_options || []
-  );
+  const [thumbnailOptions, setThumbnailOptions] = useState<string[]>(video.thumbnail_options);
   const [selectedThumbnail, setSelectedThumbnail] = useState(
-    video.thumbnail_path || (video.thumbnail_options?.[0] ?? null)
+    video.selected_thumbnail ?? video.thumbnail_options[0] ?? null
   );
   const [isRegeneratingThumbnails, setIsRegeneratingThumbnails] = useState(false);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
@@ -73,11 +71,47 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
   const [youtubeAuth, setYoutubeAuth] = useState<YouTubeAuthStatus | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [uploadedUrl, setUploadedUrl] = useState<string | null>(null);
+  const lastUpload = video.uploads[video.uploads.length - 1];
+  const [uploadedUrl, setUploadedUrl] = useState<string | null>(
+    video.status === "done" && lastUpload ? lastUpload.url : null
+  );
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadCount, setUploadCount] = useState(video.uploads.length);
 
   // Reprocessing state
   const [isReprocessing, setIsReprocessing] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Autosave edits (debounced), and flush whatever is pending on close.
+  const latest = useRef({ title, description, preacher, selectedThumbnail });
+  latest.current = { title, description, preacher, selectedThumbnail };
+  const dirty = useRef(false);
+  const firstRender = useRef(true);
+
+  const flush = () => {
+    if (!dirty.current) return Promise.resolve();
+    dirty.current = false;
+    const v = latest.current;
+    return saveReview(
+      video.id,
+      { title: v.title, description: v.description, preacher: v.preacher },
+      v.selectedThumbnail
+    )
+      .then(() => setSaveError(null))
+      .catch((err) => setSaveError(errorMessage(err, "Couldn't save your changes")));
+  };
+
+  useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    dirty.current = true;
+    const timer = setTimeout(flush, AUTOSAVE_MS);
+    return () => clearTimeout(timer);
+  }, [title, description, preacher, selectedThumbnail]);
+
+  useEffect(() => () => void flush(), []);
 
   // Load YouTube auth status
   useEffect(() => {
@@ -127,46 +161,46 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
   };
 
   const handleOpenFolder = async () => {
-    const pathToOpen = video.trimmed_path || video.file_path;
-    if (pathToOpen) {
-      await openFolder(pathToOpen);
+    try {
+      await revealVideo(video.id);
+    } catch (err) {
+      setSaveError(errorMessage(err));
     }
   };
 
   const handleReprocess = async () => {
-    if (!confirm("This will re-transcribe the video and regenerate all suggestions. Continue?")) {
-      return;
-    }
+    const confirmed = await ask(
+      "This re-transcribes the video and regenerates all suggestions and thumbnails. Your edits here are replaced. Continue?",
+      { title: "Reprocess", kind: "warning", okLabel: "Reprocess", cancelLabel: "Cancel" }
+    );
+    if (!confirmed) return;
 
     try {
       setIsReprocessing(true);
-      const updatedVideo = await processVideoFull(video.id);
-      onVideoUpdate(updatedVideo);
-
-      // Reset local state with new data
-      setTitle(updatedVideo.transcription?.suggested_title || updatedVideo.title);
-      setDescription(updatedVideo.transcription?.suggested_description || "");
-      setChapters(updatedVideo.transcription?.suggested_chapters || []);
-      setStartTime(updatedVideo.transcription?.sermon_start || 0);
-      setEndTime(updatedVideo.transcription?.sermon_end || updatedVideo.duration || 0);
-      setThumbnailOptions(updatedVideo.thumbnail_options || []);
-      setSelectedThumbnail(updatedVideo.thumbnail_path || updatedVideo.thumbnail_options?.[0] || null);
-
-      // Reset upload state
-      setUploadedUrl(null);
+      dirty.current = false;
+      // Reset deletes the saved transcript, so processing transcribes again.
+      await resetVideo(video.id);
+      await processVideo(video.id);
+      onBack();
     } catch (err) {
       console.error("Reprocessing failed:", err);
-      alert(`Reprocessing failed: ${err instanceof Error ? err.message : String(err)}`);
+      alert(`Reprocessing failed: ${errorMessage(err)}`);
     } finally {
       setIsReprocessing(false);
     }
   };
 
   const handleUpload = async () => {
-    const videoPath = video.trimmed_path || video.file_path;
-    if (!videoPath) return;
+    if (uploadCount > 0) {
+      const confirmed = await ask(
+        "This video has already been uploaded to YouTube. Upload it again as a new YouTube video?",
+        { title: "Upload again", kind: "warning", okLabel: "Upload Again", cancelLabel: "Cancel" }
+      );
+      if (!confirmed) return;
+    }
 
     try {
+      await flush();
       setIsUploading(true);
       setUploadError(null);
       setUploadProgress(0);
@@ -187,20 +221,20 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
       fullDescription += `\n\n---\n${SOCIAL_LINKS}`;
 
       const url = await youtubeUploadVideo(
-        videoPath,
+        video.id,
         title,
         fullDescription,
         selectedThumbnail || undefined,
         "public",
-        video.id,    // sourceVideoId for captions
         startTime,   // trim start for caption adjustment
         endTime      // trim end for caption adjustment
       );
       setUploadedUrl(url);
+      setUploadCount((n) => n + 1);
       setIsUploading(false);
     } catch (err) {
       console.error("Upload failed:", err);
-      setUploadError(err instanceof Error ? err.message : String(err));
+      setUploadError(errorMessage(err));
       setIsUploading(false);
     }
   };
@@ -220,7 +254,7 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
           </button>
           <div>
             <h2 className="font-semibold">{video.title}</h2>
-            <p className="text-sm text-muted-foreground">{video.channel}</p>
+            <p className="text-sm text-muted-foreground">{video.channel || video.file_name}</p>
           </div>
         </div>
 
@@ -241,8 +275,8 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
           {youtubeAuth?.is_authenticated && !uploadedUrl && (
             <button
               onClick={handleUpload}
-              disabled={isUploading || !preacher.trim() || !video.url}
-              title={!preacher.trim() ? "Speaker name is required" : !video.url ? "Original YouTube URL is required" : undefined}
+              disabled={isUploading || !preacher.trim()}
+              title={!preacher.trim() ? "Speaker name is required" : undefined}
               className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-colors"
             >
               {isUploading ? (
@@ -283,15 +317,13 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
               >
                 Upload Again
               </button>
-              <a
-                href={uploadedUrl}
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                onClick={() => openUrl(uploadedUrl)}
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
               >
                 Open on YouTube
                 <ExternalLink className="w-4 h-4" />
-              </a>
+              </button>
             </div>
           </div>
         </div>
@@ -310,6 +342,13 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
           >
             Retry
           </button>
+        </div>
+      )}
+
+      {saveError && (
+        <div className="mx-4 mt-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center gap-2">
+          <AlertCircle className="w-4 h-4" />
+          {saveError}
         </div>
       )}
 
@@ -427,19 +466,19 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
                 />
               </div>
 
-              <div>
-                <label className="block text-sm font-medium mb-1">
-                  Original YouTube URL <span className="text-red-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  value={video.url}
-                  readOnly
-                  className={`w-full px-3 py-2 border rounded-lg bg-muted text-muted-foreground ${
-                    !video.url ? "border-red-300" : "border-input"
-                  }`}
-                />
-              </div>
+              {video.source_url && (
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Original YouTube URL
+                  </label>
+                  <input
+                    type="text"
+                    value={video.source_url}
+                    readOnly
+                    className="w-full px-3 py-2 border border-input rounded-lg bg-muted text-muted-foreground"
+                  />
+                </div>
+              )}
 
               <div>
                 <label className="block text-sm font-medium mb-1">
@@ -481,7 +520,7 @@ export function ReviewScreen({ video, onBack, onVideoUpdate }: ReviewScreenProps
               className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 flex items-center gap-2 transition-colors"
             >
               <FolderOpen className="w-4 h-4" />
-              Open Folder
+              Show in Finder
             </button>
 
             {!youtubeAuth?.is_authenticated && (

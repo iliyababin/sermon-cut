@@ -1,8 +1,8 @@
 import { useState, useEffect } from "react";
-import { getVideoInfo, downloadVideo, processVideoFull } from "@/lib/tauri";
+import { getVideoInfo, downloadVideo, cancelDownload, errorMessage } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import type { VideoInfo } from "@/lib/types";
-import { Loader2, AlertCircle, Clock, User, Zap } from "lucide-react";
+import { Loader2, AlertCircle, Clock, User, Zap, Download, X } from "lucide-react";
 
 interface DownloadProgress {
   video_id: string;
@@ -27,7 +27,6 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
   const [downloadStatus, setDownloadStatus] = useState<string>("downloading");
   const [error, setError] = useState<string | null>(null);
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
 
   useEffect(() => {
     const unlisten = listen<DownloadProgress>("download-progress", (event) => {
@@ -56,14 +55,14 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
       const info = await getVideoInfo(url);
       setVideoInfo(info);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err || "Failed to fetch video info"));
+      setError(errorMessage(err, "Failed to fetch video info"));
       setVideoInfo(null);
     } finally {
       setLoading(false);
     }
   }
 
-  async function handleDownloadAndProcess() {
+  async function handleDownload(process: boolean) {
     if (!videoInfo) return;
 
     try {
@@ -72,24 +71,17 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
       setDownloadStatus("downloading");
       setError(null);
 
-      // Step 1: Download the video
-      const result = await downloadVideo(url, quality);
+      // Downloads into the library folder; with `process` it's queued for
+      // processing as soon as it lands.
+      await downloadVideo(url, quality, process);
 
-      // Step 2: Start processing in background and redirect to library
-      setIsProcessing(true);
       setDownloading(false);
-
-      // Start processing (this runs in background, we don't await)
-      processVideoFull(result.id).catch((err) => {
-        console.error("Background processing failed:", err);
-      });
-
-      // Redirect to library immediately
+      setVideoInfo(null);
+      setUrl("");
       onGoToLibrary();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err || "Download failed"));
+      setError(errorMessage(err, "Download failed"));
       setDownloading(false);
-      setIsProcessing(false);
       setDownloadProgress(0);
     }
   }
@@ -180,49 +172,64 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
                 )}
               </div>
 
-              {downloading || isProcessing ? (
+              {downloading ? (
                 <div className="mt-4">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-sm font-medium">
-                      {isProcessing
-                        ? "Starting processing..."
-                        : downloadStatus === "processing"
-                          ? "Processing..."
-                          : "Downloading..."}
+                      {downloadStatus === "processing" ? "Finishing..." : "Downloading..."}
                     </span>
-                    <span className="text-sm text-muted-foreground">
-                      {isProcessing
-                        ? "Redirecting to library"
-                        : downloadStatus === "processing"
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-muted-foreground">
+                        {downloadStatus === "processing"
                           ? "Merging streams"
                           : `${downloadProgress.toFixed(1)}%`}
-                    </span>
+                      </span>
+                      <button
+                        onClick={() => cancelDownload(videoInfo.id)}
+                        className="p-1 text-muted-foreground hover:text-destructive rounded"
+                        title="Cancel download"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
                   </div>
                   <div className="h-3 bg-muted rounded-full overflow-hidden">
                     <div
                       className={`h-full transition-all duration-300 ${
-                        isProcessing || downloadStatus === "processing"
+                        downloadStatus === "processing"
                           ? "bg-yellow-500 animate-pulse"
                           : "bg-primary"
                       }`}
-                      style={{ width: isProcessing ? "100%" : `${downloadProgress}%` }}
+                      style={{ width: `${downloadProgress}%` }}
                     />
                   </div>
-                  {!isProcessing && downloadStatus !== "processing" && (
+                  {downloadStatus !== "processing" && (
                     <div className="flex items-center justify-between mt-2 text-xs text-muted-foreground">
                       <span>{downloadSpeed || "Calculating..."}</span>
                       {downloadEta && <span>ETA: {downloadEta}</span>}
                     </div>
                   )}
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    You can leave this page; the download keeps going and shows up in the library.
+                  </p>
                 </div>
               ) : (
-                <button
-                  onClick={handleDownloadAndProcess}
-                  className="w-full mt-4 px-4 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 flex items-center justify-center gap-2 transition-colors"
-                >
-                  <Zap className="w-5 h-5" />
-                  Download & Process
-                </button>
+                <div className="mt-4 flex gap-2">
+                  <button
+                    onClick={() => handleDownload(false)}
+                    className="flex-1 px-4 py-3 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 flex items-center justify-center gap-2 transition-colors"
+                  >
+                    <Download className="w-5 h-5" />
+                    Download
+                  </button>
+                  <button
+                    onClick={() => handleDownload(true)}
+                    className="flex-1 px-4 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 flex items-center justify-center gap-2 transition-colors"
+                  >
+                    <Zap className="w-5 h-5" />
+                    Download & Process
+                  </button>
+                </div>
               )}
             </div>
           </div>

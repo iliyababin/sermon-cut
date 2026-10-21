@@ -1,51 +1,103 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { VideoInfo, TranscriptionResult, Settings, YouTubeAuthStatus, CropRect, PlaylistInfo } from "./types";
+import type {
+  VideoInfo,
+  Settings,
+  YouTubeAuthStatus,
+  CropRect,
+  PlaylistInfo,
+  LibraryView,
+  VideoDetail,
+} from "./types";
 
 export async function getVideoInfo(url: string): Promise<VideoInfo> {
   return invoke("get_video_info", { url });
 }
 
+// Library
+
+export async function getLibrary(): Promise<LibraryView> {
+  return invoke("get_library");
+}
+
+/** List the library folder again and return the result. */
+export async function rescanLibrary(): Promise<LibraryView> {
+  return invoke("rescan_library");
+}
+
+export async function getVideo(videoId: string): Promise<VideoDetail> {
+  return invoke("get_video", { videoId });
+}
+
+export async function processVideo(videoId: string): Promise<void> {
+  return invoke("process_video", { videoId });
+}
+
+export async function cancelProcessing(videoId: string): Promise<void> {
+  return invoke("cancel_processing", { videoId });
+}
+
+export async function resetVideo(videoId: string): Promise<void> {
+  return invoke("reset_video", { videoId });
+}
+
+export async function hideVideo(videoId: string, hidden: boolean): Promise<void> {
+  return invoke("hide_video", { videoId, hidden });
+}
+
+export async function trashVideo(videoId: string): Promise<void> {
+  return invoke("trash_video", { videoId });
+}
+
+export async function forgetVideo(videoId: string): Promise<void> {
+  return invoke("forget_video", { videoId });
+}
+
+export async function saveReview(
+  videoId: string,
+  review: { title: string; description: string; preacher: string },
+  selectedThumbnail: string | null
+): Promise<void> {
+  return invoke("save_review", { videoId, ...review, selectedThumbnail });
+}
+
+export async function revealVideo(videoId: string): Promise<void> {
+  return invoke("reveal_video", { videoId });
+}
+
+export async function openLibraryFolder(): Promise<void> {
+  return invoke("open_library_folder");
+}
+
+export async function dismissNotices(): Promise<void> {
+  return invoke("dismiss_notices");
+}
+
+export async function takeOverLibrary(): Promise<LibraryView> {
+  return invoke("take_over_library");
+}
+
+export async function clearLibraryData(): Promise<void> {
+  return invoke("clear_library_data");
+}
+
+export async function checkLibraryFolder(path: string): Promise<string[]> {
+  return invoke("check_library_folder", { path });
+}
+
+/** Download into the library. Resolves with the new video's id. */
 export async function downloadVideo(
   url: string,
-  quality?: string
-): Promise<VideoInfo> {
-  return invoke("download_video", { url, quality });
+  quality?: string,
+  process?: boolean
+): Promise<string> {
+  return invoke("download_video", { url, quality, process });
 }
 
 export async function cancelDownload(videoId: string): Promise<void> {
   return invoke("cancel_download", { videoId });
 }
 
-export async function getDownloadProgress(videoId: string): Promise<number> {
-  return invoke("get_download_progress", { videoId });
-}
-
-export async function extractAudio(videoId: string): Promise<string> {
-  return invoke("extract_audio", { videoId });
-}
-
-export async function transcribeAudio(
-  videoId: string,
-  forceRefresh?: boolean
-): Promise<TranscriptionResult> {
-  return invoke("transcribe_audio", { videoId, forceRefresh });
-}
-
-export async function trimVideo(
-  videoId: string,
-  startTime: number,
-  endTime: number
-): Promise<string> {
-  return invoke("trim_video", { videoId, startTime, endTime });
-}
-
-export async function getVideos(): Promise<VideoInfo[]> {
-  return invoke("get_videos");
-}
-
-export async function deleteVideo(videoId: string): Promise<void> {
-  return invoke("delete_video", { videoId });
-}
+// Settings
 
 export async function getSettings(): Promise<Settings> {
   return invoke("get_settings");
@@ -61,44 +113,6 @@ export async function resetState(): Promise<void> {
 
 export async function getAppDataDir(): Promise<string> {
   return invoke("get_app_data_dir");
-}
-
-export async function addLocalVideo(filePath: string): Promise<VideoInfo> {
-  return invoke("add_local_video", { filePath });
-}
-
-export async function generateThumbnail(
-  videoId: string,
-  startTime: number,
-  endTime: number,
-  title: string,
-  logoPath?: string
-): Promise<string> {
-  return invoke("generate_thumbnail", {
-    videoId,
-    startTime,
-    endTime,
-    title,
-    logoPath,
-  });
-}
-
-export async function generateThumbnailOptions(
-  videoId: string,
-  startTime: number,
-  endTime: number,
-  title: string,
-  count?: number,
-  logoPath?: string
-): Promise<string[]> {
-  return invoke("generate_thumbnail_options", {
-    videoId,
-    startTime,
-    endTime,
-    title,
-    count,
-    logoPath,
-  });
 }
 
 export async function openFile(path: string): Promise<void> {
@@ -132,51 +146,23 @@ export async function youtubeListPlaylists(): Promise<PlaylistInfo[]> {
 }
 
 export async function youtubeUploadVideo(
-  videoPath: string,
+  videoId: string,
   title: string,
   description: string,
   thumbnailPath?: string,
   privacy?: "public" | "unlisted" | "private",
-  sourceVideoId?: string,
   startTime?: number,
   endTime?: number
 ): Promise<string> {
   return invoke("youtube_upload_video", {
-    videoPath,
-    title,
-    description,
-    thumbnailPath,
-    privacy,
-    sourceVideoId,
-    startTime,
-    endTime,
-  });
-}
-
-export async function processVideoFull(videoId: string): Promise<VideoInfo> {
-  return invoke("process_video_full", { videoId });
-}
-
-export async function updateVideoMetadata(
-  videoId: string,
-  title?: string,
-  description?: string,
-  thumbnailPath?: string
-): Promise<VideoInfo> {
-  return invoke("update_video_metadata", {
     videoId,
     title,
     description,
     thumbnailPath,
+    privacy,
+    startTime,
+    endTime,
   });
-}
-
-export async function retrimVideo(
-  videoId: string,
-  startTime: number,
-  endTime: number
-): Promise<string> {
-  return invoke("retrim_video", { videoId, startTime, endTime });
 }
 
 export async function regenerateThumbnails(videoId: string): Promise<string[]> {
@@ -197,4 +183,10 @@ export async function processCustomThumbnail(
     applyColorGrading,
     applyLogoOverlay,
   });
+}
+
+/** Tauri rejects with a plain string; turn anything into a message. */
+export function errorMessage(err: unknown, fallback = "Something went wrong"): string {
+  if (err instanceof Error) return err.message;
+  return String(err || fallback);
 }

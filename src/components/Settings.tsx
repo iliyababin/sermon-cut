@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { getSettings, saveSettings, getAppDataDir, resetState, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists } from "@/lib/tauri";
+import { getSettings, saveSettings, getAppDataDir, resetState, clearLibraryData, checkLibraryFolder, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists, errorMessage } from "@/lib/tauri";
 import type { Settings as SettingsType, YouTubeAuthStatus, PlaylistInfo } from "@/lib/types";
 import { Save, Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle, RefreshCw, Download } from "lucide-react";
 import { useUpdater } from "@/hooks/useUpdater";
@@ -20,6 +20,10 @@ export function Settings() {
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
   const [resetConfirm, setResetConfirm] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [clearConfirm, setClearConfirm] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [folderWarnings, setFolderWarnings] = useState<string[]>([]);
   const [appVersion, setAppVersion] = useState("");
   const updater = useUpdater();
 
@@ -28,6 +32,15 @@ export function Settings() {
     loadYoutubeAuth();
     getVersion().then(setAppVersion);
   }, []);
+
+  const libraryFolder = settings?.output_folder ?? "";
+  useEffect(() => {
+    if (!libraryFolder) {
+      setFolderWarnings([]);
+      return;
+    }
+    checkLibraryFolder(libraryFolder).then(setFolderWarnings).catch(() => setFolderWarnings([]));
+  }, [libraryFolder]);
 
   async function loadSettings() {
     try {
@@ -105,11 +118,13 @@ export function Settings() {
 
     try {
       setSaving(true);
+      setSaveError(null);
       await saveSettings(settings);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       console.error("Failed to save settings:", err);
+      setSaveError(errorMessage(err, "Failed to save settings"));
     } finally {
       setSaving(false);
     }
@@ -154,8 +169,11 @@ export function Settings() {
 
           <div className="mt-4">
             <label className="block text-sm font-medium mb-2">
-              Output Folder
+              Library Folder
             </label>
+            <p className="text-sm text-muted-foreground mb-2">
+              Every video in this folder shows up in the library. Drop recordings in here; downloads from YouTube are saved here too.
+            </p>
             <div className="flex gap-2">
               <input
                 type="text"
@@ -181,6 +199,12 @@ export function Settings() {
             <p className="mt-2 text-sm text-muted-foreground">
               Default: Movies/sermon-cut on Mac, Videos/sermon-cut on Windows and Linux
             </p>
+            {folderWarnings.map((warning, i) => (
+              <div key={i} className="mt-2 flex items-start gap-2 p-3 text-sm rounded-lg bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{warning}</span>
+              </div>
+            ))}
           </div>
         </div>
 
@@ -449,9 +473,9 @@ export function Settings() {
           </div>
 
           <div className="mt-6 pt-6 border-t border-border">
-            <h4 className="text-sm font-semibold mb-2">Reset Application State</h4>
+            <h4 className="text-sm font-semibold mb-2">Reset Settings</h4>
             <p className="text-sm text-muted-foreground mb-3">
-              This will clear all saved videos and reset settings to defaults. Downloaded files on disk will not be deleted.
+              Puts every setting back to its default and signs out of YouTube. Your videos and the library are not touched.
             </p>
 
             {!resetConfirm ? (
@@ -459,52 +483,70 @@ export function Settings() {
                 onClick={() => setResetConfirm(true)}
                 className="px-4 py-2 bg-destructive/10 text-destructive rounded-lg hover:bg-destructive/20 transition-colors text-sm"
               >
-                Reset State...
+                Reset Settings...
               </button>
             ) : (
-              <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg space-y-3">
-                <div className="flex items-start gap-2">
-                  <AlertTriangle className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
-                  <p className="text-sm text-destructive">
-                    Are you sure? This will remove all videos from the library and reset all settings. This cannot be undone.
-                  </p>
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={async () => {
-                      try {
-                        setResetting(true);
-                        await resetState();
-                        await loadSettings();
-                        setResetConfirm(false);
-                      } catch (err) {
-                        console.error("Failed to reset state:", err);
-                      } finally {
-                        setResetting(false);
-                      }
-                    }}
-                    disabled={resetting}
-                    className="px-4 py-2 bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90 disabled:opacity-50 flex items-center gap-2 text-sm transition-colors"
-                  >
-                    {resetting ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : null}
-                    Yes, Reset Everything
-                  </button>
-                  <button
-                    onClick={() => setResetConfirm(false)}
-                    disabled={resetting}
-                    className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 text-sm transition-colors"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
+              <ConfirmBox
+                message="Reset all settings to their defaults and sign out of YouTube?"
+                confirmLabel="Yes, Reset Settings"
+                busy={resetting}
+                onCancel={() => setResetConfirm(false)}
+                onConfirm={async () => {
+                  try {
+                    setResetting(true);
+                    await resetState();
+                    await loadSettings();
+                    await loadYoutubeAuth();
+                    setResetConfirm(false);
+                  } catch (err) {
+                    setSaveError(errorMessage(err, "Failed to reset settings"));
+                  } finally {
+                    setResetting(false);
+                  }
+                }}
+              />
+            )}
+          </div>
+
+          <div className="mt-6 pt-6 border-t border-border">
+            <h4 className="text-sm font-semibold mb-2">Clear Library Data</h4>
+            <p className="text-sm text-muted-foreground mb-3">
+              Deletes Sermon Cut's transcripts, trimmed videos and thumbnails (the hidden .sermon-cut folder inside the library). Your video files stay where they are and show up as not processed.
+            </p>
+
+            {!clearConfirm ? (
+              <button
+                onClick={() => setClearConfirm(true)}
+                className="px-4 py-2 bg-destructive/10 text-destructive rounded-lg hover:bg-destructive/20 transition-colors text-sm"
+              >
+                Clear Library Data...
+              </button>
+            ) : (
+              <ConfirmBox
+                message="Delete all transcripts, trimmed videos, thumbnails and upload history for this library? This cannot be undone. Your video files are kept."
+                confirmLabel="Yes, Clear Library Data"
+                busy={clearing}
+                onCancel={() => setClearConfirm(false)}
+                onConfirm={async () => {
+                  try {
+                    setClearing(true);
+                    await clearLibraryData();
+                    setClearConfirm(false);
+                  } catch (err) {
+                    setSaveError(errorMessage(err, "Failed to clear library data"));
+                  } finally {
+                    setClearing(false);
+                  }
+                }}
+              />
             )}
           </div>
         </div>
 
         {/* Save Button */}
+        {saveError && (
+          <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">{saveError}</div>
+        )}
         <div className="flex justify-end">
           <button
             onClick={handleSave}
@@ -529,6 +571,46 @@ export function Settings() {
             )}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmBox({
+  message,
+  confirmLabel,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  message: string;
+  confirmLabel: string;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg space-y-3">
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
+        <p className="text-sm text-destructive">{message}</p>
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={onConfirm}
+          disabled={busy}
+          className="px-4 py-2 bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90 disabled:opacity-50 flex items-center gap-2 text-sm transition-colors"
+        >
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+          {confirmLabel}
+        </button>
+        <button
+          onClick={onCancel}
+          disabled={busy}
+          className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 text-sm transition-colors"
+        >
+          Cancel
+        </button>
       </div>
     </div>
   );

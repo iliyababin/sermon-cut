@@ -4,12 +4,13 @@ import { VideoLibrary } from "./components/VideoLibrary";
 import { DownloadForm } from "./components/DownloadForm";
 import { ReviewScreen } from "./components/ReviewScreen";
 import { Settings } from "./components/Settings";
+import { ThumbnailGenerator } from "./components/ThumbnailGenerator";
 import { getVideo, errorMessage } from "./lib/tauri";
 import type { LibraryVideo, VideoDetail } from "./lib/types";
-import { Download, Film, Settings as SettingsIcon, Clapperboard, ArrowUpCircle } from "lucide-react";
+import { Download, Film, Settings as SettingsIcon, Clapperboard, ArrowUpCircle, Image } from "lucide-react";
 import { useUpdater } from "./hooks/useUpdater";
 
-type View = "library" | "download" | "review" | "settings";
+type View = "library" | "download" | "review" | "settings" | "thumbnail";
 
 export default function App() {
   const [currentView, setCurrentView] = useState<View>("library");
@@ -65,6 +66,12 @@ export default function App() {
             onClick={() => setCurrentView("download")}
           />
           <NavButton
+            icon={<Image className="w-5 h-5" />}
+            label="Thumbnail"
+            active={currentView === "thumbnail"}
+            onClick={() => setCurrentView("thumbnail")}
+          />
+          <NavButton
             icon={<SettingsIcon className="w-5 h-5" />}
             label="Settings"
             active={currentView === "settings"}
@@ -105,6 +112,9 @@ export default function App() {
             />
           </div>
         )}
+        <div className={currentView === "thumbnail" ? "" : "hidden"}>
+          <ThumbnailGenerator />
+        </div>
         <div className={currentView === "settings" ? "" : "hidden"}>
           <Settings />
         </div>

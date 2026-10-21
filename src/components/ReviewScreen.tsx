@@ -7,8 +7,12 @@ import {
   processVideo,
   resetVideo,
   saveReview,
+  saveRenderedThumbnail,
   errorMessage,
 } from "@/lib/tauri";
+import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
+import { getDefaultTemplate } from "@/templates";
+import { splitTitleIntoLines, rawThumbnailVariant } from "@/lib/utils";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
@@ -65,6 +69,90 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     video.selected_thumbnail ?? video.thumbnail_options[0] ?? null
   );
   const [isRegeneratingThumbnails, setIsRegeneratingThumbnails] = useState(false);
+
+  // Template overlays: the webview draws title/speaker/logo over the raw crops
+  // and the result is saved back into the video's library folder.
+  const [renderedPaths, setRenderedPaths] = useState<string[]>([]);
+  const [singleLine, setSingleLine] = useState(false);
+  const [isRenderingOverlays, setIsRenderingOverlays] = useState(false);
+  const [renderProgress, setRenderProgress] = useState("");
+  const lastRenderKey = useRef("");
+
+  // Re-render overlays when the crops, title, speaker or layout change.
+  // Debounced so typing in the title field doesn't kick off a render per
+  // keystroke.
+  useEffect(() => {
+    const titleLines = singleLine ? [title.trim()] : splitTitleIntoLines(title);
+    const renderKey = `${thumbnailOptions.join(",")}|${titleLines.join(",")}|${preacher}|${singleLine}`;
+
+    if (
+      renderKey === lastRenderKey.current ||
+      thumbnailOptions.length === 0 ||
+      titleLines.length === 0 ||
+      !preacher.trim()
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const timeout = setTimeout(() => {
+      async function renderOverlays() {
+        setIsRenderingOverlays(true);
+        setRenderProgress("Preparing overlays...");
+
+        const renderStamp = Date.now();
+        try {
+          const template = getDefaultTemplate();
+          const results = await renderThumbnailBatch(
+            template,
+            thumbnailOptions.map(rawThumbnailVariant),
+            titleLines,
+            preacher,
+            (current, total) => {
+              if (!cancelled) {
+                setRenderProgress(`Rendering overlays ${current}/${total}...`);
+              }
+            },
+          );
+
+          if (cancelled) return;
+
+          const paths: string[] = [];
+          for (const result of results) {
+            const savedPath = await saveRenderedThumbnail(
+              video.id,
+              result.imageData,
+              `thumbnail_rendered_${result.index + 1}_${renderStamp}.jpg`,
+            );
+            paths.push(savedPath);
+          }
+
+          if (!cancelled) {
+            lastRenderKey.current = renderKey;
+            setRenderedPaths(paths);
+            if (paths.length > 0) {
+              setSelectedThumbnail(paths[0]);
+            }
+          }
+        } catch (err) {
+          console.error("Failed to render overlays:", err);
+        } finally {
+          if (!cancelled) {
+            setIsRenderingOverlays(false);
+            setRenderProgress("");
+          }
+        }
+      }
+
+      renderOverlays();
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+    };
+  }, [thumbnailOptions, title, preacher, singleLine, video.id]);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
 
   // Upload state
@@ -137,6 +225,8 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       setIsRegeneratingThumbnails(true);
       const newOptions = await regenerateThumbnails(video.id);
       setThumbnailOptions(newOptions);
+      setRenderedPaths([]); // overlays re-render off the new crops
+      lastRenderKey.current = "";
       if (newOptions.length > 0) {
         setSelectedThumbnail(newOptions[0]);
       }
@@ -405,8 +495,25 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
                 </div>
               </div>
 
+              <label className="flex items-center gap-2 text-sm mb-3 text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={singleLine}
+                  onChange={(e) => setSingleLine(e.target.checked)}
+                  className="rounded"
+                />
+                Title on a single line
+              </label>
+
+              {isRenderingOverlays && (
+                <div className="mb-3 p-2 bg-muted rounded-lg flex items-center gap-2">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  <span className="text-xs text-muted-foreground">{renderProgress}</span>
+                </div>
+              )}
+
               <div className="grid grid-cols-3 gap-2">
-                {thumbnailOptions.map((path, index) => (
+                {(renderedPaths.length > 0 ? renderedPaths : thumbnailOptions).map((path, index) => (
                   <button
                     key={path}
                     onClick={() => handleSelectThumbnail(path)}

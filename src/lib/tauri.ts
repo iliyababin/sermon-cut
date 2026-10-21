@@ -152,7 +152,8 @@ export async function youtubeUploadVideo(
   thumbnailPath?: string,
   privacy?: "public" | "unlisted" | "private",
   startTime?: number,
-  endTime?: number
+  endTime?: number,
+  playlistId?: string
 ): Promise<string> {
   return invoke("youtube_upload_video", {
     videoId,
@@ -162,6 +163,7 @@ export async function youtubeUploadVideo(
     privacy,
     startTime,
     endTime,
+    playlistId,
   });
 }
 
@@ -189,4 +191,31 @@ export async function processCustomThumbnail(
 export function errorMessage(err: unknown, fallback = "Something went wrong"): string {
   if (err instanceof Error) return err.message;
   return String(err || fallback);
+}
+
+export async function saveRenderedThumbnail(
+  videoId: string,
+  imageData: Uint8Array,
+  filename: string,
+): Promise<string> {
+  return invoke("save_rendered_thumbnail", {
+    videoId,
+    imageData: Array.from(imageData),
+    filename,
+  });
+}
+
+/// Crop an arbitrary image for the standalone Thumbnail tab (no library video).
+export async function cropStandaloneThumbnail(
+  sourceImagePath: string,
+  cropRect: CropRect,
+): Promise<string> {
+  return invoke("crop_standalone_thumbnail", { sourceImagePath, cropRect });
+}
+
+export async function copyFile(
+  source: string,
+  destination: string,
+): Promise<void> {
+  return invoke("copy_file", { source, destination });
 }

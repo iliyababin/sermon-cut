@@ -134,7 +134,7 @@ pub async fn start_oauth_flow(credentials: &YouTubeCredentials) -> Result<YouTub
         AUTH_URL,
         urlencoding::encode(&credentials.client_id),
         urlencoding::encode(&redirect_uri),
-        urlencoding::encode("https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube"),
+        urlencoding::encode("https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/youtube.force-ssl"),
         urlencoding::encode(&oauth_state)
     );
 
@@ -622,7 +622,7 @@ pub async fn upload_captions(
 
     // Add SRT file part
     body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    body.extend_from_slice(b"Content-Type: text/srt\r\n\r\n");
+    body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
     body.extend_from_slice(srt_content.as_bytes());
     body.extend_from_slice(b"\r\n");
 

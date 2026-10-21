@@ -309,3 +309,38 @@ pub async fn youtube_list_playlists(
     let access_token = fresh_access_token(&state, &app_handle).await?;
     crate::youtube::list_playlists(&access_token).await
 }
+
+/// Crop an arbitrary image for the standalone Thumbnail tab.
+///
+/// The library-backed `process_custom_thumbnail` needs a real video id; this
+/// one works on any file the user picks. Grading and the logo overlay are
+/// skipped on purpose — the template system draws those in the webview.
+#[tauri::command]
+pub async fn crop_standalone_thumbnail(
+    state: State<'_, AppStateHandle>,
+    source_image_path: String,
+    crop_rect: crate::thumbnail::CropRect,
+) -> Result<String, String> {
+    let output_dir = {
+        let guard = state.lock().await;
+        guard.settings.library_folder()
+    };
+    let dir = Path::new(&output_dir).join("thumbnails");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create thumbnails directory: {}", e))?;
+
+    crate::thumbnail::process_custom_thumbnail(&source_image_path, &dir, &crop_rect, false, None)
+        .await
+}
+
+/// Copy a file, creating the destination's parent directory if needed.
+#[tauri::command]
+pub async fn copy_file(source: String, destination: String) -> Result<(), String> {
+    if let Some(parent) = Path::new(&destination).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create destination directory: {}", e))?;
+    }
+    std::fs::copy(&source, &destination)
+        .map_err(|e| format!("Failed to copy {} to {}: {}", source, destination, e))?;
+    Ok(())
+}

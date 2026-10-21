@@ -59,6 +59,15 @@ fn save_jpeg(img: &RgbImage, path: &Path) -> Result<(), String> {
     std::fs::write(path, &buf).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
+/// Decode PNG bytes (as produced by html2canvas in the webview) and re-encode
+/// them as a JPEG, so rendered template thumbnails match the pipeline's format.
+pub fn save_png_as_jpeg(png_bytes: &[u8], output_path: &Path) -> Result<(), String> {
+    let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to decode PNG: {}", e))?;
+    let rgb = img.to_rgb8();
+    save_jpeg(&rgb, output_path)
+}
+
 /// Core pipeline: detect → score → pick best → crop → grade → logo → save.
 ///
 /// Returns `(final_image_path, debug_image_path_if_any)`.

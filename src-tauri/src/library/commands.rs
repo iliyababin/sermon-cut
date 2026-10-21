@@ -127,6 +127,16 @@ pub async fn process_custom_thumbnail(
     .await
 }
 
+#[tauri::command]
+pub async fn save_rendered_thumbnail(
+    lib: State<'_, LibraryHandle>,
+    video_id: String,
+    image_data: Vec<u8>,
+    filename: String,
+) -> Result<String, String> {
+    lib.save_rendered_thumbnail(&video_id, image_data, filename).await
+}
+
 /// Show the trimmed video (or the original) in Finder.
 #[tauri::command]
 pub async fn reveal_video(lib: State<'_, LibraryHandle>, video_id: String) -> Result<(), String> {
@@ -220,6 +230,7 @@ pub async fn youtube_upload_video(
     privacy: Option<String>,
     start_time: Option<f64>,
     end_time: Option<f64>,
+    playlist_id: Option<String>,
 ) -> Result<String, String> {
     use crate::youtube;
 
@@ -258,7 +269,11 @@ pub async fn youtube_upload_video(
             }
         }
 
-        let playlist = state.lock().await.settings.youtube_playlist_id.clone();
+        // An explicit playlist from the review screen wins over the setting.
+        let playlist = match playlist_id.filter(|p| !p.is_empty()) {
+            Some(explicit) => Some(explicit),
+            None => state.lock().await.settings.youtube_playlist_id.clone(),
+        };
         if let Some(playlist_id) = playlist.filter(|p| !p.is_empty()) {
             if let Err(e) = youtube::add_to_playlist(&access_token, &playlist_id, &uploaded_id).await {
                 println!("[youtube] Warning: Failed to add to playlist: {}", e);

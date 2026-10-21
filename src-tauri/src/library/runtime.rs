@@ -1231,6 +1231,51 @@ impl Library {
             let name = file_in_dir(&dir, &path)?;
             let _g = self.inner();
             let mut data = manifest::load_video_data(&dir);
+
+            // Each render writes a fresh timestamped file so the webview can't
+            // serve a cached image. Drop the previous render's files and
+            // manifest entries so neither grows without bound.
+            let superseded: Vec<String> = data
+                .thumbnail_options
+                .iter()
+                .filter(|n| n.starts_with(RENDERED_PREFIX) && *n != &name)
+                .cloned()
+                .collect();
+            for old in &superseded {
+                let _ = std::fs::remove_file(dir.join(old));
+            }
+            data.thumbnail_options.retain(|n| !superseded.contains(n));
+
+            if !data.thumbnail_options.contains(&name) {
+                data.thumbnail_options.insert(0, name.clone());
+            }
+            data.selected_thumbnail = Some(name.clone());
+            manifest::save_video_data(&dir, &data)?;
+            Ok(path_string(&dir.join(name)))
+        }
+        .await;
+        self.end_op(id);
+        result
+    }
+
+    /// Persist a thumbnail rendered in the webview (template system) into the
+    /// video's library folder and select it, mirroring `custom_thumbnail` so
+    /// the choice survives a restart.
+    pub async fn save_rendered_thumbnail(
+        self: &Arc<Self>,
+        id: &str,
+        png_bytes: Vec<u8>,
+        filename: String,
+    ) -> Result<String, String> {
+        let (paths, _entry, _data) = self.begin_op(id)?;
+        let result = async {
+            let dir = paths.ensure_video_dir(id)?;
+            let name = sanitize_filename(&filename)?;
+            let out_path = dir.join(&name);
+            crate::thumbnail::save_png_as_jpeg(&png_bytes, &out_path)?;
+
+            let _g = self.inner();
+            let mut data = manifest::load_video_data(&dir);
             if !data.thumbnail_options.contains(&name) {
                 data.thumbnail_options.insert(0, name.clone());
             }
@@ -1404,6 +1449,25 @@ pub struct UploadJob {
     pub thumbnail_path: Option<PathBuf>,
     pub segments: Option<Vec<crate::state::TranscriptSegment>>,
     pub file_hash: String,
+}
+
+/// Filename prefix for thumbnails rendered by the template system.
+const RENDERED_PREFIX: &str = "thumbnail_rendered_";
+
+/// Accept only a bare filename, so a rendered thumbnail can't be written
+/// outside the video's own folder.
+fn sanitize_filename(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Thumbnail filename is empty".to_string());
+    }
+    if Path::new(trimmed).components().count() != 1
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err(format!("Invalid thumbnail filename: {}", name));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Resolve a path the frontend sent back to a file directly inside `dir`.

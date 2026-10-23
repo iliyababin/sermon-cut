@@ -114,11 +114,10 @@ pub async fn save_review(
 #[tauri::command]
 pub async fn regenerate_thumbnails(
     lib: State<'_, LibraryHandle>,
-    state: State<'_, AppStateHandle>,
     app_handle: AppHandle,
     video_id: String,
 ) -> Result<Vec<String>, String> {
-    let result = lib.regenerate_thumbnails(&app_handle, &state, &video_id).await;
+    let result = lib.regenerate_thumbnails(&video_id).await;
     changed(&app_handle);
     result
 }

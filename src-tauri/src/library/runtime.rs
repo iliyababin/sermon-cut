@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
 
 pub type AppStateHandle = Arc<tokio::sync::Mutex<AppState>>;
@@ -237,18 +237,6 @@ fn hold(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
 fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl std::future::Future<Output = Result<T, String>> {
     let handle = tokio::task::spawn_blocking(f);
     async move { handle.await.map_err(|e| format!("Background task failed: {}", e)) }
-}
-
-/// Logo setting, or the bundled default.
-pub fn effective_logo(app: &AppHandle, logo_path: Option<String>) -> Option<String> {
-    match logo_path {
-        Some(path) if !path.is_empty() => Some(path),
-        _ => app
-            .path()
-            .resolve("resources/default_logo.png", tauri::path::BaseDirectory::Resource)
-            .ok()
-            .map(|p| path_string(&p)),
-    }
 }
 
 /// What to tell the user about a read-only library. `why` is either the
@@ -1632,13 +1620,9 @@ impl Library {
             let e = g.entry(id)?;
             (paths, e.file_name.clone(), e.fingerprint.clone(), e.duration, e.display_title())
         };
-        let (api_url, api_key, logo) = {
+        let (api_url, api_key) = {
             let s = app_state.lock().await;
-            (
-                s.settings.modal_api_url.clone(),
-                s.settings.modal_api_key.clone(),
-                s.settings.logo_path.clone(),
-            )
+            (s.settings.modal_api_url.clone(), s.settings.modal_api_key.clone())
         };
         let video_path = paths.original(&file_name)?;
 
@@ -1722,8 +1706,7 @@ impl Library {
 
         self.set_progress(app, id, ProcessingStage::GeneratingThumbnails, 75.0, "Generating thumbnail options...");
         let title = transcription.suggested_title.clone().unwrap_or(display_title);
-        let logo = effective_logo(app, logo);
-        let thumbs = crate::thumbnail::generate_thumbnail_options(&video_path, start, end, &title, &staging, 10, logo.as_deref()).await?;
+        let thumbs = crate::thumbnail::generate_thumbnail_options(&video_path, start, end, &title, &staging, 10).await?;
         let thumb_names: Vec<String> = thumbs
             .iter()
             .filter_map(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
@@ -2017,10 +2000,9 @@ impl Library {
         Ok((BusyGuard { lib: self, id: id.to_string() }, paths, e, data))
     }
 
-    pub async fn regenerate_thumbnails(self: &Arc<Self>, app: &AppHandle, app_state: &AppStateHandle, id: &str) -> Result<Vec<String>, String> {
+    pub async fn regenerate_thumbnails(self: &Arc<Self>, id: &str) -> Result<Vec<String>, String> {
         let (_busy, paths, entry, data) = self.begin_op(id)?;
         async {
-            let logo = effective_logo(app, app_state.lock().await.settings.logo_path.clone());
             let dir = paths.ensure_video_dir(id)?;
             let transcript = manifest::load_transcript(&dir).map(|t| t.transcription);
             let start = data.trim_start.or(transcript.as_ref().and_then(|t| t.sermon_start)).unwrap_or(0.0);
@@ -2042,7 +2024,7 @@ impl Library {
             std::fs::create_dir(&staging).map_err(|e| format!("Failed to create work folder: {}", e))?;
             let video_path = paths.original(&entry.file_name)?;
             let generated =
-                crate::thumbnail::generate_thumbnail_options(&video_path, start, end, &title, &staging, 10, logo.as_deref()).await;
+                crate::thumbnail::generate_thumbnail_options(&video_path, start, end, &title, &staging, 10).await;
             let names = generated.map(|thumbs| {
                 thumbs
                     .iter()

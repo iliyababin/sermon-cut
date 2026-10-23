@@ -3,7 +3,6 @@ mod crop;
 mod fit;
 mod frames;
 mod grading;
-mod logo;
 mod scoring;
 mod yolo;
 
@@ -68,15 +67,15 @@ pub fn save_for_youtube(bytes: &[u8], output_path: &Path) -> Result<(), String> 
 }
 
 /// Core pipeline: extract frames → detect → score → pick best → crop →
-/// grade → logo → save. Frame extraction is async (ffmpeg); the rest is CPU
-/// work and runs on a blocking thread.
+/// grade → save. No logo: the review screen's template draws it. Frame
+/// extraction is async (ffmpeg); the rest is CPU work and runs on a
+/// blocking thread.
 async fn run_pipeline(
     video_path: &str,
     start_time: f64,
     end_time: f64,
     output_dir: &Path,
     output_stem: &str,
-    logo_path: Option<&str>,
     count: u32,
 ) -> Result<Vec<String>, String> {
     let model_path = find_model_path()?;
@@ -92,9 +91,8 @@ async fn run_pipeline(
 
     let output_dir = output_dir.to_path_buf();
     let output_stem = output_stem.to_string();
-    let logo_path = logo_path.map(str::to_string);
     let result = tokio::task::spawn_blocking(move || {
-        pick_and_save(&model_path, &frame_data, &output_dir, &output_stem, logo_path.as_deref(), count)
+        pick_and_save(&model_path, &frame_data, &output_dir, &output_stem, count)
     })
     .await
     .map_err(|e| format!("Thumbnail task failed: {}", e))?;
@@ -108,7 +106,6 @@ fn pick_and_save(
     frame_data: &[(f64, PathBuf)],
     output_dir: &Path,
     output_stem: &str,
-    logo_path: Option<&str>,
     count: u32,
 ) -> Result<Vec<String>, String> {
     if frame_data.is_empty() {
@@ -180,9 +177,6 @@ fn pick_and_save(
             save_jpeg(&cropped, &raw_path)?;
         }
         grading::apply_color_grading(&mut cropped);
-        if let Some(lp) = logo_path {
-            logo::apply_logo_overlay(&mut cropped, lp);
-        }
 
         let out_path = output_dir.join(format!("{}thumbnail_option_1.jpg", output_stem));
         save_jpeg(&cropped, &out_path)?;
@@ -216,12 +210,9 @@ fn pick_and_save(
             save_jpeg(&raw_cropped, &raw_path)?;
         }
 
-        // Crop → grade → logo
+        // Crop → grade
         let mut result = crop_image(&img, &person_crop);
         grading::apply_color_grading(&mut result);
-        if let Some(lp) = logo_path {
-            logo::apply_logo_overlay(&mut result, lp);
-        }
 
         let out_name = if count > 1 {
             format!("{}thumbnail_option_{}.jpg", output_stem, idx + 1)
@@ -275,7 +266,6 @@ pub async fn generate_thumbnail_options(
     title: &str,
     output_dir: &Path,
     count: u32,
-    logo_path: Option<&str>,
 ) -> Result<Vec<String>, String> {
     if !video_path.exists() {
         return Err(format!("Video file not found: {}", video_path.display()));
@@ -293,7 +283,6 @@ pub async fn generate_thumbnail_options(
         end_time,
         output_dir,
         "",
-        logo_path,
         count,
     )
     .await

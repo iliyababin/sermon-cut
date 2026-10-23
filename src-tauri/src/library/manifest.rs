@@ -56,6 +56,9 @@ pub enum Loaded {
     Newer(Manifest, Option<String>),
     /// Unreadable; it was moved aside to the given name and a fresh one started.
     Corrupt(Manifest, String),
+    /// Unreadable, and it couldn't be set aside either: open read-only so
+    /// it is never overwritten.
+    Stuck(String),
 }
 
 #[derive(Deserialize)]
@@ -147,12 +150,28 @@ pub fn load(paths: &LibraryPaths) -> Result<Loaded, String> {
 fn set_aside(path: &Path, reason: &str) -> Loaded {
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let aside = path.with_file_name(format!("library.json.corrupt-{}", stamp));
+    set_aside_to(path, &aside, reason, |a, b| std::fs::rename(a, b))
+}
+
+/// Keep an unreadable library.json for recovery: move it to `aside`, or
+/// copy it there if it can't be moved. If neither works, it must not be
+/// overwritten, so the library opens read-only.
+fn set_aside_to(path: &Path, aside: &Path, reason: &str, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Loaded {
     eprintln!("[library] library.json is unreadable ({}); moving it to {}", reason, aside.display());
-    let _ = std::fs::rename(path, &aside);
-    Loaded::Corrupt(
-        Manifest::default(),
-        aside.file_name().unwrap_or_default().to_string_lossy().to_string(),
-    )
+    let kept = rename(path, aside).or_else(|e| {
+        eprintln!("[library] Couldn't move it ({}); copying instead", e);
+        std::fs::copy(path, aside).map(|_| ())
+    });
+    match kept {
+        Ok(()) => Loaded::Corrupt(
+            Manifest::default(),
+            aside.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        ),
+        Err(e) => Loaded::Stuck(format!(
+            "The library's tracking file (.sermon-cut/library.json) can't be read, and Sermon Cut couldn't keep a copy of it ({}). The library is read-only so nothing is lost; move that file somewhere safe, then reopen the library.",
+            e
+        )),
+    }
 }
 
 pub fn save(paths: &LibraryPaths, manifest: &Manifest) -> Result<(), String> {
@@ -425,6 +444,32 @@ mod tests {
         assert!(aside.starts_with("library.json.corrupt-"));
         assert_eq!(std::fs::read(paths.data_dir().join(&aside)).unwrap(), b"{ not json");
         assert!(!paths.manifest().exists());
+    }
+
+    #[test]
+    fn unreadable_manifest_is_copied_when_it_cant_be_moved() {
+        let (_t, paths) = lib();
+        let path = paths.manifest();
+        std::fs::write(&path, b"{ not json").unwrap();
+        let aside = paths.data_dir().join("library.json.corrupt-x");
+        let refuse = |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let Loaded::Corrupt(_, name) = set_aside_to(&path, &aside, "bad", refuse) else { panic!() };
+        assert_eq!(name, "library.json.corrupt-x");
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn unreadable_manifest_that_cant_be_kept_opens_read_only() {
+        let (_t, paths) = lib();
+        let path = paths.manifest();
+        std::fs::write(&path, b"{ not json").unwrap();
+        // A folder sits where the copy would go: neither a move nor a copy works.
+        let aside = paths.data_dir().join("library.json.corrupt-x");
+        std::fs::create_dir(&aside).unwrap();
+        std::fs::write(aside.join("keep"), b"x").unwrap();
+        let Loaded::Stuck(why) = set_aside_to(&path, &aside, "bad", |a, b| std::fs::rename(a, b)) else { panic!() };
+        assert!(why.contains("read-only"), "{why}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "left in place");
     }
 
     #[test]

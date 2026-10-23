@@ -650,6 +650,7 @@ impl Library {
                     ));
                     (m, Mode::Writable)
                 }
+                Ok(Loaded::Stuck(why)) => (Manifest::default(), Mode::ReadOnly(why)),
                 Ok(Loaded::Newer(m, wanted)) => (
                     m,
                     Mode::ReadOnly(newer_library_message(wanted.as_deref())),

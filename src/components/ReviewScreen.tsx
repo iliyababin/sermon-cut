@@ -109,6 +109,8 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   const [renderProgress, setRenderProgress] = useState("");
   // A render that failed doesn't block uploading: the plain image is used.
   const [renderError, setRenderError] = useState<string | null>(null);
+  // Bumped by "Try again" to render the stale thumbnails again.
+  const [renderAttempt, setRenderAttempt] = useState(0);
   const titleLines = useMemo(
     () => (singleLine ? [title.trim()] : splitTitleIntoLines(title)).filter((l) => l),
     [title, singleLine]
@@ -157,7 +159,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       clearTimeout(timeout);
     };
     // staleIds + keys capture everything a render depends on.
-  }, [staleIds, keys, video.id]);
+  }, [staleIds, keys, video.id, renderAttempt]);
 
   const thumbnailsReady = staleOptions.length === 0 || renderError !== null;
   const shownPath = (o: ThumbnailOption) => renders[o.id]?.path ?? o.path;
@@ -185,6 +187,10 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   // Reprocessing state
   const [isReprocessing, setIsReprocessing] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // Regenerate or Reprocess failed.
+  const [actionError, setActionError] = useState<string | null>(null);
+  // The YouTube sign-in or playlists couldn't be loaded.
+  const [youtubeError, setYoutubeError] = useState<string | null>(null);
 
   // Autosave edits (debounced), and flush whatever is pending on close.
   const latest = useRef({ title, description, preacher, selectedSource });
@@ -234,15 +240,21 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   useEffect(() => () => void flush(), []);
 
   // Load YouTube auth status, the upload defaults and the playlists
-  useEffect(() => {
+  const loadYoutube = () => {
+    setYoutubeError(null);
     youtubeGetAuthStatus()
       .then((status) => {
         setYoutubeAuth(status);
         if (status.is_authenticated) {
-          youtubeListPlaylists().then(setPlaylists).catch(console.error);
+          youtubeListPlaylists()
+            .then(setPlaylists)
+            .catch((err) => setYoutubeError(`Couldn't load your playlists: ${errorMessage(err)}`));
         }
       })
-      .catch(console.error);
+      .catch((err) => setYoutubeError(`Couldn't check the YouTube sign-in: ${errorMessage(err)}`));
+  };
+  useEffect(() => {
+    loadYoutube();
     getSettings()
       .then((s) => {
         if (choicesTouched.current) return;
@@ -291,10 +303,11 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   const handleRegenerateThumbnails = async () => {
     try {
       setIsRegeneratingThumbnails(true);
+      setActionError(null);
       await regenerateThumbnails(video.id);
       await reloadThumbnails();
     } catch (err) {
-      console.error("Failed to regenerate thumbnails:", err);
+      setActionError(`Couldn't regenerate the thumbnails: ${errorMessage(err)}`);
     } finally {
       setIsRegeneratingThumbnails(false);
     }
@@ -326,14 +339,14 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
     try {
       setIsReprocessing(true);
+      setActionError(null);
       dirty.current = false;
       // Reset deletes the saved transcript, so processing transcribes again.
       await resetVideo(video.id);
       await processVideo(video.id);
       onBack();
     } catch (err) {
-      console.error("Reprocessing failed:", err);
-      alert(`Reprocessing failed: ${errorMessage(err)}`);
+      setActionError(`Couldn't reprocess: ${errorMessage(err)}`);
     } finally {
       setIsReprocessing(false);
     }
@@ -626,11 +639,17 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         </div>
       )}
 
-      {saveError && (
-        <div className="mx-4 mt-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center gap-2">
-          <AlertCircle className="w-4 h-4" />
-          {saveError}
-        </div>
+      {saveError && <ErrorBanner message={saveError} />}
+      {actionError && <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />}
+      {youtubeError && <ErrorBanner message={youtubeError} onRetry={loadYoutube} />}
+      {renderError && !renderProgress && (
+        <ErrorBanner
+          message={`Couldn't update the thumbnails: ${renderError}. Uploading uses the plain image.`}
+          onRetry={() => {
+            setRenderError(null);
+            setRenderAttempt((n) => n + 1);
+          }}
+        />
       )}
 
       {/* Main Content */}
@@ -673,7 +692,8 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                   </button>
                   <button
                     onClick={handleRegenerateThumbnails}
-                    disabled={isRegeneratingThumbnails}
+                    disabled={isRegeneratingThumbnails || phase.kind === "uploading"}
+                    title={phase.kind === "uploading" ? "Wait for the upload to finish" : undefined}
                     className="text-sm px-3 py-1.5 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 flex items-center gap-1.5 transition-colors"
                   >
                     {isRegeneratingThumbnails ? (
@@ -706,11 +726,6 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                   <Loader2 className="w-3 h-3 animate-spin" />
                   <span className="text-xs text-muted-foreground">{renderProgress}</span>
                 </div>
-              )}
-              {renderError && !renderProgress && (
-                <p className="mb-3 text-xs text-destructive">
-                  {renderError}. Uploading uses the plain image.
-                </p>
               )}
 
               <div className="grid grid-cols-3 gap-2">
@@ -850,6 +865,33 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
           onSave={handleThumbnailEditorSave}
           onClose={() => setIsEditorOpen(false)}
         />
+      )}
+    </div>
+  );
+}
+
+function ErrorBanner({
+  message,
+  onRetry,
+  onDismiss,
+}: {
+  message: string;
+  onRetry?: () => void;
+  onDismiss?: () => void;
+}) {
+  return (
+    <div role="alert" className="mx-4 mt-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center gap-2">
+      <AlertCircle className="w-4 h-4 shrink-0" />
+      <span className="flex-1">{message}</span>
+      {onRetry && (
+        <button onClick={onRetry} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors">
+          Try again
+        </button>
+      )}
+      {onDismiss && (
+        <button onClick={onDismiss} className="px-3 py-1 hover:bg-destructive/10 rounded-lg transition-colors">
+          Dismiss
+        </button>
       )}
     </div>
   );

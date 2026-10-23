@@ -184,6 +184,19 @@ describe("ReviewScreen", () => {
     expect((calls("save_review")[1][1] as Record<string, unknown>).title).toBe("Again");
   });
 
+  it("shows a failed regenerate inline, and disables it during an upload", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "regenerate_thumbnails" ? Promise.reject("ffmpeg crashed") : base(cmd, args)
+    );
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    const regenerate = screen.getByRole("button", { name: /regenerate/i }) as HTMLButtonElement;
+    fireEvent.click(regenerate);
+    expect((await screen.findByRole("alert")).textContent).toContain("ffmpeg crashed");
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    await waitFor(() => expect(regenerate.disabled).toBe(true));
+  });
+
   it("starts from the last privacy and the default playlist", async () => {
     render(<ReviewScreen video={video()} onBack={() => {}} />);
     const privacy = (await screen.findByLabelText("Privacy")) as HTMLSelectElement;

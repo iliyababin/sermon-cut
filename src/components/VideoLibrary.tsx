@@ -323,7 +323,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
       {library.downloads.length > 0 && (
         <div className="grid gap-4 mb-4">
           {library.downloads.map((d) => (
-            <DownloadCard key={d.job_id} item={d} progress={downloads[d.youtube_id]} />
+            <DownloadCard key={d.job_id} item={d} progress={downloads[d.youtube_id]} onCancel={() => run(() => cancelDownload(d.job_id))} />
           ))}
         </div>
       )}
@@ -393,7 +393,7 @@ function Banner({
   );
 }
 
-function DownloadCard({ item, progress }: { item: DownloadItem; progress?: DownloadProgress }) {
+function DownloadCard({ item, progress, onCancel }: { item: DownloadItem; progress?: DownloadProgress; onCancel: () => void }) {
   const merging = progress?.status === "processing";
   const pct = progress?.progress ?? 0;
   return (
@@ -421,7 +421,7 @@ function DownloadCard({ item, progress }: { item: DownloadItem; progress?: Downl
       </div>
       <div>
         <button
-          onClick={() => cancelDownload(item.job_id)}
+          onClick={onCancel}
           className="p-2 text-muted-foreground hover:text-destructive rounded-lg hover:bg-destructive/10 transition-colors"
           title="Cancel download"
         >

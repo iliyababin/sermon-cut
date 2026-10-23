@@ -221,7 +221,11 @@ export function DownloadForm({ onGoToLibrary, isActive }: DownloadFormProps) {
                           : `${downloadProgress.toFixed(1)}%`}
                       </span>
                       <button
-                        onClick={() => cancelDownload(videoInfo.id)}
+                        onClick={() =>
+                          cancelDownload(videoInfo.id).catch((err) =>
+                            setError(errorMessage(err, "Couldn't cancel the download"))
+                          )
+                        }
                         className="p-1 text-muted-foreground hover:text-destructive rounded"
                         title="Cancel download"
                       >

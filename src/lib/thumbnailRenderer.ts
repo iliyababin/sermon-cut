@@ -61,19 +61,20 @@ export async function renderThumbnailBatch(
   options: RenderOptions = {},
 ): Promise<RenderResult[]> {
   const resolveUrl = options.resolveUrl ?? convertFileSrc;
-  // Hidden but laid out, so text can be measured.
-  const host = document.createElement("div");
-  host.style.position = "fixed";
-  host.style.left = "-9999px";
-  host.style.top = "0";
-  host.style.zIndex = "-1";
-  document.body.appendChild(host);
-
-  await ensureFontsLoaded(template);
-
   const results: RenderResult[] = [];
+  let host: HTMLDivElement | null = null;
 
   try {
+    // Hidden but laid out, so text can be measured.
+    host = document.createElement("div");
+    host.style.position = "fixed";
+    host.style.left = "-9999px";
+    host.style.top = "0";
+    host.style.zIndex = "-1";
+    document.body.appendChild(host);
+
+    await ensureFontsLoaded(template);
+
     for (let i = 0; i < baseImagePaths.length; i++) {
       options.onProgress?.(i + 1, baseImagePaths.length);
 
@@ -108,7 +109,7 @@ export async function renderThumbnailBatch(
       results.push({ imageData: new Uint8Array(arrayBuffer), index: i });
     }
   } finally {
-    document.body.removeChild(host);
+    host?.remove();
   }
 
   return results;

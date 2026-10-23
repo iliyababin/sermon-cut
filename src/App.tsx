@@ -27,7 +27,7 @@ export default function App() {
   viewRef.current = currentView;
 
   useEffect(() => {
-    getVersion().then(setAppVersion);
+    getVersion().then(setAppVersion).catch(() => {});
     updater.checkForUpdates();
   }, []);
 

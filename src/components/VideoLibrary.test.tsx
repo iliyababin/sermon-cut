@@ -106,6 +106,20 @@ describe("VideoLibrary", () => {
     expect(screen.queryByText("Gone")).toBeNull();
   });
 
+  it("shows why a download couldn't be cancelled", async () => {
+    library.downloads = [{ job_id: "dl1", youtube_id: "yt1", title: "Sunday" }];
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "cancel_download"
+        ? Promise.reject("The download already finished.")
+        : cmd === "get_library" || cmd === "rescan_library"
+          ? Promise.resolve(library)
+          : Promise.resolve(null)
+    );
+    render(<VideoLibrary onVideoSelect={() => {}} />);
+    fireEvent.click(await screen.findByTitle("Cancel download"));
+    await screen.findByText("The download already finished.");
+  });
+
   it("shows a queued video's place in line", async () => {
     render(<VideoLibrary onVideoSelect={() => {}} />);
     await screen.findByText("Queued (2 of 3)");

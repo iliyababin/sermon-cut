@@ -251,14 +251,17 @@ pub async fn run_oauth_flow(credentials: &YouTubeCredentials, flow: &OAuthFlow) 
 
     // CSRF protection: only a callback carrying this state counts.
     let oauth_state = uuid::Uuid::new_v4().to_string();
+    // PKCE: the code is only worth anything with this verifier.
+    let verifier = pkce_verifier();
 
     let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
         flow.endpoints.auth,
         urlencoding::encode(&credentials.client_id),
         urlencoding::encode(&redirect_uri),
         urlencoding::encode("https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/youtube.force-ssl"),
-        urlencoding::encode(&oauth_state)
+        urlencoding::encode(&oauth_state),
+        pkce_challenge(&verifier)
     );
 
     println!("[youtube] Opening browser for sign-in; waiting on port {}", port);
@@ -288,7 +291,7 @@ pub async fn run_oauth_flow(credentials: &YouTubeCredentials, flow: &OAuthFlow) 
                     }
                     Callback::Code(code) => {
                         // Exchange first, so the page tells the truth.
-                        let result = exchange_code_for_tokens(credentials, &code, &redirect_uri, &flow.endpoints.token).await;
+                        let result = exchange_code_for_tokens(credentials, &code, &verifier, &redirect_uri, &flow.endpoints.token).await;
                         match &result {
                             Ok(_) => respond(&mut stream, "200 OK", PAGE_DONE).await,
                             Err(e) => respond(&mut stream, "200 OK", &page("Sign-in failed", e)).await,
@@ -307,9 +310,24 @@ pub async fn run_oauth_flow(credentials: &YouTubeCredentials, flow: &OAuthFlow) 
     }
 }
 
+/// A PKCE code verifier: 64 random URL-safe characters (RFC 7636 §4.1).
+fn pkce_verifier() -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = (0..3).flat_map(|_| uuid::Uuid::new_v4().into_bytes()).collect();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes[..48])
+}
+
+/// The S256 challenge for a verifier: base64url(SHA-256(verifier)).
+fn pkce_challenge(verifier: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()))
+}
+
 async fn exchange_code_for_tokens(
     credentials: &YouTubeCredentials,
     code: &str,
+    code_verifier: &str,
     redirect_uri: &str,
     token_url: &str,
 ) -> Result<YouTubeTokens, String> {
@@ -317,6 +335,7 @@ async fn exchange_code_for_tokens(
     params.insert("client_id", credentials.client_id.as_str());
     params.insert("client_secret", credentials.client_secret.as_str());
     params.insert("code", code);
+    params.insert("code_verifier", code_verifier);
     params.insert("grant_type", "authorization_code");
     params.insert("redirect_uri", redirect_uri);
 
@@ -510,6 +529,8 @@ mod tests {
         handle: tokio::task::JoinHandle<Result<YouTubeTokens, String>>,
         redirect: String,
         state: String,
+        challenge: String,
+        challenge_method: String,
     }
 
     async fn start(server: &MockServer, timeout: Duration, cancel: CancellationToken) -> Running {
@@ -537,7 +558,13 @@ mod tests {
             urlencoding::decode(value).unwrap().to_string()
         };
         assert!(url.starts_with(&format!("{}/auth?", server.base)));
-        Running { handle, redirect: param("redirect_uri"), state: param("state") }
+        Running {
+            handle,
+            redirect: param("redirect_uri"),
+            state: param("state"),
+            challenge: param("code_challenge"),
+            challenge_method: param("code_challenge_method"),
+        }
     }
 
     async fn get(url: &str) -> (u16, String, String) {
@@ -583,6 +610,42 @@ mod tests {
         let tokens = run.handle.await.unwrap().unwrap();
         assert_eq!(tokens.access_token, "new-access");
         assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh"));
+    }
+
+    #[tokio::test]
+    async fn the_code_is_exchanged_with_the_pkce_verifier() {
+        use base64::Engine;
+        use sha2::Digest;
+        let server = MockServer::start().await;
+        let run = start(&server, Duration::from_secs(10), CancellationToken::new()).await;
+        assert_eq!(run.challenge_method, "S256");
+        get(&format!("{}/?code=abc&state={}", run.redirect, run.state)).await;
+        run.handle.await.unwrap().unwrap();
+
+        let form = server.with(|s| s.token_requests[0].clone());
+        let verifier = form
+            .split('&')
+            .find_map(|p| p.strip_prefix("code_verifier="))
+            .map(|v| urlencoding::decode(v).unwrap().to_string())
+            .expect("a code_verifier was sent");
+        assert!((43..=128).contains(&verifier.len()), "{}", verifier);
+        assert!(verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)));
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
+        assert_eq!(run.challenge, expected);
+
+        // Each sign-in has its own.
+        let again = start(&server, Duration::from_secs(10), CancellationToken::new()).await;
+        assert_ne!(again.challenge, run.challenge);
+        again.handle.abort();
+    }
+
+    #[test]
+    fn pkce_challenge_is_base64url_sha256() {
+        // Computed independently (Python's hashlib and base64).
+        assert_eq!(
+            pkce_challenge("sermon-cut-pkce-test-verifier-0123456789-abcdefghijklmnop"),
+            "9Y03p2lF0DX5upK6YUJtnvjBvLJWsR2qtE5Ahiu359A"
+        );
     }
 
     #[tokio::test]

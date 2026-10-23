@@ -2408,6 +2408,8 @@ mod tests {
             session: "other".into(),
             app_version: "0".into(),
             heartbeat: chrono::Utc::now().timestamp(),
+            machine_id: Some("another-mac".into()),
+            user: Some("someone".into()),
         };
         fsutil::write_json_atomic(&paths.lock_file(), &other).unwrap();
         assert_eq!(lib.heartbeat().await, HeartbeatOutcome::LostTo("Office iMac".into()));

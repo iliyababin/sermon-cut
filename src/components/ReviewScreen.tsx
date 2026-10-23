@@ -10,7 +10,6 @@ import {
   processVideo,
   resetVideo,
   saveReview,
-  saveRenderedThumbnail,
   cancelUpload,
   errorMessage,
   UPLOAD_CANCELLED,
@@ -20,6 +19,7 @@ import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
 import { getDefaultTemplate } from "@/templates";
 import { splitTitleIntoLines } from "@/lib/utils";
 import { renderKey } from "./review/renderKey";
+import { useRenderSync } from "@/hooks/useRenderSync";
 import { buildYoutubeDescription, youtubeChapters, youtubeTitle } from "@/lib/youtube";
 import { canStartUpload, initialReviewState, reviewReducer, reviewShortcut } from "./review/reviewMachine";
 import { listen } from "@tauri-apps/api/event";
@@ -30,7 +30,6 @@ import type {
   YouTubeAuthStatus,
   Chapter,
   ThumbnailOption,
-  ThumbnailRender,
   PlaylistInfo,
   UploadPrivacy,
   UploadWarning,
@@ -76,13 +75,6 @@ const PRIVACY_LABELS: Record<UploadPrivacy, string> = {
   unlisted: "Unlisted",
   private: "Private",
 };
-const RENDER_DEBOUNCE_MS = 1500;
-
-type RenderMap = Record<string, { path: string; key: string }>;
-
-function rendersById(renders: ThumbnailRender[]): RenderMap {
-  return Object.fromEntries(renders.map((r) => [r.source, { path: r.path, key: r.render_key }]));
-}
 
 function fileName(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
@@ -127,18 +119,12 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   const [selectedSource, setSelectedSource] = useState<string | null>(
     video.selected_source ?? video.thumbnail_options[0]?.id ?? null
   );
-  const [renders, setRenders] = useState<RenderMap>(() => rendersById(video.renders));
   const [isRegeneratingThumbnails, setIsRegeneratingThumbnails] = useState(false);
 
   // The template draws title/speaker/logo over each source; the result is
   // saved into the video's library folder. A render is current when its key
   // matches what it would be rendered with now; only stale ones are redone.
   const [singleLine, setSingleLine] = useState(false);
-  const [renderProgress, setRenderProgress] = useState("");
-  // A render that failed doesn't block uploading: the plain image is used.
-  const [renderError, setRenderError] = useState<string | null>(null);
-  // Bumped by "Try again" to render the stale thumbnails again.
-  const [renderAttempt, setRenderAttempt] = useState(0);
   const titleLines = useMemo(
     () => (singleLine ? [title.trim()] : splitTitleIntoLines(title)).filter((l) => l),
     [title, singleLine]
@@ -148,46 +134,25 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     const inputs = { titleLines, preacher, singleLine };
     return Object.fromEntries(thumbnailOptions.map((o) => [o.id, renderKey(o, inputs)]));
   }, [thumbnailOptions, titleLines, preacher, singleLine]);
-  const staleOptions = canRender ? thumbnailOptions.filter((o) => renders[o.id]?.key !== keys[o.id]) : [];
-  const staleIds = staleOptions.map((o) => o.id).join("|");
-
-  useEffect(() => {
-    if (staleOptions.length === 0) return;
-    let cancelled = false;
-    const inputs = { titleLines, preacher };
-    const todo = staleOptions.map((o) => ({ option: o, key: keys[o.id] }));
-
-    // Debounced so typing in the title field doesn't start a render per
-    // keystroke; right away when nothing has been rendered yet.
-    const delay = Object.keys(renders).length === 0 ? 0 : RENDER_DEBOUNCE_MS;
-    const timeout = setTimeout(async () => {
-      try {
-        setRenderError(null);
-        const template = getDefaultTemplate();
-        for (let i = 0; i < todo.length; i++) {
-          if (cancelled) return;
-          setRenderProgress(`Updating thumbnails ${i + 1}/${todo.length}...`);
-          const { option, key } = todo[i];
-          const [result] = await renderThumbnailBatch(template, [option.render_from], inputs.titleLines, inputs.preacher);
-          if (cancelled) return;
-          const path = await saveRenderedThumbnail(video.id, option.id, key, result.imageData);
-          if (cancelled) return;
-          setRenders((prev) => ({ ...prev, [option.id]: { path, key } }));
-        }
-      } catch (err) {
-        console.error("Failed to render thumbnails:", err);
-        if (!cancelled) setRenderError(errorMessage(err, "Couldn't update the thumbnails"));
-      } finally {
-        if (!cancelled) setRenderProgress("");
-      }
-    }, delay);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timeout);
-    };
-    // staleIds + keys capture everything a render depends on.
-  }, [staleIds, keys, video.id, renderAttempt]);
+  // A render that failed doesn't block uploading: the plain image is used.
+  const {
+    renders,
+    replaceRenders,
+    stale: staleOptions,
+    progress: renderProgress,
+    error: renderError,
+    retry: retryRenders,
+  } = useRenderSync({
+    videoId: video.id,
+    options: thumbnailOptions,
+    keys,
+    enabled: canRender,
+    initial: video.renders,
+    render: async (option) => {
+      const [result] = await renderThumbnailBatch(getDefaultTemplate(), [option.render_from], titleLines, preacher);
+      return result.imageData;
+    },
+  });
 
   const thumbnailsReady = staleOptions.length === 0 || renderError !== null;
   const shownPath = (o: ThumbnailOption) => renders[o.id]?.path ?? o.path;
@@ -335,7 +300,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   const reloadThumbnails = async (select?: string) => {
     const fresh = await getVideo(video.id);
     setThumbnailOptions(fresh.thumbnail_options);
-    setRenders(rendersById(fresh.renders));
+    replaceRenders(fresh.renders);
     setSelectedSource(select ?? fresh.selected_source ?? fresh.thumbnail_options[0]?.id ?? null);
   };
 
@@ -702,10 +667,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       {renderError && !renderProgress && (
         <ErrorBanner
           message={`Couldn't update the thumbnails: ${renderError}. Uploading uses the plain image.`}
-          onRetry={() => {
-            setRenderError(null);
-            setRenderAttempt((n) => n + 1);
-          }}
+          onRetry={retryRenders}
         />
       )}
 

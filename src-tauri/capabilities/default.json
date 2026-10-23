@@ -2,33 +2,15 @@
   "$schema": "https://schemas.tauri.app/capability/2.0.0",
   "identifier": "default",
   "description": "Default capabilities for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:default",
     "shell:default",
     "shell:allow-open",
     "dialog:default",
-    {
-      "identifier": "fs:allow-read",
-      "allow": [
-        { "path": "$APPDATA/**" },
-        { "path": "$VIDEO/**" },
-        { "path": "$HOME/Videos/**" },
-        { "path": "$TEMP/**" }
-      ]
-    },
-    {
-      "identifier": "fs:allow-write",
-      "allow": [
-        { "path": "$APPDATA/**" },
-        { "path": "$VIDEO/**" },
-        { "path": "$HOME/Videos/**" },
-        { "path": "$TEMP/**" }
-      ]
-    },
-    "fs:allow-exists",
-    "fs:allow-mkdir",
     "updater:default",
     "process:allow-restart",
     "notification:default"

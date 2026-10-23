@@ -44,6 +44,7 @@ fn checked_logo(path: &Path, roots: &[PathBuf], picked: bool) -> Result<PathBuf,
 }
 
 /// Whether `path` is inside one of `roots` (see `fsutil::resolve_within`).
+#[cfg(test)]
 pub fn is_within(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| resolve_within(path, root).is_some())
 }
@@ -98,6 +99,7 @@ pub fn allowed_path(path: &Path, roots: &[PathBuf], picked: bool, access: Access
         .or_else(|| picked.then(|| resolve(path)).flatten())
 }
 
+#[cfg(test)]
 pub fn path_allowed(path: &Path, roots: &[PathBuf], picked: bool, access: Access) -> bool {
     allowed_path(path, roots, picked, access).is_some()
 }
@@ -840,6 +842,25 @@ mod tests {
         assert_eq!(image_mime(b"{\"refresh_token\": \"x\"}"), None);
         assert_eq!(image_mime(b"RIFF\x24\0\0\0WAVEfmt "), None);
         assert_eq!(image_mime(b""), None);
+    }
+
+    #[test]
+    fn the_webview_gets_no_file_system_api() {
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let names: Vec<String> = caps["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().or(p["identifier"].as_str()).unwrap().to_string())
+            .collect();
+        assert!(names.iter().all(|n| !n.starts_with("fs:")), "{names:?}");
+        // Dialog picks still reach the fs scope `check_path` asks.
+        assert!(names.iter().any(|n| n == "dialog:default"));
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["app"]["withGlobalTauri"], serde_json::json!(false));
+        let package: serde_json::Value = serde_json::from_str(include_str!("../../package.json")).unwrap();
+        assert!(package["dependencies"].get("@tauri-apps/plugin-fs").is_none());
     }
 
     #[test]

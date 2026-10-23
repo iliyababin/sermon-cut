@@ -1,7 +1,7 @@
 //! library.json and the per-video JSON files, with validation on load.
 
 use super::fsutil::{self, ReadJsonError};
-use super::{is_valid_file_name, is_valid_id, Entry, EntryStatus, LibraryPaths, SCHEMA_VERSION};
+use super::{is_valid_file_name, is_valid_id, Entry, EntryStatus, LibraryPaths, FORMAT_VERSION, MIN_APP_VERSION, SCHEMA_VERSION};
 use crate::state::TranscriptionResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -15,14 +15,25 @@ const MAX_TEXT: usize = 5000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
+    /// Missing in files written by v0.4.0 (schema 1).
+    #[serde(default = "schema_v1")]
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_app_version: Option<String>,
     #[serde(default)]
     pub entries: Vec<Entry>,
+}
+
+fn schema_v1() -> u32 {
+    1
 }
 
 impl Default for Manifest {
     fn default() -> Self {
         Manifest {
-            version: SCHEMA_VERSION,
+            version: FORMAT_VERSION,
+            schema_version: SCHEMA_VERSION,
+            min_app_version: Some(MIN_APP_VERSION.to_string()),
             entries: Vec::new(),
         }
     }
@@ -41,7 +52,8 @@ impl Manifest {
 pub enum Loaded {
     Ok(Manifest),
     /// Written by a newer app version: show it, but never write to it.
-    Newer(Manifest, u32),
+    /// Carries the app version it asks for, if it says.
+    Newer(Manifest, Option<String>),
     /// Unreadable; it was moved aside to the given name and a fresh one started.
     Corrupt(Manifest, String),
 }
@@ -49,6 +61,10 @@ pub enum Loaded {
 #[derive(Deserialize)]
 struct VersionOnly {
     version: u32,
+    #[serde(default)]
+    schema_version: Option<u32>,
+    #[serde(default)]
+    min_app_version: Option<String>,
 }
 
 fn truncate(s: &mut Option<String>) {
@@ -107,18 +123,21 @@ pub fn load(paths: &LibraryPaths) -> Result<Loaded, String> {
     };
 
     if let Ok(v) = serde_json::from_slice::<VersionOnly>(&bytes) {
-        if v.version > SCHEMA_VERSION {
+        if v.version > FORMAT_VERSION || v.schema_version.is_some_and(|s| s > SCHEMA_VERSION) {
             // Show what we can understand, but never rewrite it.
             let mut manifest = serde_json::from_slice::<Manifest>(&bytes).unwrap_or_default();
             sanitize(&mut manifest);
-            return Ok(Loaded::Newer(manifest, v.version));
+            let wanted = v.min_app_version.filter(|m| m.len() <= 32 && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'));
+            return Ok(Loaded::Newer(manifest, wanted));
         }
     }
 
     match serde_json::from_slice::<Manifest>(&bytes) {
         Ok(mut manifest) => {
             sanitize(&mut manifest);
-            manifest.version = SCHEMA_VERSION;
+            manifest.version = FORMAT_VERSION;
+            manifest.schema_version = SCHEMA_VERSION;
+            manifest.min_app_version = Some(MIN_APP_VERSION.to_string());
             Ok(Loaded::Ok(manifest))
         }
         Err(e) => Ok(set_aside(&path, &e.to_string())),
@@ -412,10 +431,28 @@ mod tests {
     fn newer_version_is_read_only() {
         let (_t, paths) = lib();
         std::fs::write(paths.manifest(), br#"{"version": 99, "entries": [], "future": true}"#).unwrap();
-        let Loaded::Newer(_, v) = load(&paths).unwrap() else { panic!() };
-        assert_eq!(v, 99);
+        let Loaded::Newer(_, wanted) = load(&paths).unwrap() else { panic!() };
+        assert_eq!(wanted, None);
         // Untouched.
         assert!(std::fs::read_to_string(paths.manifest()).unwrap().contains("future"));
+    }
+
+    #[test]
+    fn newer_schema_is_read_only_and_older_schema_upgrades() {
+        let (_t, paths) = lib();
+        std::fs::write(paths.manifest(), br#"{"version": 1, "schema_version": 3, "min_app_version": "0.9.0", "entries": []}"#).unwrap();
+        let Loaded::Newer(_, wanted) = load(&paths).unwrap() else { panic!() };
+        assert_eq!(wanted.as_deref(), Some("0.9.0"));
+
+        // What v0.4.0 writes: no schema_version. Saved back as schema 2,
+        // still format 1 so v0.4.0 can open it.
+        std::fs::write(paths.manifest(), br#"{"version": 1, "entries": []}"#).unwrap();
+        let Loaded::Ok(m) = load(&paths).unwrap() else { panic!() };
+        save(&paths, &m).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(paths.manifest()).unwrap()).unwrap();
+        assert_eq!(raw["version"], 1);
+        assert_eq!(raw["schema_version"], SCHEMA_VERSION);
+        assert_eq!(raw["min_app_version"], MIN_APP_VERSION);
     }
 
     #[test]

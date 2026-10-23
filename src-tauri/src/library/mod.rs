@@ -31,7 +31,15 @@ use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
 pub const DATA_DIR: &str = ".sermon-cut";
-pub const SCHEMA_VERSION: u32 = 1;
+/// library.json's `version`, which v0.4.0 checks: a higher one makes it
+/// open the library read-only. Left at 1 because every change since is
+/// additive and v0.4.0 may keep writing (both Macs should still update).
+pub const FORMAT_VERSION: u32 = 1;
+/// library.json's `schema_version`, checked from v0.5 on. Raise it (and
+/// MIN_APP_VERSION) when older builds must stop writing a library.
+pub const SCHEMA_VERSION: u32 = 2;
+/// The first app version that understands SCHEMA_VERSION.
+pub const MIN_APP_VERSION: &str = "0.5.0";
 
 /// Extensions (compared case-insensitively) that count as videos.
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "mts"];

@@ -510,6 +510,16 @@ fn clear_outputs(dir: &Path, keep_custom: bool) {
     }
 }
 
+fn newer_library_message(wanted: Option<&str>) -> String {
+    match wanted {
+        Some(v) => format!(
+            "This library was updated by a newer Sermon Cut — please update (to version {} or later) to make changes here.",
+            v
+        ),
+        None => "This library was updated by a newer Sermon Cut — please update to make changes here.".into(),
+    }
+}
+
 fn fingerprint_matches(now: &Fingerprint, expected: &Fingerprint) -> bool {
     now.size == expected.size && now.hash == expected.hash
 }
@@ -593,12 +603,9 @@ impl Library {
                     ));
                     (m, Mode::Writable)
                 }
-                Ok(Loaded::Newer(m, v)) => (
+                Ok(Loaded::Newer(m, wanted)) => (
                     m,
-                    Mode::ReadOnly(format!(
-                        "This library was last used by a newer version of Sermon Cut (format {}). Update Sermon Cut to make changes.",
-                        v
-                    )),
+                    Mode::ReadOnly(newer_library_message(wanted.as_deref())),
                 ),
                 Err(e) => (Manifest::default(), Mode::Unavailable(e)),
             },
@@ -2428,6 +2435,31 @@ mod tests {
         let view = lib.view(vec![]);
         assert!(view.available && view.writable && view.videos.is_empty());
     }
+
+    #[test]
+    fn newer_schema_opens_read_only() {
+        let (_t, lib, id, _dir) = processed_library();
+        let paths = lib.inner().paths.clone().unwrap();
+        lib.inner().save().unwrap();
+        let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(paths.manifest()).unwrap()).unwrap();
+        raw["schema_version"] = serde_json::json!(SCHEMA_NEXT);
+        raw["min_app_version"] = serde_json::json!("1.2.0");
+        std::fs::write(paths.manifest(), raw.to_string()).unwrap();
+
+        lib.open_blocking(true);
+        let view = lib.view(vec![]);
+        assert!(view.available && !view.writable);
+        assert_eq!(view.videos.len(), 1, "still shown");
+        let msg = view.message.unwrap();
+        assert!(msg.starts_with("This library was updated by a newer Sermon Cut — please update"), "{msg}");
+        assert!(msg.contains("1.2.0"), "{msg}");
+        assert!(lib.reset(&id).is_err());
+        // Never rewritten.
+        let after: serde_json::Value = serde_json::from_slice(&std::fs::read(paths.manifest()).unwrap()).unwrap();
+        assert_eq!(after["schema_version"], SCHEMA_NEXT);
+    }
+
+    const SCHEMA_NEXT: u32 = crate::library::SCHEMA_VERSION + 1;
 
     #[test]
     fn raw_variants() {

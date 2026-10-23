@@ -830,6 +830,36 @@ fn recover_commit(dir: &Path) {
     }
 }
 
+/// On open, before `mark_interrupted`: a queued entry still marked
+/// Processing (and not this session's running job) was cut short by the
+/// app stopping; count it. True if any was.
+fn count_restarts(manifest: &mut Manifest, running: Option<&str>) -> bool {
+    let queued: HashSet<String> = manifest.queue.iter().cloned().collect();
+    let mut any = false;
+    for e in &mut manifest.entries {
+        if e.status == EntryStatus::Processing && running != Some(e.id.as_str()) && queued.contains(&e.id) {
+            e.process_attempts += 1;
+            any = true;
+        }
+    }
+    any
+}
+
+/// After `mark_interrupted`: say why an entry stopped too often to be
+/// restarted (it then leaves the queue).
+fn give_up_restarting(manifest: &mut Manifest) {
+    let queued: HashSet<String> = manifest.queue.iter().cloned().collect();
+    for e in &mut manifest.entries {
+        if e.process_attempts >= super::MAX_RESTARTS && queued.contains(&e.id) {
+            e.error = Some(if e.status == EntryStatus::Error {
+                "Processing stopped unexpectedly twice — click Retry.".into()
+            } else {
+                "Re-processing stopped unexpectedly twice — click Reprocess to try again. The earlier results are kept.".into()
+            });
+        }
+    }
+}
+
 fn newer_library_message(wanted: Option<&str>) -> String {
     match wanted {
         Some(v) => format!(
@@ -1040,7 +1070,9 @@ impl Library {
                 sweep(&paths, &|id| self.video_lock(id));
             }
             let has_results = |e: &Entry| paths.video_dir(&e.id).is_ok_and(|dir| manifest::has_results(&dir));
-            if manifest::mark_interrupted(&mut manifest, running.as_deref(), has_results) || recovered {
+            let restarts = count_restarts(&mut manifest, running.as_deref());
+            if manifest::mark_interrupted(&mut manifest, running.as_deref(), has_results) || restarts || recovered {
+                give_up_restarting(&mut manifest);
                 if let Err(e) = manifest::save(&paths, &manifest) {
                     eprintln!("[library] Failed to save library.json: {}", e);
                 }
@@ -1049,15 +1081,15 @@ impl Library {
             // library.json was lost or restored from an older backup.
             orphans = manifest::find_orphans(&paths, &manifest);
         }
-        // The queue of the last session, minus what can't or needn't run.
+        // The queue of the last session (re-process requests of finished
+        // videos too), minus what can't run or was interrupted too often.
         let restored: Vec<String> = if mode == Mode::Writable && queue_idle {
             manifest
                 .queue
                 .iter()
                 .filter(|id| {
                     manifest.get(id).is_some_and(|e| {
-                        !matches!(e.status, EntryStatus::Done | EntryStatus::ReadyForReview)
-                            && paths.original(&e.file_name).is_ok_and(|p| p.is_file())
+                        e.process_attempts < super::MAX_RESTARTS && paths.original(&e.file_name).is_ok_and(|p| p.is_file())
                     })
                 })
                 .cloned()
@@ -1505,6 +1537,8 @@ impl Library {
         if g.is_busy(id) {
             return Err("This video is already queued or processing".into());
         }
+        // Asked for again: it may be restarted after a crash again.
+        g.entry_mut(id)?.process_attempts = 0;
         g.queue.push_back(id.to_string());
         if !g.manifest.queue.iter().any(|q| q == id) {
             g.manifest.queue.push(id.to_string());
@@ -1594,7 +1628,7 @@ impl Library {
             g.manifest.queue.retain(|q| q != id);
             if let Ok(e) = g.entry_mut(id) {
                 match result {
-                    Some(Ok(())) => {}
+                    Some(Ok(())) => e.process_attempts = 0,
                     Some(Err(err)) if matches!(previous, EntryStatus::Done | EntryStatus::ReadyForReview) => {
                         e.status = previous;
                         e.error = Some(format!("Re-processing failed: {}", err));
@@ -3788,14 +3822,72 @@ mod tests {
 
         let reopened = Library::new(root.to_string_lossy().to_string());
         reopened.open_blocking(true);
-        // The interrupted job first, then the one that was waiting; not the
-        // done or ready ones, an unknown id, or a file that's gone.
+        // In order: the interrupted job, re-process requests of finished
+        // videos, the one that was waiting; not an unknown id or a file
+        // that's gone.
+        let want = vec![ids[1].clone(), done.clone(), ids[0].clone(), ids[3].clone()];
         let g = reopened.inner();
-        assert_eq!(g.queue.iter().cloned().collect::<Vec<_>>(), vec![ids[1].clone(), ids[0].clone()]);
-        assert_eq!(g.manifest.queue, vec![ids[1].clone(), ids[0].clone()]);
+        assert_eq!(g.queue.iter().cloned().collect::<Vec<_>>(), want);
+        assert_eq!(g.manifest.queue, want);
         assert_eq!(g.status_of(g.manifest.get(&ids[1]).unwrap()), ViewStatus::Queued);
+        assert_eq!(g.manifest.get(&ids[1]).unwrap().process_attempts, 1);
+        assert_eq!(g.manifest.get(&ids[0]).unwrap().process_attempts, 0, "only the interrupted one counts");
         drop(g);
-        assert_eq!(saved_queue(&reopened), vec![ids[1].clone(), ids[0].clone()]);
+        assert_eq!(saved_queue(&reopened), want);
+    }
+
+    #[test]
+    fn a_job_interrupted_twice_waits_for_retry() {
+        let (_t, lib, _done, _dir) = processed_library();
+        let root = lib.root().unwrap();
+        std::fs::write(root.join("crashy.mp4"), b"crashy").unwrap();
+        let id = {
+            let mut g = lib.inner();
+            let mut e = Entry::new("crashy.mp4".into(), fsutil::fingerprint(&root.join("crashy.mp4")).unwrap(), Some(60.0));
+            e.status = EntryStatus::Processing;
+            let id = e.id.clone();
+            g.manifest.entries.push(e);
+            g.manifest.queue = vec![id.clone()];
+            g.save().unwrap();
+            id
+        };
+        // The app stops while it processes; reopened, it starts again.
+        let crash_and_reopen = || {
+            let mut m = match manifest::load(&lib.inner().paths.clone().unwrap()).unwrap() {
+                manifest::Loaded::Ok(m) => m,
+                _ => panic!("library.json unreadable"),
+            };
+            m.get_mut(&id).unwrap().status = EntryStatus::Processing;
+            manifest::save(&lib.inner().paths.clone().unwrap(), &m).unwrap();
+            let reopened = Library::new(root.to_string_lossy().to_string());
+            reopened.open_blocking(true);
+            reopened
+        };
+        let once = crash_and_reopen();
+        assert_eq!(once.inner().queue.iter().cloned().collect::<Vec<_>>(), vec![id.clone()]);
+        drop(once);
+
+        let twice = crash_and_reopen();
+        let g = twice.inner();
+        assert!(g.queue.is_empty() && g.manifest.queue.is_empty(), "not restarted a third time");
+        let e = g.manifest.get(&id).unwrap();
+        assert_eq!((e.status, e.process_attempts), (EntryStatus::Error, 2));
+        assert_eq!(e.error.as_deref(), Some("Processing stopped unexpectedly twice — click Retry."));
+        drop(g);
+
+        // Retry starts the count again, and so does a job that succeeds.
+        twice.inner().scanned = true;
+        twice.inner().last.present.insert(id.clone());
+        block_on(twice.enqueue(&id)).unwrap();
+        assert_eq!(twice.inner().manifest.get(&id).unwrap().process_attempts, 0);
+        twice.inner().entry_mut(&id).unwrap().process_attempts = 1;
+        twice.start_next().unwrap();
+        twice.finish_job(&id, &Some(Ok(())));
+        assert_eq!(twice.inner().manifest.get(&id).unwrap().process_attempts, 0);
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
     }
 
     #[test]

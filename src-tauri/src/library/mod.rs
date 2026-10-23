@@ -133,6 +133,20 @@ pub struct Entry {
     /// after it was cancelled).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_queued: bool,
+    /// Times processing of it was cut short by the app stopping (a crash
+    /// or a force quit) and restarted on the next open. After
+    /// `MAX_RESTARTS` it waits for the user instead. Back to 0 when a job
+    /// succeeds or the user asks again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub process_attempts: u32,
+}
+
+/// How many times a job the app stopped in the middle of is restarted by
+/// itself; the next interruption leaves it for the user.
+pub const MAX_RESTARTS: u32 = 2;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Entry {
@@ -156,6 +170,7 @@ impl Entry {
             missing: false,
             first_seen: chrono::Utc::now().timestamp_millis(),
             auto_queued: false,
+            process_attempts: 0,
         }
     }
 

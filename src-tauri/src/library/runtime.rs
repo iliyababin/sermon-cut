@@ -35,9 +35,11 @@ const FILE_CHANGED: &str =
 #[derive(Debug, Clone, PartialEq)]
 enum Mode {
     Writable,
-    /// Shown, but nothing is written: newer format, another Mac has it open,
-    /// or the folder can't be written.
+    /// Shown, but nothing is written: newer format, the folder can't be
+    /// written, or the migration is running. The message says which.
     ReadOnly(String),
+    /// Another computer (named) has it open: shown read-only until it lets go.
+    Locked(String),
     /// Folder missing or unreadable (drive unplugged). Last-known list shown.
     Unavailable(String),
 }
@@ -49,7 +51,19 @@ impl Mode {
         match self {
             Mode::Writable => true,
             Mode::ReadOnly(why) => why == UPDATING_LIBRARY,
-            Mode::Unavailable(_) => false,
+            Mode::Locked(_) | Mode::Unavailable(_) => false,
+        }
+    }
+
+    /// What to tell the user about a library that can't be written now.
+    fn reason(&self) -> Option<String> {
+        match self {
+            Mode::Writable => None,
+            Mode::Locked(host) => Some(format!(
+                "This library is open on {}. It's read-only here so the two computers don't overwrite each other's changes.",
+                host
+            )),
+            Mode::ReadOnly(why) | Mode::Unavailable(why) => Some(why.clone()),
         }
     }
 }
@@ -288,17 +302,6 @@ fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl s
     async move { handle.await.map_err(|e| format!("Background task failed: {}", e)) }
 }
 
-/// What to tell the user about a read-only library. `why` is either the
-/// message itself or "locked:<host>" when another computer has it open.
-fn readonly_reason(why: &str) -> String {
-    match why.strip_prefix("locked:") {
-        Some(host) => format!(
-            "This library is open on {}. It's read-only here so the two computers don't overwrite each other's changes.",
-            host
-        ),
-        None => why.to_string(),
-    }
-}
 
 /// Outcome of a lock heartbeat.
 #[derive(Debug, Clone, PartialEq)]
@@ -314,8 +317,8 @@ impl Inner {
     fn writable(&self) -> Result<&LibraryPaths, String> {
         match (&self.mode, &self.paths) {
             (Mode::Writable, Some(paths)) => Ok(paths),
-            (Mode::ReadOnly(why), _) | (Mode::Unavailable(why), _) => Err(readonly_reason(why)),
-            _ => Err("The library isn't open".into()),
+            (Mode::Writable, None) => Err("The library isn't open".into()),
+            (mode, _) => Err(mode.reason().unwrap_or_default()),
         }
     }
 
@@ -591,10 +594,8 @@ impl Inner {
 
         let (available, writable, message, locked_by) = match &self.mode {
             Mode::Writable => (true, true, self.notice.clone(), None),
-            Mode::ReadOnly(why) => {
-                let locked = why.strip_prefix("locked:").map(|h| h.to_string());
-                (true, false, Some(readonly_reason(why)), locked)
-            }
+            Mode::Locked(host) => (true, false, self.mode.reason(), Some(host.clone())),
+            Mode::ReadOnly(why) => (true, false, Some(why.clone()), None),
             Mode::Unavailable(why) => (false, false, Some(why.clone()), None),
         };
 
@@ -1091,7 +1092,7 @@ impl Library {
         if mode == Mode::Writable {
             match lock::acquire(&paths, &session, force_lock) {
                 Ok(Acquire::Acquired) => {}
-                Ok(Acquire::HeldBy(host)) => mode = Mode::ReadOnly(format!("locked:{}", host)),
+                Ok(Acquire::HeldBy(host)) => mode = Mode::Locked(host),
                 Err(e) => mode = Mode::ReadOnly(format!("Sermon Cut can't write to this folder: {}", e)),
             }
         }
@@ -1265,7 +1266,7 @@ impl Library {
                     // Unchanged meanwhile (the lock-file mutex keeps opens
                     // and switches out, but not every mode change).
                     if g.mode.holds_lock() {
-                        g.mode = Mode::ReadOnly(format!("locked:{}", host));
+                        g.mode = Mode::Locked(host.clone());
                         return HeartbeatOutcome::LostTo(host);
                     }
                     HeartbeatOutcome::Unchanged
@@ -1276,7 +1277,7 @@ impl Library {
                     HeartbeatOutcome::Unchanged
                 }
             },
-            Mode::ReadOnly(why) if why.starts_with("locked:") => {
+            Mode::Locked(_) => {
                 match lock::acquire(&paths, &session, false) {
                     Ok(Acquire::Acquired) => HeartbeatOutcome::Regained,
                     _ => HeartbeatOutcome::Unchanged,
@@ -1382,7 +1383,7 @@ impl Library {
     pub async fn rescan(self: &Arc<Self>, app_state: &AppStateHandle) -> Result<(), String> {
         let _scan = self.scan_lock.lock().await;
 
-        let needs_open = !matches!(self.inner().mode, Mode::Writable | Mode::ReadOnly(_));
+        let needs_open = !matches!(self.inner().mode, Mode::Writable | Mode::ReadOnly(_) | Mode::Locked(_));
         if needs_open {
             let _lock_file = self.lock_file_mutex.lock().await;
             let lib = self.clone();
@@ -3998,7 +3999,7 @@ mod tests {
         // Read-only, or the entry gone.
         let (_t, lib, id, _dir) = processed_library();
         let root = lib.root().unwrap();
-        lib.inner().mode = Mode::ReadOnly("locked:Office iMac".into());
+        lib.inner().mode = Mode::Locked("Office iMac".into());
         assert!(lib.add_to_queue(&id, &root, &fp).is_err());
         lib.inner().mode = Mode::Writable;
         lib.inner().manifest.entries.clear();
@@ -4108,7 +4109,7 @@ mod tests {
     #[test]
     fn locked_library_errors_name_the_other_computer() {
         let (_t, lib, id, _dir) = processed_library();
-        lib.inner().mode = Mode::ReadOnly("locked:Office iMac".into());
+        lib.inner().mode = Mode::Locked("Office iMac".into());
         let err = lib.reset(&id).unwrap_err();
         assert!(err.starts_with("This library is open on Office iMac."), "{err}");
         assert_eq!(lib.view(vec![]).message.as_deref(), Some(err.as_str()));

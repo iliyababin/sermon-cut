@@ -1959,7 +1959,11 @@ impl Library {
         before_swap();
         let JobOutputs { trimmed_name, start, end, thumb_names, duration } = outputs;
         let (dir, staging) = (video_dir.to_path_buf(), staging.to_path_buf());
+        // Under the video's lock, like every other writer of video.json
+        // (a render being saved, a review), so none interleaves with the swap.
+        let lock = self.video_lock(id);
         blocking(move || {
+            let _v = hold(&lock);
             let old = manifest::load_video_data(&dir);
             let data = VideoData {
                 trimmed_file: Some(trimmed_name),
@@ -2369,20 +2373,36 @@ impl Library {
             return Err("Invalid render key".into());
         }
         let source = source_id(source).ok_or_else(|| format!("Invalid thumbnail: {}", source))?;
-        let dir = self.with_entry(id, |g, paths| {
+        // The files are read and written under the video's lock, on a
+        // blocking thread, never under `inner` (docs/INVARIANTS.md #4);
+        // `inner` only decides.
+        let paths = self.with_entry(id, |g, paths| {
             g.require_render_allowed(id)?;
-            let dir = paths.ensure_video_dir(id)?;
-            let data = manifest::load_video_data(&dir);
-            if !data.thumbnail_options.contains(&source) {
-                return Err("That thumbnail is no longer one of this video's options".into());
-            }
-            check_render_key(&dir, &data, &source, template_version, logo, render_key)?;
-            Ok(dir)
+            Ok(paths.clone())
         })?;
+        let job = RenderSave {
+            lib: self.clone(),
+            id: id.to_string(),
+            source,
+            render_key: render_key.to_string(),
+            template_version,
+            logo: logo.to_string(),
+        };
+        let dir = {
+            let job = job.clone();
+            blocking(move || {
+                let lock = job.lib.video_lock(&job.id);
+                let _v = hold(&lock);
+                let dir = paths.ensure_video_dir(&job.id)?;
+                job.check(&dir, &manifest::load_video_data(&dir))?;
+                Ok::<_, String>(dir)
+            })
+            .await??
+        };
 
         // Named here, never by the webview. Written under a hidden temp name
         // (swept on the next open if we crash) that no save or prune touches.
-        let name = manifest::render_file_name(&source);
+        let name = manifest::render_file_name(&job.source);
         let tmp = dir.join(format!("{}{}", manifest::RENDER_TMP_PREFIX, name));
         let out = tmp.clone();
         let rendering = RenderingGuard::new(self);
@@ -2393,39 +2413,32 @@ impl Library {
         }
 
         // Moved into place and recorded together, under the video's lock, so
-        // no prune can see the file unrecorded; then the replaced render goes.
-        let lock = self.video_lock(id);
-        let _v = hold(&lock);
-        let committed = self.with_entry(id, |g, _| {
-            // Processing may have started (or the options changed) meanwhile.
-            g.require_render_allowed(id)?;
-            let mut data = manifest::load_video_data(&dir);
-            if !data.thumbnail_options.contains(&source) {
-                return Err("That thumbnail is no longer one of this video's options".into());
-            }
-            check_render_key(&dir, &data, &source, template_version, logo, render_key)?;
-            std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("Failed to save thumbnail: {}", e))?;
-            data.renders.retain(|r| r.source != source);
-            data.renders.push(Render {
-                source: source.clone(),
-                file: name.clone(),
-                render_key: render_key.to_string(),
-            });
-            if let Err(e) = manifest::save_video_data(&dir, &data) {
-                let _ = std::fs::remove_file(dir.join(&name));
-                return Err(e);
-            }
-            Ok(data)
-        });
-        drop(rendering);
-        match committed {
-            Ok(data) => {
+        // no prune or commit can see the file unrecorded; then the replaced
+        // render goes.
+        let committed = {
+            let (dir, name, tmp) = (dir.clone(), name.clone(), tmp.clone());
+            blocking(move || {
+                let lock = job.lib.video_lock(&job.id);
+                let _v = hold(&lock);
+                let mut data = manifest::load_video_data(&dir);
+                job.check(&dir, &data)?;
+                std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("Failed to save thumbnail: {}", e))?;
+                data.renders.retain(|r| r.source != job.source);
+                data.renders.push(Render { source: job.source.clone(), file: name.clone(), render_key: job.render_key.clone() });
+                if let Err(e) = manifest::save_video_data(&dir, &data) {
+                    let _ = std::fs::remove_file(dir.join(&name));
+                    return Err(e);
+                }
                 manifest::prune_renders(&dir, &data);
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
+                Ok(())
+            })
+            .await
+            .and_then(|r| r)
+        };
+        drop(rendering);
+        if let Err(e) = committed {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
         Ok(path_string(&dir.join(name)))
     }
@@ -2862,6 +2875,30 @@ impl Drop for BusyGuard<'_> {
         let mut g = self.lib.inner();
         g.busy.remove(&self.id);
         g.uploads.remove(&self.id);
+    }
+}
+
+/// A render being saved (see `save_rendered_thumbnail`).
+#[derive(Clone)]
+struct RenderSave {
+    lib: Arc<Library>,
+    id: String,
+    source: String,
+    render_key: String,
+    template_version: u32,
+    logo: String,
+}
+
+impl RenderSave {
+    /// Whether the render may still be saved: the video isn't being
+    /// processed (asked of `inner`, briefly), its source is still an option,
+    /// and its key is the saved review's. Called holding the video's lock.
+    fn check(&self, dir: &Path, data: &VideoData) -> Result<(), String> {
+        self.lib.with_entry(&self.id, |g, _| g.require_render_allowed(&self.id))?;
+        if !data.thumbnail_options.contains(&self.source) {
+            return Err("That thumbnail is no longer one of this video's options".into());
+        }
+        check_render_key(dir, data, &self.source, self.template_version, &self.logo, &self.render_key)
     }
 }
 
@@ -4321,6 +4358,74 @@ mod tests {
             duration: 60.0,
         };
         (staging, outputs, hash)
+    }
+
+    /// The commit swaps video.json under the video's lock, so a render
+    /// being saved (which reads and writes it under that lock, not `inner`)
+    /// can't interleave with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_waits_for_the_videos_lock() {
+        let (_t, lib, id, dir) = processed_library();
+        let (staging, outputs, hash) = job_at_commit(&lib, &id).await;
+        let lock = lib.video_lock(&id);
+        let held = hold(&lock);
+        let (at_swap, reached) = std::sync::mpsc::channel();
+        let commit = tokio::spawn({
+            let (lib, id, dir, staging) = (lib.clone(), id.clone(), dir.clone(), staging.0.clone());
+            async move { lib.commit_job(&id, &dir, &staging, &hash, outputs, move || at_swap.send(()).unwrap()).await }
+        });
+        reached.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        // Can only fail if the swap doesn't wait for the lock.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(manifest::load_video_data(&dir).trimmed_file, None, "not swapped while the lock is held");
+        assert!(!commit.is_finished());
+        drop(held);
+        commit.await.unwrap().unwrap();
+        assert_eq!(manifest::load_video_data(&dir).trimmed_file.as_deref(), Some("trimmed.mp4"));
+        drop(staging);
+    }
+
+    /// A render saved while a job is queued and committed: whichever comes
+    /// first, video.json ends up the commit's, and every render it records
+    /// is on disk, with no temp files left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_render_saved_during_a_commit_stays_consistent() {
+        for round in 0..20 {
+            let (_t, lib, id, dir) = processed_library();
+            let source = "thumbnail_option_1.jpg";
+            let review = Review { title: Some("A".into()), preacher: Some("P".into()), ..Default::default() };
+            lib.save_review(&id, review, None).unwrap();
+            let key = test_key(&dir, source, "A");
+            let render = tokio::spawn({
+                let (lib, id, key) = (lib.clone(), id.clone(), key.clone());
+                async move { lib.save_rendered_thumbnail(&id, source, &key, TV, "", png()).await }
+            });
+            if round % 2 == 0 {
+                tokio::task::yield_now().await;
+            }
+            let (staging, outputs, hash) = job_at_commit(&lib, &id).await;
+            lib.commit_job(&id, &dir, &staging.0, &hash, outputs, || {}).await.unwrap();
+            let rendered = render.await.unwrap();
+            drop(staging);
+            lib.finish_job(&id, &Some(Ok(())));
+
+            let data = manifest::load_video_data(&dir);
+            assert_eq!((data.trimmed_file.as_deref(), data.trim_start), (Some("trimmed.mp4"), Some(1.5)), "round {round}");
+            assert_eq!(data.thumbnail_options, ["thumbnail_option_9.jpg"]);
+            for r in &data.renders {
+                assert!(dir.join(&r.file).exists(), "round {round}: {} recorded but missing", r.file);
+            }
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(manifest::RENDER_TMP_PREFIX))
+                .collect();
+            assert!(leftovers.is_empty(), "round {round}: {leftovers:?}");
+            if let Err(e) = rendered {
+                assert!(e.contains("processed"), "round {round}: {e}");
+            }
+        }
     }
 
     #[tokio::test]

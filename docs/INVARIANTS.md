@@ -27,7 +27,9 @@ this file in the same commit and say why.
    methods that do such I/O synchronously are called from a blocking
    thread (`commands::off_thread`, `blocking`).
 5. Saving never deletes. `save_video_data` only writes; pruning renders or
-   outputs is an explicit step taken under the per-video mutex.
+   outputs is an explicit step taken under the per-video mutex. Every
+   read-modify-write of video.json (reviews, renders, trims, custom
+   thumbnails, a job's commit) holds the per-video mutex, not `inner`.
 6. Outputs are replaced through the commit journal (`begin_commit` /
    `swap_in_outputs` / `recover_commit`), never by delete-then-rename.
    A commit, once begun, runs to the end: a cancel then only says it came

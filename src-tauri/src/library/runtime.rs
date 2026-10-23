@@ -1871,14 +1871,16 @@ impl Library {
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_else(|| "mp4".into());
 
-            // Under the scan lock, so a scan that listed the folder before
-            // the move can't mark the new entry missing; and under `inner`
-            // across the move and the new entry, so a scan can't see the
-            // file before it has its YouTube details.
+            // Under the scan lock from before the move until the entry is
+            // saved: a scan that listed the folder before the move can't mark
+            // the new entry missing, and no scan can see the file before it
+            // has its YouTube details. The move itself runs outside `inner`.
             let _scan = self.scan_lock.lock().await;
+            self.inner().writable()?;
+            let (src, root) = (file.clone(), paths.root.clone());
+            let wanted = download_file_name(&info.title, &info.id, &ext);
+            let name = blocking(move || move_into_library(&src, &root, &wanted)).await??;
             let mut g = self.inner();
-            g.writable()?;
-            let name = move_into_library(&file, &paths.root, &download_file_name(&info.title, &info.id, &ext))?;
             let mut entry = Entry::new(name, fingerprint, duration);
             entry.title = Some(info.title.clone());
             entry.source_url = Some(info.url.clone());

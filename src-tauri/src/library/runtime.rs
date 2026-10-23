@@ -25,6 +25,10 @@ const UPDATING_LIBRARY: &str = "Updating library…";
 /// While an app update installs.
 const UPDATING: &str = "Sermon Cut is updating… It will restart in a moment.";
 
+/// The entry went while its files were being worked on (the library was
+/// reopened, e.g. after another computer let go of it).
+const ENTRY_GONE: &str = "This video was removed from the library meanwhile.";
+
 const FILE_CHANGED: &str =
     "The file changed since it was added. If it's still copying, wait for it to finish, then try again.";
 
@@ -2046,16 +2050,36 @@ impl Library {
         f(&mut g, &paths)
     }
 
-    /// Back to New: delete what processing made. Keeps upload history.
-    pub fn reset(&self, id: &str) -> Result<(), String> {
-        self.with_entry(id, |g, paths| {
+    /// Decide under `inner` (writable, the entry exists, idle, plus
+    /// `check`), then mark the video busy until the guard drops, so its
+    /// files can be worked on without `inner` (docs/INVARIANTS.md #4).
+    fn mark_busy(&self, id: &str, check: impl FnOnce(&Inner) -> Result<(), String>) -> Result<(BusyGuard<'_>, LibraryPaths), String> {
+        let paths = self.with_entry(id, |g, paths| {
             g.require_idle(id)?;
-            manifest::remove_video_dir(paths, id)?;
-            let e = g.entry_mut(id)?;
-            e.status = EntryStatus::New;
-            e.error = None;
-            g.save()
-        })
+            check(g)?;
+            g.busy.insert(id.to_string());
+            Ok(paths.clone())
+        })?;
+        Ok((BusyGuard { lib: self, id: id.to_string() }, paths))
+    }
+
+    /// Delete a video's folder under its lock. Blocking.
+    fn remove_video_files(&self, paths: &LibraryPaths, id: &str) -> Result<(), String> {
+        let lock = self.video_lock(id);
+        let _v = hold(&lock);
+        manifest::remove_video_dir(paths, id)
+    }
+
+    /// Back to New: delete what processing made. Keeps upload history.
+    /// Blocking (deletes files): call it from a blocking thread.
+    pub fn reset(&self, id: &str) -> Result<(), String> {
+        let (_busy, paths) = self.mark_busy(id, |_| Ok(()))?;
+        self.remove_video_files(&paths, id)?;
+        let mut g = self.inner();
+        let e = g.entry_mut(id).map_err(|_| ENTRY_GONE.to_string())?;
+        e.status = EntryStatus::New;
+        e.error = None;
+        g.save()
     }
 
     pub fn set_hidden(&self, id: &str, hidden: bool) -> Result<(), String> {
@@ -2066,17 +2090,19 @@ impl Library {
         })
     }
 
-    /// Drop a video whose file is gone.
+    /// Drop a video whose file is gone. Blocking (deletes files).
     pub fn forget(&self, id: &str) -> Result<(), String> {
-        self.with_entry(id, |g, paths| {
-            g.require_idle(id)?;
+        let (_busy, paths) = self.mark_busy(id, |g| {
             if g.present(id) {
                 return Err("The file is still in the library folder. Use Move to Trash or Hide instead.".into());
             }
-            manifest::remove_video_dir(paths, id)?;
-            g.manifest.entries.retain(|e| e.id != id);
-            g.save()
-        })
+            Ok(())
+        })?;
+        self.remove_video_files(&paths, id)?;
+        let mut g = self.inner();
+        // Gone already (e.g. the library was reopened meanwhile): done too.
+        g.manifest.entries.retain(|e| e.id != id);
+        g.save()
     }
 
     /// Move the user's file to the Trash, then delete the app's data for it.
@@ -2088,24 +2114,20 @@ impl Library {
         // A scan that listed the file just before it went would add it back
         // as a new video once the entry is gone.
         let _scan = self.scan_lock.lock().await;
-        let path = self.with_entry(id, |g, paths| {
-            g.require_idle(id)?;
-            let path = paths.original(&g.entry(id)?.file_name)?;
-            g.busy.insert(id.to_string());
-            Ok(path)
-        })?;
-        let _busy = BusyGuard { lib: &**self, id: id.to_string() };
-        let lib = self.clone();
-        let check = path.clone();
+        let (_busy, paths) = self.mark_busy(id, |_| Ok(()))?;
+        let path = paths.original(&self.inner().entry(id)?.file_name)?;
+        let (lib, check, video) = (self.clone(), path.clone(), id.to_string());
         let result = blocking(move || -> Result<(), String> {
-            let paths = lib.inner().paths.clone().ok_or("The library isn't open")?;
             paths.verify_original(&check)?;
-            mover(&check)
+            mover(&check)?;
+            if let Err(e) = lib.remove_video_files(&paths, &video) {
+                eprintln!("[library] {}", e);
+            }
+            Ok(())
         })
         .await
         .and_then(|r| r);
 
-        let mut g = self.inner();
         result.map_err(|e| {
             format!(
                 "Couldn't move \"{}\" to the Trash: {}. Some network and external drives have no Trash; delete the file in Finder if you want it gone.",
@@ -2113,11 +2135,8 @@ impl Library {
                 e
             )
         })?;
-        if let Some(paths) = g.paths.clone() {
-            if let Err(e) = manifest::remove_video_dir(&paths, id) {
-                eprintln!("[library] {}", e);
-            }
-        }
+        let mut g = self.inner();
+        // Gone already (the library was reopened meanwhile): nothing to drop.
         g.manifest.entries.retain(|e| e.id != id);
         g.last.present.remove(id);
         g.save()
@@ -2126,38 +2145,43 @@ impl Library {
     /// Save the review screen's edits. `selected_source` is a thumbnail
     /// source id; one that's no longer an option (e.g. regenerated meanwhile)
     /// is ignored rather than losing the text edits.
+    /// Blocking (reads and writes video.json).
     pub fn save_review(&self, id: &str, review: Review, selected_source: Option<String>) -> Result<(), String> {
+        // The video's lock, held throughout, keeps a reset, forget or trash
+        // (which delete the folder under it) from interleaving.
         let lock = self.video_lock(id);
         let _v = hold(&lock);
-        self.with_entry(id, |g, paths| {
+        let paths = self.with_entry(id, |g, paths| {
             // Processing replaces video.json, so edits made now would be lost.
             if g.queue.iter().any(|q| q == id) || g.running.as_ref().is_some_and(|r| r.id == id) {
                 return Err("This video is being processed".into());
             }
-            let dir = paths.ensure_video_dir(id)?;
-            let mut data = manifest::load_video_data(&dir);
-            data.review = review;
-            if let Some(source) = selected_source.as_deref().and_then(source_id) {
-                if data.thumbnail_options.contains(&source) {
-                    data.selected_source = Some(source);
-                }
+            Ok(paths.clone())
+        })?;
+        let dir = paths.ensure_video_dir(id)?;
+        let mut data = manifest::load_video_data(&dir);
+        data.review = review;
+        if let Some(source) = selected_source.as_deref().and_then(source_id) {
+            if data.thumbnail_options.contains(&source) {
+                data.selected_source = Some(source);
             }
-            manifest::save_video_data(&dir, &data)
-        })
+        }
+        manifest::save_video_data(&dir, &data)
     }
 
     /// Mark an id busy for an operation that runs outside the lock, until
     /// the returned guard is dropped.
     fn begin_op(&self, id: &str) -> Result<(BusyGuard<'_>, LibraryPaths, Entry, VideoData), String> {
-        let (paths, e, data) = self.with_entry(id, |g, paths| {
+        let (paths, e) = self.with_entry(id, |g, paths| {
             g.require_not_updating()?;
             g.require_idle(id)?;
             let e = g.entry(id)?.clone();
-            let data = manifest::load_video_data(&paths.video_dir(id)?);
             g.busy.insert(id.to_string());
-            Ok((paths.clone(), e, data))
+            Ok((paths.clone(), e))
         })?;
-        Ok((BusyGuard { lib: self, id: id.to_string() }, paths, e, data))
+        let busy = BusyGuard { lib: self, id: id.to_string() };
+        let data = manifest::load_video_data(&paths.video_dir(id)?);
+        Ok((busy, paths, e, data))
     }
 
     pub async fn regenerate_thumbnails(self: &Arc<Self>, id: &str) -> Result<Vec<String>, String> {
@@ -2227,25 +2251,28 @@ impl Library {
             let dir = paths.ensure_video_dir(id)?;
             let path = crate::thumbnail::process_custom_thumbnail(&source, &dir, &crop, grading).await?;
             let name = file_in_dir(&dir, &path)?;
+            // Under the video's lock, on a blocking thread, never `inner`
+            // (the video is busy, so its entry stays).
             let lock = self.video_lock(id);
-            let _v = hold(&lock);
-            let pruned = {
-                let _g = self.inner();
-                let mut data = manifest::load_video_data(&dir);
-                if !data.thumbnail_options.contains(&name) {
-                    data.thumbnail_options.insert(0, name.clone());
+            let (commit_dir, added) = (dir.clone(), name.clone());
+            blocking(move || {
+                let _v = hold(&lock);
+                let mut data = manifest::load_video_data(&commit_dir);
+                if !data.thumbnail_options.contains(&added) {
+                    data.thumbnail_options.insert(0, added);
                 }
                 // The selection is by id, so adding a source never moves it; the
                 // review screen selects the new one itself.
                 let pruned = prune_custom_thumbnails(&mut data.thumbnail_options, data.selected_source.as_deref());
-                manifest::save_video_data(&dir, &data)?;
-                pruned
-            };
-            for old in pruned {
-                let _ = std::fs::remove_file(dir.join(old));
-            }
-            // Renders of the dropped sources.
-            manifest::prune_renders(&dir, &manifest::load_video_data(&dir));
+                manifest::save_video_data(&commit_dir, &data)?;
+                for old in pruned {
+                    let _ = std::fs::remove_file(commit_dir.join(old));
+                }
+                // Renders of the dropped sources.
+                manifest::prune_renders(&commit_dir, &data);
+                Ok::<_, String>(())
+            })
+            .await??;
             Ok(path_string(&dir.join(name)))
         }
         .await
@@ -3577,6 +3604,54 @@ mod tests {
         let g = lib.inner();
         assert!(g.manifest.entries.is_empty(), "no entry comes back for the trashed file");
         assert!(g.busy.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_library_stays_responsive_during_a_slow_trash() {
+        let (_t, lib, id, dir) = processed_library();
+        // Deleting the app's files waits on the video's lock, held here.
+        let lock = lib.video_lock(&id);
+        let held = hold(&lock);
+        let trash = tokio::spawn({
+            let (lib, id) = (lib.clone(), id.clone());
+            async move {
+                lib.trash_with(&id, |p| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    std::fs::remove_file(p).map_err(|e| e.to_string())
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let started = std::time::Instant::now();
+        let view = lib.view(vec![]);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(view.videos.iter().any(|v| v.id == id && v.busy));
+        assert!(dir.exists(), "the folder goes under the video's lock");
+        drop(held);
+        trash.await.unwrap().unwrap();
+        assert!(!dir.exists());
+        assert!(lib.view(vec![]).videos.is_empty());
+    }
+
+    #[test]
+    fn an_entry_removed_mid_reset_is_reported() {
+        let (_t, lib, id, dir) = processed_library();
+        let lock = lib.video_lock(&id);
+        let held = hold(&lock);
+        let reset = std::thread::spawn({
+            let (lib, id) = (lib.clone(), id.clone());
+            move || lib.reset(&id)
+        });
+        while !lib.inner().busy.contains(&id) {
+            std::thread::yield_now();
+        }
+        // E.g. the library was reopened and another computer had dropped it.
+        lib.inner().manifest.entries.retain(|e| e.id != id);
+        drop(held);
+        assert_eq!(reset.join().unwrap(), Err(ENTRY_GONE.to_string()));
+        assert!(!dir.exists());
+        assert!(lib.inner().busy.is_empty());
     }
 
     #[test]

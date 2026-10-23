@@ -21,7 +21,11 @@ this file in the same commit and say why.
 
 4. No file I/O under `inner`. Decide under `inner` and mark the entry busy,
    drop `inner`, do the I/O, then re-lock to commit. At commit, handle the
-   entry having disappeared.
+   entry having disappeared. The one exception is library.json itself,
+   saved under `inner` so it always matches the state it records; video
+   folders, video.json and media are never touched under it. Library
+   methods that do such I/O synchronously are called from a blocking
+   thread (`commands::off_thread`, `blocking`).
 5. Saving never deletes. `save_video_data` only writes; pruning renders or
    outputs is an explicit step taken under the per-video mutex.
 6. Outputs are replaced through the commit journal (`begin_commit` /

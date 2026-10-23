@@ -17,6 +17,18 @@ async fn view(lib: &Library, state: &AppStateHandle) -> LibraryView {
     lib.view(notices)
 }
 
+/// Run a blocking library action (one that touches files) off the async
+/// workers.
+async fn off_thread<T: Send + 'static>(
+    lib: &LibraryHandle,
+    f: impl FnOnce(&Library) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let lib = lib.clone();
+    tauri::async_runtime::spawn_blocking(move || f(&lib))
+        .await
+        .map_err(|e| format!("Background task failed: {}", e))?
+}
+
 fn changed(app: &AppHandle) {
     let _ = app.emit("library-changed", ());
     crate::notify::refresh_badge(app);
@@ -61,7 +73,7 @@ pub async fn cancel_processing(lib: State<'_, LibraryHandle>, app_handle: AppHan
 
 #[tauri::command]
 pub async fn reset_video(lib: State<'_, LibraryHandle>, app_handle: AppHandle, video_id: String) -> Result<(), String> {
-    lib.reset(&video_id)?;
+    off_thread(&lib, move |lib| lib.reset(&video_id)).await?;
     changed(&app_handle);
     Ok(())
 }
@@ -82,7 +94,7 @@ pub async fn trash_video(lib: State<'_, LibraryHandle>, app_handle: AppHandle, v
 
 #[tauri::command]
 pub async fn forget_video(lib: State<'_, LibraryHandle>, app_handle: AppHandle, video_id: String) -> Result<(), String> {
-    lib.forget(&video_id)?;
+    off_thread(&lib, move |lib| lib.forget(&video_id)).await?;
     changed(&app_handle);
     Ok(())
 }
@@ -100,7 +112,8 @@ pub async fn save_review(
 ) -> Result<(), String> {
     let named = preacher.clone().unwrap_or_default();
     let review = Review { title, description, preacher, single_line: single_line.unwrap_or(false) };
-    lib.save_review(&video_id, review, selected_source)?;
+    let id = video_id.clone();
+    off_thread(&lib, move |lib| lib.save_review(&id, review, selected_source)).await?;
     // Offered on the next video's review screen.
     let mut s = state.lock().await;
     if s.note_preacher(&video_id, &named) {

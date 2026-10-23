@@ -8,6 +8,7 @@ mod modal;
 mod state;
 mod thumbnail;
 mod tools;
+mod upload;
 mod youtube;
 
 use library::runtime::Library;
@@ -185,6 +186,8 @@ fn main() {
             library::commands::download_video,
             library::commands::cancel_download,
             library::commands::youtube_upload_video,
+            library::commands::cancel_upload,
+            library::commands::retry_thumbnail,
             library::commands::check_library_folder,
         ])
         .build(tauri::generate_context!())

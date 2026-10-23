@@ -52,6 +52,22 @@ export interface UploadRecord {
   file_hash: string;
   privacy?: UploadPrivacy | null;
   playlist_id?: string | null;
+  /** YouTube's id for the video (uploads since 0.5). */
+  video_id?: string | null;
+  /** What didn't work after the upload. */
+  warnings?: UploadWarning[];
+}
+
+export interface UploadWarning {
+  kind: "thumbnail" | "captions" | "playlist";
+  message: string;
+}
+
+/** What youtube_upload_video resolves with. */
+export interface UploadOutcome {
+  url: string;
+  video_id: string;
+  warnings: UploadWarning[];
 }
 
 /** A video in the library folder. */

@@ -7,6 +7,8 @@ import type {
   CropRect,
   PlaylistInfo,
   UploadPrivacy,
+  UploadOutcome,
+  UploadWarning,
   LibraryView,
   VideoDetail,
 } from "./types";
@@ -167,7 +169,7 @@ export async function youtubeUploadVideo(
   startTime?: number,
   endTime?: number,
   playlistId?: string
-): Promise<string> {
+): Promise<UploadOutcome> {
   return invoke("youtube_upload_video", {
     videoId,
     title,
@@ -179,6 +181,19 @@ export async function youtubeUploadVideo(
     endTime,
     playlistId,
   });
+}
+
+/** What a cancelled upload rejects with (UploadError::Cancelled). */
+export const UPLOAD_CANCELLED = "Upload cancelled.";
+
+/** Stop a running upload; uploading again continues where it stopped. */
+export async function cancelUpload(videoId: string): Promise<void> {
+  return invoke("cancel_upload", { videoId });
+}
+
+/** Set the last upload's thumbnail again; resolves with the warnings left. */
+export async function retryThumbnail(videoId: string): Promise<UploadWarning[]> {
+  return invoke("retry_thumbnail", { videoId });
 }
 
 export async function regenerateThumbnails(videoId: string): Promise<string[]> {

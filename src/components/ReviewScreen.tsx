@@ -11,8 +11,11 @@ import {
   resetVideo,
   saveReview,
   saveRenderedThumbnail,
+  cancelUpload,
   errorMessage,
+  UPLOAD_CANCELLED,
 } from "@/lib/tauri";
+import { UploadWarnings } from "./UploadWarnings";
 import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
 import { getDefaultTemplate } from "@/templates";
 import { splitTitleIntoLines } from "@/lib/utils";
@@ -29,6 +32,7 @@ import type {
   ThumbnailRender,
   PlaylistInfo,
   UploadPrivacy,
+  UploadWarning,
 } from "@/lib/types";
 import { LocalImage } from "./LocalImage";
 import { ThumbnailEditor } from "./ThumbnailEditor";
@@ -237,11 +241,14 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       status: string;
       url: string | null;
       error: string | null;
+      warnings?: UploadWarning[] | null;
     }>("youtube-upload-progress", (event) => {
       const e = event.payload;
       if (e.video_id !== video.id) return;
       if (e.status === "done" && e.url) {
-        dispatch({ type: "succeeded", url: e.url });
+        dispatch({ type: "succeeded", url: e.url, warnings: e.warnings ?? [] });
+      } else if (e.status === "cancelled") {
+        dispatch({ type: "cancelled" });
       } else if (e.status === "error") {
         dispatch({ type: "failed", message: e.error || "Upload failed" });
       } else {
@@ -364,7 +371,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
         fullDescription += `\n\n---\n${SOCIAL_LINKS}`;
 
         const source = selectedOption?.id;
-        const url = await youtubeUploadVideo(
+        const outcome = await youtubeUploadVideo(
           video.id,
           title,
           fullDescription,
@@ -376,15 +383,26 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
           playlistId
         );
         // The "done" event reports this too; the machine counts it once.
-        dispatch({ type: "succeeded", url });
+        dispatch({ type: "succeeded", url: outcome.url, warnings: outcome.warnings });
       } catch (err) {
+        const message = errorMessage(err);
+        if (message === UPLOAD_CANCELLED) {
+          dispatch({ type: "cancelled" });
+          return;
+        }
         console.error("Upload failed:", err);
-        dispatch({ type: "failed", message: errorMessage(err) });
+        dispatch({ type: "failed", message });
       }
     })();
   }, [uploadRequest]);
 
   const handleUpload = () => dispatch({ type: "upload", ready: uploadReady });
+
+  // The upload stops; its session is kept, so Upload continues it.
+  const handleCancelUpload = () => {
+    dispatch({ type: "cancelRequested" });
+    cancelUpload(video.id).catch((err) => setSaveError(errorMessage(err, "Couldn't cancel the upload")));
+  };
 
   const formatTime = formatTimeDisplay;
 
@@ -479,6 +497,15 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
                 </>
               )}
             </button>
+            {phase.kind === "uploading" && (
+              <button
+                onClick={handleCancelUpload}
+                disabled={review.cancelling}
+                className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 transition-colors"
+              >
+                {review.cancelling ? "Cancelling…" : "Cancel upload"}
+              </button>
+            )}
             </>
           )}
         </div>
@@ -512,6 +539,21 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
               </button>
             </div>
           </div>
+          {phase.warnings.length > 0 && (
+            <div className="mt-3">
+              <UploadWarnings
+                videoId={video.id}
+                warnings={phase.warnings}
+                onChange={(warnings) => dispatch({ type: "warnings", warnings })}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {phase.kind === "cancelled" && (
+        <div className="mx-4 mt-4 p-3 bg-muted rounded-lg text-sm text-muted-foreground">
+          Upload cancelled. Upload again to continue where it stopped.
         </div>
       )}
 

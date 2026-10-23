@@ -1,3 +1,5 @@
+import type { UploadWarning } from "@/lib/types";
+
 /**
  * The review screen's upload flow as a reducer:
  *
@@ -17,7 +19,9 @@ export type ReviewPhase =
    * it once per request); null when it was started before the screen
    * opened and is only being followed. */
   | { kind: "uploading"; progress: number; request: number | null }
-  | { kind: "done"; url: string }
+  /** `warnings`: what didn't work after the upload (thumbnail, captions,
+   * playlist). */
+  | { kind: "done"; url: string; warnings: UploadWarning[] }
   | { kind: "error"; message: string }
   | { kind: "cancelled" };
 
@@ -26,6 +30,8 @@ export interface ReviewState {
   /** Uploads of this video so far, for the "upload again?" question. */
   uploadCount: number;
   nextRequest: number;
+  /** Cancel was clicked for the running upload; waiting for it to stop. */
+  cancelling: boolean;
 }
 
 export type ReviewEvent =
@@ -34,16 +40,20 @@ export type ReviewEvent =
   | { type: "confirm" }
   | { type: "cancelConfirm" }
   | { type: "progress"; percent: number }
-  | { type: "succeeded"; url: string }
+  | { type: "succeeded"; url: string; warnings?: UploadWarning[] }
   | { type: "failed"; message: string }
   | { type: "cancelled" }
+  /** Cancel clicked during an upload. */
+  | { type: "cancelRequested" }
+  /** The done upload's warnings changed (a thumbnail was set again). */
+  | { type: "warnings"; warnings: UploadWarning[] }
   /** Dismiss the success banner to upload again. */
   | { type: "uploadAgain" };
 
 export interface InitialReview {
   status: string;
   uploadProgress: number | null;
-  uploads: { url: string }[];
+  uploads: { url: string; warnings?: UploadWarning[] }[];
 }
 
 export function initialReviewState(video: InitialReview): ReviewState {
@@ -52,9 +62,9 @@ export function initialReviewState(video: InitialReview): ReviewState {
   if (video.status === "uploading") {
     phase = { kind: "uploading", progress: video.uploadProgress ?? 0, request: null };
   } else if (video.status === "done" && last) {
-    phase = { kind: "done", url: last.url };
+    phase = { kind: "done", url: last.url, warnings: last.warnings ?? [] };
   }
-  return { phase, uploadCount: video.uploads.length, nextRequest: 1 };
+  return { phase, uploadCount: video.uploads.length, nextRequest: 1, cancelling: false };
 }
 
 /** Whether Upload can be clicked in this phase. */
@@ -67,6 +77,7 @@ function startUploading(state: ReviewState): ReviewState {
     ...state,
     phase: { kind: "uploading", progress: 0, request: state.nextRequest },
     nextRequest: state.nextRequest + 1,
+    cancelling: false,
   };
 }
 
@@ -87,18 +98,29 @@ export function reviewReducer(state: ReviewState, event: ReviewEvent): ReviewSta
         return { ...state, phase: { ...phase, progress: Math.max(phase.progress, event.percent) } };
       }
       if (phase.kind === "editing" || phase.kind === "error" || phase.kind === "cancelled") {
-        return { ...state, phase: { kind: "uploading", progress: event.percent, request: null } };
+        return { ...state, phase: { kind: "uploading", progress: event.percent, request: null }, cancelling: false };
       }
       return state;
     case "succeeded":
       // Both the command's result and the final event report success;
       // only the first counts.
       if (phase.kind !== "uploading") return state;
-      return { ...state, phase: { kind: "done", url: event.url }, uploadCount: state.uploadCount + 1 };
+      return {
+        ...state,
+        phase: { kind: "done", url: event.url, warnings: event.warnings ?? [] },
+        uploadCount: state.uploadCount + 1,
+        cancelling: false,
+      };
     case "failed":
-      return phase.kind === "uploading" ? { ...state, phase: { kind: "error", message: event.message } } : state;
+      return phase.kind === "uploading"
+        ? { ...state, phase: { kind: "error", message: event.message }, cancelling: false }
+        : state;
     case "cancelled":
-      return phase.kind === "uploading" ? { ...state, phase: { kind: "cancelled" } } : state;
+      return phase.kind === "uploading" ? { ...state, phase: { kind: "cancelled" }, cancelling: false } : state;
+    case "cancelRequested":
+      return phase.kind === "uploading" && !state.cancelling ? { ...state, cancelling: true } : state;
+    case "warnings":
+      return phase.kind === "done" ? { ...state, phase: { ...phase, warnings: event.warnings } } : state;
     case "uploadAgain":
       return phase.kind === "done" ? { ...state, phase: { kind: "editing" } } : state;
   }

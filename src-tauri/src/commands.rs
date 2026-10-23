@@ -1,6 +1,8 @@
 use crate::library::commands::LibraryHandle;
 use crate::state::{AppState, Settings, SettingsPatch, SettingsView, VideoInfo};
+use crate::upload::{TokenSource, UploadError};
 use crate::youtube_dl;
+use futures::future::BoxFuture;
 use std::path::Path;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
@@ -330,18 +332,30 @@ pub async fn youtube_sign_out(
 
 /// A valid YouTube access token, refreshing (and saving) it if needed.
 pub async fn fresh_access_token(state: &AppStateHandle, app_handle: &AppHandle) -> Result<String, String> {
+    access_token(state, app_handle, false).await.map_err(|e| e.user_message())
+}
+
+/// The access token, refreshed when it's about to expire or `force` is set
+/// (after a 401). With no refresh token to renew it, the user has to sign
+/// in again.
+pub async fn access_token(state: &AppStateHandle, app_handle: &AppHandle, force: bool) -> Result<String, UploadError> {
     use crate::youtube::{self, YouTubeCredentials};
 
     let (access_token, refresh_token, needs_refresh) = {
         let state_guard = state.lock().await;
-        let auth = state_guard.settings.youtube_auth.as_ref()
-            .ok_or("Not authenticated with YouTube")?;
+        let auth = state_guard
+            .settings
+            .youtube_auth
+            .as_ref()
+            .ok_or_else(|| UploadError::Auth("not signed in".into()))?;
 
         let access_token = auth.access_token.clone();
         let refresh_token = auth.refresh_token.clone();
-        let needs_refresh = access_token.is_none() || auth.expires_at
-            .map(|exp| exp - chrono::Utc::now().timestamp() < 300)
-            .unwrap_or(true);
+        let needs_refresh = force
+            || access_token.is_none()
+            || auth.expires_at
+                .map(|exp| exp - chrono::Utc::now().timestamp() < 300)
+                .unwrap_or(true);
 
         (access_token.unwrap_or_default(), refresh_token, needs_refresh)
     };
@@ -350,10 +364,10 @@ pub async fn fresh_access_token(state: &AppStateHandle, app_handle: &AppHandle) 
         return Ok(access_token);
     }
     let Some(refresh) = refresh_token else {
-        return Ok(access_token);
+        return Err(UploadError::Auth("no refresh token".into()));
     };
 
-    let credentials = YouTubeCredentials::load_from_resource(app_handle)?;
+    let credentials = YouTubeCredentials::load_from_resource(app_handle).map_err(UploadError::Other)?;
     let new_tokens = youtube::refresh_access_token(&credentials, &refresh).await?;
     {
         let mut state_guard = state.lock().await;
@@ -364,6 +378,21 @@ pub async fn fresh_access_token(state: &AppStateHandle, app_handle: &AppHandle) 
         if let Err(e) = state_guard.save() { eprintln!("[warn] Failed to save state: {}", e); }
     }
     Ok(new_tokens.access_token)
+}
+
+/// Tokens for the upload code, from the signed-in account.
+pub struct AppTokens<'a> {
+    pub state: &'a AppStateHandle,
+    pub app: &'a AppHandle,
+}
+
+impl TokenSource for AppTokens<'_> {
+    fn token(&self) -> BoxFuture<'_, Result<String, UploadError>> {
+        Box::pin(access_token(self.state, self.app, false))
+    }
+    fn refresh(&self) -> BoxFuture<'_, Result<String, UploadError>> {
+        Box::pin(access_token(self.state, self.app, true))
+    }
 }
 
 #[tauri::command]

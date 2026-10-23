@@ -420,6 +420,8 @@ mod tests {
             file_hash: "h1".into(),
             privacy: None,
             playlist_id: None,
+            video_id: None,
+            warnings: vec![],
         });
         let mut entries = vec![e];
         let r = reconcile(&mut entries, &[ready("a.mp4", 20, 2, "h2")], &HashSet::new());

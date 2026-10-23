@@ -167,4 +167,56 @@ describe("ReviewScreen", () => {
     // "No playlist" is sent as such, so the default isn't used instead.
     expect(args.playlistId).toBe("");
   });
+
+  it("cancels a running upload, which can then be continued", async () => {
+    let reject: (e: unknown) => void = () => {};
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "youtube_upload_video") return new Promise((_, r) => (reject = r));
+      if (cmd === "cancel_upload") {
+        reject("Upload cancelled.");
+        return Promise.resolve(null);
+      }
+      return base(cmd, args);
+    });
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /upload/i }));
+    const cancel = await screen.findByRole("button", { name: "Cancel upload" });
+    fireEvent.click(cancel);
+    await screen.findByText(/Upload cancelled\. Upload again to continue/);
+    expect(calls("cancel_upload")).toEqual([["cancel_upload", { videoId: "vid1" }]]);
+    expect(screen.queryByRole("button", { name: "Cancel upload" })).toBeNull();
+    // No error banner: a cancel isn't a failure.
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    const upload = screen.getByRole("button", { name: /^upload$/i }) as HTMLButtonElement;
+    expect(upload.disabled).toBe(false);
+  });
+
+  it("shows the upload's warnings and sets the thumbnail again", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "retry_thumbnail"
+        ? Promise.resolve([{ kind: "playlist", message: "The video wasn't added to the playlist." }])
+        : base(cmd, args)
+    );
+    const uploads = [
+      {
+        url: "https://youtube.com/watch?v=abc",
+        uploaded_at: "",
+        file_hash: "h",
+        video_id: "abc",
+        warnings: [
+          { kind: "thumbnail" as const, message: "The thumbnail wasn't set. Try later." },
+          { kind: "playlist" as const, message: "The video wasn't added to the playlist." },
+        ],
+      },
+    ];
+    render(<ReviewScreen video={video({ status: "done", uploads })} onBack={() => {}} />);
+    await screen.findByText("The thumbnail wasn't set. Try later.");
+    fireEvent.click(screen.getByRole("button", { name: /set thumbnail again/i }));
+    await waitFor(() => expect(screen.queryByText("The thumbnail wasn't set. Try later.")).toBeNull());
+    expect(calls("retry_thumbnail")).toEqual([["retry_thumbnail", { videoId: "vid1" }]]);
+    expect(screen.getByText("The video wasn't added to the playlist.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /set thumbnail again/i })).toBeNull();
+  });
 });

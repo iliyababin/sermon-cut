@@ -70,6 +70,12 @@ pub struct UploadRecord {
     pub privacy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playlist_id: Option<String>,
+    /// YouTube's id for the video, for "Set thumbnail again".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_id: Option<String>,
+    /// What didn't work after the upload (thumbnail, captions, playlist).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::upload::UploadWarning>,
 }
 
 /// One video in library.json.
@@ -97,6 +103,9 @@ pub struct Entry {
     pub hidden: bool,
     #[serde(default)]
     pub uploads: Vec<UploadRecord>,
+    /// An unfinished resumable upload, continued by the next attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_session: Option<crate::upload::UploadSession>,
     pub added_at: String,
     /// Id from the pre-0.4 state.json, so migration can be re-run safely.
     #[serde(default)]
@@ -118,6 +127,7 @@ impl Entry {
             duration,
             hidden: false,
             uploads: Vec::new(),
+            upload_session: None,
             added_at: chrono::Utc::now().to_rfc3339(),
             legacy_id: None,
         }

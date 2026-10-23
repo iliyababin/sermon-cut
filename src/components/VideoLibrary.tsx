@@ -13,8 +13,10 @@ import {
   dismissNotices,
   takeOverLibrary,
   cancelDownload,
+  cancelUpload,
   errorMessage,
 } from "@/lib/tauri";
+import { UploadWarnings } from "./UploadWarnings";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
@@ -319,6 +321,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
               onOpen={() => onVideoSelect(video)}
               onProcess={() => run(() => processVideo(video.id))}
               onCancel={() => run(() => cancelProcessing(video.id))}
+              onCancelUpload={() => run(() => cancelUpload(video.id))}
               onReveal={() => run(() => revealVideo(video.id))}
               onReset={() => handleReset(video)}
               onHide={() => run(() => hideVideo(video.id, !video.hidden))}
@@ -407,6 +410,7 @@ interface VideoCardProps {
   onOpen: () => void;
   onProcess: () => void;
   onCancel: () => void;
+  onCancelUpload: () => void;
   onReveal: () => void;
   onReset: () => void;
   onHide: () => void;
@@ -511,6 +515,9 @@ function VideoCard(props: VideoCardProps) {
             <ExternalLink className="w-3 h-3" />
           </button>
         )}
+        {video.status === "done" && lastUpload?.warnings && lastUpload.warnings.length > 0 && (
+          <UploadWarnings videoId={video.id} warnings={lastUpload.warnings} compact />
+        )}
       </div>
 
       {!pending && (
@@ -532,6 +539,15 @@ function VideoCard(props: VideoCardProps) {
             >
               <X className="w-4 h-4" />
               Cancel
+            </button>
+          )}
+          {video.status === "uploading" && (
+            <button
+              onClick={props.onCancelUpload}
+              className="flex items-center gap-2 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+            >
+              <X className="w-4 h-4" />
+              Cancel upload
             </button>
           )}
           {reviewable && (

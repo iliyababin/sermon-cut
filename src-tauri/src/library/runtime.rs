@@ -9,6 +9,7 @@ use super::manifest::{self, Loaded, Manifest, Render, Review, TranscriptFile, Vi
 use super::scan::{self, FileObs, ObsState, Reconciled, ScanCache};
 use super::{Entry, EntryStatus, Fingerprint, LibraryPaths, UploadRecord, MAX_TRANSCRIBE_SECS};
 use crate::state::{AppState, ProcessingStage, TranscriptionResult};
+use crate::upload::{SessionStore, UploadOutcome, UploadSession, UploadWarning, WarningKind};
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,11 @@ pub struct DownloadItem {
     cancel: Option<tokio::sync::watch::Sender<bool>>,
 }
 
+struct ActiveUpload {
+    percent: u32,
+    cancel: CancellationToken,
+}
+
 struct Inner {
     configured: String,
     paths: Option<LibraryPaths>,
@@ -61,8 +67,8 @@ struct Inner {
     running: Option<Running>,
     /// Entries with an upload, trash or thumbnail operation in flight.
     busy: HashSet<String>,
-    /// YouTube uploads in flight: entry id → percent.
-    uploads: std::collections::HashMap<String, u32>,
+    /// YouTube uploads in flight.
+    uploads: std::collections::HashMap<String, ActiveUpload>,
     downloads: Vec<DownloadItem>,
     session: String,
     notice: Option<String>,
@@ -347,7 +353,7 @@ impl Inner {
             processing_stage: running.map(|r| r.stage.clone()),
             processing_progress: running.map(|r| r.progress),
             processing_message: running.map(|r| r.message.clone()),
-            upload_progress: self.uploads.get(&e.id).copied(),
+            upload_progress: self.uploads.get(&e.id).map(|u| u.percent),
             busy: self.is_busy(&e.id),
         }
     }
@@ -1420,12 +1426,14 @@ impl Library {
                 thumbnail_path,
                 segments,
                 file_hash: entry.fingerprint.hash.clone(),
+                cancel: CancellationToken::new(),
             })
         };
         let job = prepare();
         match &job {
-            Ok(_) => {
-                self.inner().uploads.insert(id.to_string(), 0);
+            Ok(job) => {
+                let active = ActiveUpload { percent: 0, cancel: job.cancel.clone() };
+                self.inner().uploads.insert(id.to_string(), active);
             }
             Err(_) => self.end_op(id),
         }
@@ -1433,30 +1441,104 @@ impl Library {
     }
 
     pub fn set_upload_progress(&self, id: &str, percent: u32) {
-        if let Some(p) = self.inner().uploads.get_mut(id) {
-            *p = percent;
+        if let Some(u) = self.inner().uploads.get_mut(id) {
+            u.percent = percent;
         }
     }
 
-    /// End an upload; with a URL it succeeded and is recorded, with the
-    /// privacy and playlist it was uploaded with.
-    pub fn finish_upload(&self, id: &str, job: &UploadJob, url: Option<&str>, options: &UploadOptions) {
+    /// Stop an upload. Its session is kept, so the next try continues it.
+    pub fn cancel_upload(&self, id: &str) -> Result<(), String> {
+        match self.inner().uploads.get(id) {
+            Some(u) => {
+                u.cancel.cancel();
+                Ok(())
+            }
+            None => Err("This video isn't uploading.".into()),
+        }
+    }
+
+    /// The entry's unfinished upload session.
+    pub fn upload_session(&self, id: &str) -> Option<UploadSession> {
+        self.inner().manifest.get(id).and_then(|e| e.upload_session.clone())
+    }
+
+    /// Keep (or clear) the entry's upload session in library.json.
+    pub fn set_upload_session(&self, id: &str, session: Option<&UploadSession>) {
+        let mut g = self.inner();
+        let Ok(e) = g.entry_mut(id) else { return };
+        if e.upload_session.as_ref() == session {
+            return;
+        }
+        e.upload_session = session.cloned();
+        g.save_logged();
+    }
+
+    /// End an upload; with an outcome it succeeded and is recorded, with
+    /// the privacy and playlist it was uploaded with and any warnings.
+    pub fn finish_upload(&self, id: &str, job: &UploadJob, outcome: Option<&UploadOutcome>, options: &UploadOptions) {
         let mut g = self.inner();
         g.busy.remove(id);
         g.uploads.remove(id);
-        let Some(url) = url else { return };
+        let Some(outcome) = outcome else { return };
         if let Ok(e) = g.entry_mut(id) {
             e.uploads.push(UploadRecord {
-                url: url.to_string(),
+                url: outcome.url.clone(),
                 uploaded_at: chrono::Utc::now().to_rfc3339(),
                 file_hash: job.file_hash.clone(),
                 privacy: Some(options.privacy.clone()),
                 playlist_id: options.playlist_id.clone(),
+                video_id: Some(outcome.video_id.clone()),
+                warnings: outcome.warnings.clone(),
             });
+            e.upload_session = None;
             e.status = EntryStatus::Done;
             e.error = None;
         }
         g.save_logged();
+    }
+
+    /// For "Set thumbnail again": the last upload's YouTube id and the
+    /// thumbnail to send (the selected one), with the video marked busy.
+    /// Finish with `finish_thumbnail_retry`.
+    pub fn begin_thumbnail_retry(&self, id: &str) -> Result<(String, PathBuf), String> {
+        let (paths, entry, data) = self.begin_op(id)?;
+        let prepare = || -> Result<(String, PathBuf), String> {
+            let video_id = entry
+                .uploads
+                .last()
+                .ok_or("This video hasn't been uploaded yet.")?
+                .video_id
+                .clone()
+                .ok_or("This upload was made by an older version of Sermon Cut. Set the thumbnail in YouTube Studio instead.")?;
+            let dir = paths.video_dir(id)?;
+            let thumbnail = resolve_thumbnail(&dir, &data, None, None)?.ok_or("This video has no thumbnail to send.")?;
+            Ok((video_id, thumbnail))
+        };
+        let r = prepare();
+        if r.is_err() {
+            self.end_op(id);
+        }
+        r
+    }
+
+    /// After "Set thumbnail again": on success the thumbnail warning goes.
+    /// Returns the upload's remaining warnings.
+    pub fn finish_thumbnail_retry(&self, id: &str, video_id: &str, ok: bool) -> Vec<UploadWarning> {
+        let mut g = self.inner();
+        g.busy.remove(id);
+        let mut remaining = Vec::new();
+        if let Ok(e) = g.entry_mut(id) {
+            if let Some(rec) = e.uploads.iter_mut().rev().find(|u| u.video_id.as_deref() == Some(video_id)) {
+                if ok {
+                    rec.warnings.retain(|w| w.kind != WarningKind::Thumbnail);
+                }
+                remaining = rec.warnings.clone();
+            }
+        }
+        if ok {
+            g.save_logged();
+        }
+        remaining
     }
 
     /// What would be lost by quitting now, for the quit warning.
@@ -1622,6 +1704,22 @@ pub struct UploadJob {
     pub thumbnail_path: Option<PathBuf>,
     pub segments: Option<Vec<crate::state::TranscriptSegment>>,
     pub file_hash: String,
+    pub cancel: CancellationToken,
+}
+
+/// The upload session kept on a library entry.
+pub struct EntrySession<'a> {
+    pub lib: &'a Library,
+    pub id: &'a str,
+}
+
+impl SessionStore for EntrySession<'_> {
+    fn load(&self) -> Option<UploadSession> {
+        self.lib.upload_session(self.id)
+    }
+    fn save(&self, session: Option<&UploadSession>) {
+        self.lib.set_upload_session(self.id, session);
+    }
 }
 
 /// A thumbnail source id from what the webview sent: a file name, or a path
@@ -1819,7 +1917,7 @@ mod tests {
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.upload_progress, Some(42));
 
-        lib.finish_upload(&id, &job, Some("https://youtube.com/watch?v=x"), &public());
+        lib.finish_upload(&id, &job, Some(&outcome("x", vec![])), &public());
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Done);
         assert_eq!(v.upload_progress, None);
@@ -1833,6 +1931,74 @@ mod tests {
         assert_eq!(v.status, ViewStatus::Done);
         assert_eq!(v.uploads.len(), 1);
         assert!(!v.busy);
+    }
+
+    fn outcome(video_id: &str, warnings: Vec<UploadWarning>) -> UploadOutcome {
+        UploadOutcome { url: crate::upload::watch_url(video_id), video_id: video_id.into(), warnings }
+    }
+
+    #[test]
+    fn upload_session_persists_and_is_cleared_on_success() {
+        let (_t, lib, id, _dir) = processed_library();
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        let store = EntrySession { lib: &lib, id: &id };
+        let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
+        store.save(Some(&session));
+        lib.finish_upload(&id, &job, None, &public());
+
+        // Survives a restart (library.json read again).
+        let root = lib.root().unwrap();
+        let reopened = Library::new(root.to_string_lossy().to_string());
+        reopened.open_blocking(true);
+        assert_eq!(reopened.upload_session(&id), Some(session.clone()));
+
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        lib.finish_upload(&id, &job, Some(&outcome("abc", vec![])), &public());
+        assert_eq!(lib.upload_session(&id), None);
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.uploads[0].video_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn cancel_reaches_the_running_upload() {
+        let (_t, lib, id, _dir) = processed_library();
+        assert!(lib.cancel_upload(&id).is_err());
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        lib.cancel_upload(&id).unwrap();
+        assert!(job.cancel.is_cancelled());
+        lib.finish_upload(&id, &job, None, &public());
+        assert!(lib.cancel_upload(&id).is_err());
+    }
+
+    #[test]
+    fn thumbnail_retry_uses_the_stored_video_id_and_clears_its_warning() {
+        let (_t, lib, id, dir) = processed_library();
+        let thumb = UploadWarning { kind: WarningKind::Thumbnail, message: "t".into() };
+        let captions = UploadWarning { kind: WarningKind::Captions, message: "c".into() };
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        lib.finish_upload(&id, &job, Some(&outcome("vid9", vec![thumb.clone(), captions.clone()])), &public());
+
+        let (video_id, path) = lib.begin_thumbnail_retry(&id).unwrap();
+        assert_eq!(video_id, "vid9");
+        assert_eq!(path, dir.join("thumbnail_option_2.jpg"));
+        // Busy meanwhile.
+        assert!(lib.begin_upload(&id, None, None).is_err());
+        // A failure keeps the warning.
+        assert_eq!(lib.finish_thumbnail_retry(&id, &video_id, false), vec![thumb, captions.clone()]);
+        let (video_id, _) = lib.begin_thumbnail_retry(&id).unwrap();
+        assert_eq!(lib.finish_thumbnail_retry(&id, &video_id, true), vec![captions.clone()]);
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.uploads[0].warnings, vec![captions]);
+        assert!(!v.busy);
+    }
+
+    #[test]
+    fn untrusted_session_uris_are_dropped_on_load() {
+        let (_t, lib, id, _dir) = processed_library();
+        lib.set_upload_session(&id, Some(&UploadSession::new("https://evil.example/x".into(), "h", 5, "m")));
+        let reopened = Library::new(lib.root().unwrap().to_string_lossy().to_string());
+        reopened.open_blocking(true);
+        assert_eq!(reopened.upload_session(&id), None);
     }
 
     fn public() -> UploadOptions {
@@ -1860,7 +2026,7 @@ mod tests {
         let (_t, lib, id, _dir) = processed_library();
         let job = lib.begin_upload(&id, None, None).unwrap();
         let options = UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PL1".into()) };
-        lib.finish_upload(&id, &job, Some("https://youtube.com/watch?v=y"), &options);
+        lib.finish_upload(&id, &job, Some(&outcome("y", vec![])), &options);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads[0].privacy.as_deref(), Some("unlisted"));
         assert_eq!(v.uploads[0].playlist_id.as_deref(), Some("PL1"));

@@ -80,6 +80,15 @@ fn sanitize(manifest: &mut Manifest) {
         truncate(&mut e.channel);
         truncate(&mut e.error);
         e.uploads.retain(|u| u.url.starts_with("https://"));
+        for u in &mut e.uploads {
+            if u.video_id.as_deref().is_some_and(|v| !crate::upload::is_valid_video_id(v)) {
+                u.video_id = None;
+            }
+        }
+        // The session URI gets the access token, so only YouTube's own.
+        if e.upload_session.as_ref().is_some_and(|s| !s.is_trusted()) {
+            e.upload_session = None;
+        }
         if e.duration.is_some_and(|d| !d.is_finite() || d < 0.0) {
             e.duration = None;
         }

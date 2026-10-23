@@ -1,7 +1,10 @@
 //! Tauri commands for the library screen, review screen and downloads.
 
 use super::manifest::Review;
-use super::runtime::{AppStateHandle, Library, LibraryView, UploadOptions, VideoDetail};
+use super::runtime::{AppStateHandle, EntrySession, Library, LibraryView, UploadOptions, VideoDetail};
+use crate::upload::client::{video_metadata, VideoUpload};
+use crate::upload::{self, AfterUpload, TokenSource, UploadConfig, UploadError, UploadOutcome, UploadWarning};
+use std::sync::atomic::{AtomicU32, Ordering};
 use crate::thumbnail::CropRect;
 use std::path::Path;
 use std::sync::Arc;
@@ -235,17 +238,18 @@ pub async fn youtube_upload_video(
     start_time: Option<f64>,
     end_time: Option<f64>,
     playlist_id: Option<String>,
-) -> Result<String, String> {
-    use crate::youtube;
-
+) -> Result<UploadOutcome, String> {
     // Privacy and playlist as chosen next to Upload; the settings fill in
     // anything not sent.
     let options = UploadOptions::resolve(&state.lock().await.settings, privacy, playlist_id)?;
     let job = lib.begin_upload(&video_id, thumbnail_source, render_key)?;
     changed(&app_handle);
+    let library: &Library = &lib;
 
-    let result: Result<String, String> = async {
-        let access_token = crate::commands::fresh_access_token(&state, &app_handle).await?;
+    let result: Result<UploadOutcome, UploadError> = async {
+        let tokens = crate::commands::AppTokens { state: &state, app: &app_handle };
+        // Signed out or revoked: say so before anything else.
+        tokens.token().await?;
 
         // The upload is starting: offer the same privacy next time.
         {
@@ -258,61 +262,92 @@ pub async fn youtube_upload_video(
             }
         }
 
-        let on_progress = |percent: u32, status: &str| {
-            lib.set_upload_progress(&video_id, percent);
-            emit_upload(&app_handle, &video_id, percent, status, None, None);
+        let video = VideoUpload {
+            path: &job.video_path,
+            file_hash: &job.file_hash,
+            metadata: video_metadata(&title, &description, &options.privacy),
         };
-        let upload_result = youtube::upload_video(
-            &access_token,
-            &job.video_path.to_string_lossy(),
-            &title,
-            &description,
-            &options.privacy,
-            &on_progress,
-        )
-        .await?;
-        let uploaded_id = upload_result.id.clone();
-
-        if let Some(thumb) = &job.thumbnail_path {
-            if let Err(e) = youtube::set_thumbnail(&access_token, &uploaded_id, &thumb.to_string_lossy()).await {
-                println!("[youtube] Warning: Thumbnail upload failed: {}", e);
+        let after = AfterUpload {
+            thumbnail: job.thumbnail_path.clone(),
+            captions: job.segments.as_ref().map(|segs| {
+                upload::post::generate_srt(segs, start_time.unwrap_or(0.0), end_time.unwrap_or(f64::MAX))
+            }),
+            playlist_id: options.playlist_id.clone(),
+        };
+        let store = EntrySession { lib: library, id: &video_id };
+        let last_percent = AtomicU32::new(u32::MAX);
+        let on_progress = |sent: u64, total: u64| {
+            let percent = (sent.saturating_mul(95) / total.max(1)) as u32;
+            if last_percent.swap(percent, Ordering::SeqCst) != percent {
+                library.set_upload_progress(&video_id, percent);
+                emit_upload(&app_handle, &video_id, percent, "uploading", None, None, None);
             }
-        }
-
-        if let Some(segs) = &job.segments {
-            let start = start_time.unwrap_or(0.0);
-            let end = end_time.unwrap_or(f64::MAX);
-            let srt_content = youtube::generate_srt(segs, start, end);
-            if !srt_content.trim().is_empty() {
-                if let Err(e) = youtube::upload_captions(&access_token, &uploaded_id, &srt_content).await {
-                    println!("[youtube] Warning: Caption upload failed: {}", e);
-                }
-            }
-        }
-
-        if let Some(playlist_id) = &options.playlist_id {
-            if let Err(e) = youtube::add_to_playlist(&access_token, playlist_id, &uploaded_id).await {
-                println!("[youtube] Warning: Failed to add to playlist: {}", e);
-            }
-        }
-
-        Ok(format!("https://youtube.com/watch?v={}", uploaded_id))
+        };
+        let cfg = UploadConfig::default();
+        upload::run(&upload::http_client(), &cfg, &tokens, &store, &job.cancel, &video, &after, &on_progress).await
     }
     .await;
 
-    lib.finish_upload(&video_id, &job, result.as_deref().ok(), &options);
+    library.finish_upload(&video_id, &job, result.as_ref().ok(), &options);
     // Final word for any screen showing this upload, including a review
     // screen reopened after the one that started it went away.
     match &result {
-        Ok(url) => emit_upload(&app_handle, &video_id, 100, "done", Some(url.as_str()), None),
-        Err(e) => emit_upload(&app_handle, &video_id, 0, "error", None, Some(e.as_str())),
+        Ok(o) => emit_upload(&app_handle, &video_id, 100, "done", Some(o.url.as_str()), None, Some(&o.warnings)),
+        Err(UploadError::Cancelled) => emit_upload(&app_handle, &video_id, 0, "cancelled", None, None, None),
+        Err(e) => {
+            eprintln!("[upload] Failed: {}", e);
+            emit_upload(&app_handle, &video_id, 0, "error", None, Some(e.user_message().as_str()), None)
+        }
     }
     changed(&app_handle);
-    result
+    result.map_err(|e| e.user_message())
+}
+
+/// Stop a running upload; the next Upload continues where it stopped.
+#[tauri::command]
+pub async fn cancel_upload(lib: State<'_, LibraryHandle>, video_id: String) -> Result<(), String> {
+    lib.cancel_upload(&video_id)
+}
+
+/// "Set thumbnail again" for the last upload, by its stored YouTube id.
+/// Returns that upload's remaining warnings.
+#[tauri::command]
+pub async fn retry_thumbnail(
+    lib: State<'_, LibraryHandle>,
+    state: State<'_, AppStateHandle>,
+    app_handle: AppHandle,
+    video_id: String,
+) -> Result<Vec<UploadWarning>, String> {
+    let (youtube_id, thumbnail) = lib.begin_thumbnail_retry(&video_id)?;
+    let result = async {
+        let tokens = crate::commands::AppTokens { state: &state, app: &app_handle };
+        let endpoints = upload::Endpoints::youtube();
+        let http = upload::http_client();
+        let token = tokens.token().await?;
+        match upload::post::set_thumbnail(&http, &endpoints, &token, &youtube_id, &thumbnail).await {
+            Err(UploadError::Auth(_)) => {
+                let token = tokens.refresh().await?;
+                upload::post::set_thumbnail(&http, &endpoints, &token, &youtube_id, &thumbnail).await
+            }
+            r => r,
+        }
+    }
+    .await;
+    let remaining = lib.finish_thumbnail_retry(&video_id, &youtube_id, result.is_ok());
+    changed(&app_handle);
+    result.map(|_| remaining).map_err(|e| UploadWarning::thumbnail(&e).message)
 }
 
 /// `youtube-upload-progress` event, tagged with the library video.
-fn emit_upload(app: &AppHandle, video_id: &str, progress: u32, status: &str, url: Option<&str>, error: Option<&str>) {
+fn emit_upload(
+    app: &AppHandle,
+    video_id: &str,
+    progress: u32,
+    status: &str,
+    url: Option<&str>,
+    error: Option<&str>,
+    warnings: Option<&[UploadWarning]>,
+) {
     let _ = app.emit(
         "youtube-upload-progress",
         serde_json::json!({
@@ -321,6 +356,7 @@ fn emit_upload(app: &AppHandle, video_id: &str, progress: u32, status: &str, url
             "status": status,
             "url": url,
             "error": error,
+            "warnings": warnings,
         }),
     );
 }

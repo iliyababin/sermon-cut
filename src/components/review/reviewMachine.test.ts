@@ -16,7 +16,7 @@ describe("reviewMachine", () => {
       request: null,
     });
     const done = initialReviewState({ status: "done", uploadProgress: null, uploads: [{ url: "https://y/1" }] });
-    expect(done.phase).toEqual({ kind: "done", url: "https://y/1" });
+    expect(done.phase).toEqual({ kind: "done", url: "https://y/1", warnings: [] });
     expect(done.uploadCount).toBe(1);
   });
 
@@ -48,7 +48,7 @@ describe("reviewMachine", () => {
 
   it("counts a success once even when reported twice", () => {
     const s = run(fresh, { type: "upload", ready: true }, { type: "succeeded", url: "u" }, { type: "succeeded", url: "u" });
-    expect(s.phase).toEqual({ kind: "done", url: "u" });
+    expect(s.phase).toEqual({ kind: "done", url: "u", warnings: [] });
     expect(s.uploadCount).toBe(1);
   });
 
@@ -66,6 +66,39 @@ describe("reviewMachine", () => {
     const cancelled = run(fresh, { type: "upload", ready: true }, { type: "cancelled" });
     expect(cancelled.phase).toEqual({ kind: "cancelled" });
     expect(run(cancelled, { type: "upload", ready: true }).phase).toMatchObject({ kind: "uploading" });
+  });
+
+  it("cancels once, and the upload ends as cancelled", () => {
+    const uploading = run(fresh, { type: "upload", ready: true });
+    const asked = run(uploading, { type: "cancelRequested" });
+    expect(asked.cancelling).toBe(true);
+    expect(run(asked, { type: "cancelRequested" })).toBe(asked);
+    const stopped = run(asked, { type: "cancelled" });
+    expect(stopped.phase).toEqual({ kind: "cancelled" });
+    expect(stopped.cancelling).toBe(false);
+    // Upload again continues (the backend resumes the session).
+    expect(run(stopped, { type: "upload", ready: true }).phase).toMatchObject({ kind: "uploading", request: 2 });
+    // Nothing to cancel when not uploading.
+    expect(run(fresh, { type: "cancelRequested" })).toBe(fresh);
+  });
+
+  it("keeps the upload's warnings and updates them after a thumbnail retry", () => {
+    const thumb = { kind: "thumbnail" as const, message: "The thumbnail wasn't set." };
+    const playlist = { kind: "playlist" as const, message: "Not added to the playlist." };
+    const done = run(
+      fresh,
+      { type: "upload", ready: true },
+      { type: "succeeded", url: "u", warnings: [thumb, playlist] }
+    );
+    expect(done.phase).toEqual({ kind: "done", url: "u", warnings: [thumb, playlist] });
+    expect(run(done, { type: "warnings", warnings: [playlist] }).phase).toEqual({
+      kind: "done",
+      url: "u",
+      warnings: [playlist],
+    });
+    expect(run(fresh, { type: "warnings", warnings: [] })).toBe(fresh);
+    const reopened = initialReviewState({ status: "done", uploadProgress: null, uploads: [{ url: "u", warnings: [thumb] }] });
+    expect(reopened.phase).toEqual({ kind: "done", url: "u", warnings: [thumb] });
   });
 
   it("ignores results that don't belong to the current phase", () => {

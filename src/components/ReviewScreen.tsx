@@ -3,6 +3,8 @@ import {
   regenerateThumbnails,
   getVideo,
   revealVideo,
+  revealCommitBackup,
+  isStuckCommit,
   youtubeGetAuthStatus,
   youtubeListPlaylists,
   getSettings,
@@ -789,7 +791,13 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         </div>
       )}
       {saveError && <ErrorBanner message={saveError} />}
-      {actionError && <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />}
+      {actionError && (
+        <ErrorBanner
+          message={actionError}
+          onReveal={isStuckCommit(actionError) ? () => revealCommitBackup(video.id).catch(() => {}) : undefined}
+          onDismiss={() => setActionError(null)}
+        />
+      )}
       {youtubeError && <ErrorBanner message={youtubeError} onRetry={loadYoutube} />}
       {renderError && !renderProgress && (
         <ErrorBanner
@@ -1059,10 +1067,13 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 function ErrorBanner({
   message,
   onRetry,
+  onReveal,
   onDismiss,
 }: {
   message: string;
   onRetry?: () => void;
+  /** Show leftovers of an unfinished save (see isStuckCommit). */
+  onReveal?: () => void;
   onDismiss?: () => void;
 }) {
   return (
@@ -1072,6 +1083,11 @@ function ErrorBanner({
       {onRetry && (
         <button onClick={onRetry} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors">
           Try again
+        </button>
+      )}
+      {onReveal && (
+        <button onClick={onReveal} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors">
+          Show leftovers
         </button>
       )}
       {onDismiss && (

@@ -230,6 +230,13 @@ pub async fn reveal_video(lib: State<'_, LibraryHandle>, video_id: String) -> Re
     reveal(&path)
 }
 
+/// Show a video's unfinished commit backup in Finder (see `STUCK_COMMIT`).
+#[tauri::command]
+pub async fn reveal_commit_backup(lib: State<'_, LibraryHandle>, video_id: String) -> Result<(), String> {
+    let path = lib.commit_backup_path(&video_id)?;
+    reveal(&path)
+}
+
 #[tauri::command]
 pub async fn open_library_folder(lib: State<'_, LibraryHandle>) -> Result<(), String> {
     let root = lib.root().ok_or("The library folder isn't available")?;

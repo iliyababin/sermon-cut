@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Loader2, Scissors, Crosshair, Play } from "lucide-react";
-import { frameStill, setTrim, errorMessage } from "@/lib/tauri";
+import { frameStill, setTrim, errorMessage, isStuckCommit, revealCommitBackup } from "@/lib/tauri";
 import { formatPrecise, lineAt, nudge, MIN_TRIM_SECS } from "@/lib/trim";
 import type { TranscriptSegment } from "@/lib/types";
 import { LocalImage } from "./LocalImage";
@@ -129,6 +129,14 @@ export function TrimPanel({ videoId, sourcePath, duration, start, end, segments,
       {error && (
         <p role="alert" className="text-sm text-destructive">
           {error}
+          {isStuckCommit(error) && (
+            <button
+              onClick={() => revealCommitBackup(videoId).catch(() => {})}
+              className="ml-2 px-2 py-0.5 text-xs bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+            >
+              Show leftovers
+            </button>
+          )}
         </p>
       )}
       {result && !changed && (

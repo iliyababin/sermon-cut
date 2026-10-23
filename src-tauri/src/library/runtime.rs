@@ -694,12 +694,21 @@ fn write_journal(backup: &Path, journal: &CommitJournal) -> Result<(), String> {
     fsutil::write_json_atomic(&backup.join(COMMIT_JOURNAL), journal)
 }
 
+/// A commit's backup folder is still there after `recover_commit` tried
+/// to put it back (the frontend offers to show it: `isStuckCommit`).
+pub const STUCK_COMMIT: &str = "An earlier save of this video didn't finish and couldn't be undone, so nothing was changed. Click Show leftovers, move the \".commit-backup\" folder out of the video's folder, then try again.";
+
 /// Start a commit: the backup folder, its journal, and a copy of the
 /// current video.json, before anything moves. The old outputs are those
-/// `replaces` picks.
+/// `replaces` picks. A backup left by an earlier commit is put right
+/// first; if it can't be, nothing is done.
 fn begin_commit(dir: &Path, staging: &Path, replaces: &dyn Fn(&str) -> bool) -> Result<CommitJournal, String> {
+    recover_commit(dir);
     let backup = dir.join(COMMIT_BACKUP);
-    std::fs::create_dir(&backup).map_err(|e| format!("Failed to save results: {}", e))?;
+    std::fs::create_dir(&backup).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => STUCK_COMMIT.to_string(),
+        _ => format!("Failed to save results: {}", e),
+    })?;
     let begun = (|| -> Result<CommitJournal, String> {
         let old: Vec<String> = names_in(dir)
             .map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?
@@ -746,7 +755,6 @@ fn swap_in_outputs_where(
     replaces: &dyn Fn(&str) -> bool,
     write_data: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    recover_commit(dir);
     let backup = dir.join(COMMIT_BACKUP);
     let mut journal = begin_commit(dir, staging, replaces)?;
 
@@ -2485,6 +2493,16 @@ impl Library {
         Ok(trimmed.filter(|p| p.exists()).unwrap_or(original))
     }
 
+    /// What "Show leftovers" shows: a commit's backup folder that couldn't
+    /// be put back (`STUCK_COMMIT`), else the video's folder.
+    pub fn commit_backup_path(&self, id: &str) -> Result<PathBuf, String> {
+        let paths = self.inner().paths.clone().ok_or("The library isn't open")?;
+        self.inner().entry(id)?;
+        let dir = paths.video_dir(id)?;
+        let backup = dir.join(COMMIT_BACKUP);
+        Ok(if backup.exists() { backup } else { dir })
+    }
+
     /// Delete .sermon-cut entirely (never the videos) and start fresh.
     pub async fn clear_data(self: &Arc<Self>) -> Result<(), String> {
         let _scan = self.scan_lock.lock().await;
@@ -4167,6 +4185,38 @@ mod tests {
     /// written, then each old output is moved aside, then each new one in.
     fn crash_after(dir: &Path, staging: &Path, steps: usize) {
         crash_after_where(dir, staging, steps, &|_| true);
+    }
+
+    #[test]
+    fn a_leftover_backup_is_put_right_before_the_next_commit() {
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        // A crash midway left a backup; the next commit undoes it first.
+        crash_after(&dir, &staging, 2);
+        let (_t2, _d, staging2) = commit_fixture();
+        let journal = begin_commit(&dir, &staging2, &|_| true).unwrap();
+        assert!(journal.old.contains(&"thumbnail_option_1.jpg".to_string()), "the old outputs are back: {:?}", journal.old);
+        let _ = std::fs::remove_dir_all(dir.join(COMMIT_BACKUP));
+        assert_eq!(contents(&dir), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_that_cant_be_put_back_stops_the_commit_with_a_way_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        crash_after(&dir, &staging, 2);
+        // The backup can't be moved out of (as on a locked folder).
+        let backup = dir.join(COMMIT_BACKUP);
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = swap_in_outputs(&dir, &staging, || Ok(())).unwrap_err();
+        assert_eq!(err, STUCK_COMMIT);
+        assert!(err.contains(".commit-backup"), "the frontend keys its button on this");
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Once it can be, the next try puts it right.
+        recover_commit(&dir);
+        assert_eq!(contents(&dir), before);
     }
 
     fn crash_after_where(dir: &Path, staging: &Path, steps: usize, replaces: &dyn Fn(&str) -> bool) {

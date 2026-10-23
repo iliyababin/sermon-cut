@@ -69,6 +69,17 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("VideoLibrary", () => {
+  it("offers to show the leftovers of a save that couldn't be undone", async () => {
+    const stuck =
+      'An earlier save of this video didn\'t finish and couldn\'t be undone, so nothing was changed. Click Show leftovers, move the ".commit-backup" folder out of the video\'s folder, then try again.';
+    library.videos = [video("stuck", { status: "ready_for_review", error: `Re-processing failed: ${stuck}` }), video("fine")];
+    render(<VideoLibrary onVideoSelect={() => {}} />);
+    const buttons = await screen.findAllByRole("button", { name: "Show leftovers" });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(invoke).toHaveBeenCalledWith("reveal_commit_backup", { videoId: "stuck" });
+  });
+
   it("shows a queued video's place in line", async () => {
     render(<VideoLibrary onVideoSelect={() => {}} />);
     await screen.findByText("Queued (2 of 3)");

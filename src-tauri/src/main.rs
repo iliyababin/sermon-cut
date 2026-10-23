@@ -222,6 +222,7 @@ fn main() {
             commands::save_standalone_thumbnail,
             commands::copy_file,
             library::commands::reveal_video,
+            library::commands::reveal_commit_backup,
             library::commands::open_library_folder,
             library::commands::dismiss_notices,
             library::commands::take_over_library,

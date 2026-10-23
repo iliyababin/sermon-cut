@@ -9,6 +9,8 @@ import {
   trashVideo,
   forgetVideo,
   revealVideo,
+  revealCommitBackup,
+  isStuckCommit,
   openLibraryFolder,
   dismissNotices,
   takeOverLibrary,
@@ -345,6 +347,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
               onCancel={() => run(() => cancelProcessing(video.id))}
               onCancelUpload={() => run(() => cancelUpload(video.id))}
               onReveal={() => run(() => revealVideo(video.id))}
+              onRevealLeftovers={() => run(() => revealCommitBackup(video.id))}
               onReset={() => handleReset(video)}
               onHide={() => run(() => hideVideo(video.id, !video.hidden))}
               onTrash={() => handleTrash(video)}
@@ -436,6 +439,7 @@ interface VideoCardProps {
   onCancel: () => void;
   onCancelUpload: () => void;
   onReveal: () => void;
+  onRevealLeftovers: () => void;
   onReset: () => void;
   onHide: () => void;
   onTrash: () => void;
@@ -521,6 +525,14 @@ function VideoCard(props: VideoCardProps) {
           <p className="mt-2 text-xs text-destructive line-clamp-3" title={video.error}>
             {video.error}
           </p>
+        )}
+        {isStuckCommit(video.error) && (
+          <button
+            onClick={props.onRevealLeftovers}
+            className="mt-2 px-3 py-1 text-xs bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+          >
+            Show leftovers
+          </button>
         )}
         {video.status === "too_long" && (
           <p className="mt-2 text-xs text-muted-foreground">

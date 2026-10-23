@@ -80,6 +80,17 @@ export async function revealVideo(videoId: string): Promise<void> {
   return invoke("reveal_video", { videoId });
 }
 
+/** Show a video's leftover ".commit-backup" folder in Finder. */
+export async function revealCommitBackup(videoId: string): Promise<void> {
+  return invoke("reveal_commit_backup", { videoId });
+}
+
+/** The error a save gives when an earlier one left its backup folder
+ * behind and it couldn't be put back (STUCK_COMMIT in the backend). */
+export function isStuckCommit(message: string | null | undefined): boolean {
+  return !!message && message.includes(".commit-backup");
+}
+
 export async function openLibraryFolder(): Promise<void> {
   return invoke("open_library_folder");
 }

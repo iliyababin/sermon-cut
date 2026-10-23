@@ -317,10 +317,12 @@ impl Inner {
             for e in self.manifest.entries.iter_mut().filter(|e| !known.contains(&e.id)) {
                 e.first_seen = 0;
             }
-            self.baseline_scan = false;
         }
         let mut stale = Vec::new();
         if self.mode == Mode::Writable {
+            // Only a saved scan settles the backlog: a read-only one is
+            // forgotten when the library is reopened for writing.
+            self.baseline_scan = false;
             stale = reconciled.replaced.clone();
             self.busy.extend(stale.iter().cloned());
             if reconciled.changed {
@@ -1194,6 +1196,8 @@ impl Library {
 
     pub async fn take_over(self: &Arc<Self>) -> Result<(), String> {
         let _scan = self.scan_lock.lock().await;
+        // What arrived while another computer had it is a backlog.
+        self.inner().baseline_scan = true;
         let lib = self.clone();
         blocking(move || lib.open_blocking(true)).await
     }
@@ -1240,8 +1244,11 @@ impl Library {
         outcome.unwrap_or(HeartbeatOutcome::Unchanged)
     }
 
+    /// Reopen after the lock was regained. What arrived while another
+    /// computer had the library is a backlog, not new arrivals.
     pub async fn reopen(self: &Arc<Self>) -> Result<(), String> {
         let _scan = self.scan_lock.lock().await;
+        self.inner().baseline_scan = true;
         let lib = self.clone();
         blocking(move || lib.open_blocking(false)).await
     }
@@ -3721,6 +3728,43 @@ mod tests {
         std::fs::write(root.join("new.mp4"), b"three").unwrap();
         lib.inner().apply_scan(&[seen(&root, "old 1.mp4"), seen(&root, "old 2.mp4"), seen(&root, "new.mp4")]);
         assert_eq!(lib.auto_process(since).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_first_scan_keeps_the_backlog_out_after_a_regain() {
+        let (_t, lib, _id, _dir) = processed_library();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("old 1.mp4"), b"one").unwrap();
+        std::fs::write(other.path().join("old 2.mp4"), b"two").unwrap();
+        // The new folder is open on another Mac.
+        let elsewhere = LibraryPaths::new(other.path().canonicalize().unwrap());
+        elsewhere.ensure_dir(&elsewhere.data_dir()).unwrap();
+        let held = lock::LockInfo {
+            host: "Office iMac".into(),
+            pid: 1,
+            session: "other".into(),
+            app_version: "0".into(),
+            heartbeat: chrono::Utc::now().timestamp(),
+            machine_id: Some("another-mac".into()),
+            user: Some("someone".into()),
+        };
+        fsutil::write_json_atomic(&elsewhere.lock_file(), &held).unwrap();
+        let since = chrono::Utc::now().timestamp_millis();
+        lib.switch(other.path().to_string_lossy().to_string()).await.unwrap();
+        assert!(!lib.view(vec![]).writable);
+        let root = lib.root().unwrap();
+        let backlog = [seen(&root, "old 1.mp4"), seen(&root, "old 2.mp4")];
+        lib.inner().apply_scan(&backlog);
+
+        // The other Mac lets go; the first writable scan still sees a backlog.
+        std::fs::remove_file(elsewhere.lock_file()).unwrap();
+        assert_eq!(lib.heartbeat().await, HeartbeatOutcome::Regained);
+        lib.reopen().await.unwrap();
+        assert!(lib.view(vec![]).writable);
+        lib.inner().apply_scan(&backlog);
+        assert_eq!(lib.inner().manifest.entries.len(), 2);
+        assert!(lib.auto_process(since).await.is_empty());
+        assert!(!lib.inner().baseline_scan);
     }
 
     fn saved_queue(lib: &Library) -> Vec<String> {

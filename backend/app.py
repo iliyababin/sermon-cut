@@ -16,17 +16,22 @@ Needs one workspace secret named `openrouter-api-key`:
                                      `Authorization: Bearer <token>`
 """
 
+import asyncio
+import json
 import os
 import tempfile
 
 import modal
-from fastapi import Header
+from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from analysis import (
+    BodyTooLarge,
     build_response,
     format_transcript,
+    openrouter_client_kwargs,
     parse_analysis,
+    read_body_capped,
     run_analysis_safely,
 )
 
@@ -199,10 +204,9 @@ def analyze(segments: list) -> dict:
 
     model_name = os.environ.get("ANALYSIS_MODEL", "anthropic/claude-sonnet-5.5")
     print(f"[INFO] Analyzing transcript with {model_name}...")
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ["OPENROUTER_API_KEY"],
-    )
+    # timeout=120 s, max_retries=1: a hung call raises APITimeoutError, which
+    # run_analysis_safely reports as analysis_error with the transcript kept.
+    client = OpenAI(**openrouter_client_kwargs(os.environ["OPENROUTER_API_KEY"]))
 
     message = client.chat.completions.create(
         model=model_name,
@@ -225,23 +229,45 @@ def analyze(segments: list) -> dict:
     secrets=[modal.Secret.from_name("openrouter-api-key")],
 )
 @modal.fastapi_endpoint(method="POST")
-def transcribe_audio(data: dict, authorization: str = Header(None)):
+async def transcribe_audio(request: Request):
     """Transcribe audio and locate the sermon.
 
     Request:  {"audio_base64": "..."}  — 16kHz mono PCM WAV works best
     Response: {"success", "segments", "text", "sermon_analysis", "analysis_error"?}
     A failed analysis keeps the transcript: sermon_analysis is null and
-    analysis_error says why.
+    analysis_error says why. Bodies over MAX_BODY_BYTES get a 413 before
+    they are parsed.
     """
-    import base64
-
     expected = os.environ.get("API_TOKEN")
+    authorization = request.headers.get("authorization")
     if expected and authorization != f"Bearer {expected}":
         return fail("Unauthorized", 401)
+
+    try:
+        body = await read_body_capped(
+            request.headers.get("content-length"), request.stream()
+        )
+    except BodyTooLarge as e:
+        return fail(str(e), 413)
+
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return fail("Request body must be JSON", 400)
+    if not isinstance(data, dict):
+        return fail("Request body must be a JSON object", 400)
+    del body
 
     audio_base64 = data.get("audio_base64")
     if not audio_base64:
         return fail("audio_base64 is required", 400)
+
+    # Transcription and analysis block for minutes; keep them off the loop.
+    return await asyncio.to_thread(process_audio, audio_base64)
+
+
+def process_audio(audio_base64: str):
+    import base64
 
     audio_path = None
     try:

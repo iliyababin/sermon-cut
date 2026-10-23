@@ -82,11 +82,13 @@ The app caps uploads at 200 MB and videos at 2 hours.
 }
 ```
 
-`sermon_analysis` fields are null when the model finds no sermon. If the AI
-step itself fails (OpenRouter error, empty or unparseable reply), the
-transcript is still returned with HTTP 200, `"sermon_analysis": null` and an
-`"analysis_error": "..."` string. Other errors return
-`{"success": false, "error": "..."}` with a 4xx/5xx status.
+When the model finds no sermon, the `sermon_analysis` fields are null and an
+extra `"reason"` string says why. If the AI step itself fails (OpenRouter
+error, a call over 120 s, empty or unparseable reply), the transcript is
+still returned with HTTP 200, `"sermon_analysis": null` and an
+`"analysis_error": "..."` string. Bodies over 300 MB get a 413 before they
+are parsed. Other errors return `{"success": false, "error": "..."}` with a
+4xx/5xx status.
 
 Tests for the pure helpers in `analysis.py` (no Modal needed):
 

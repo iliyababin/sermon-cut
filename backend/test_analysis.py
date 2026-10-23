@@ -1,5 +1,6 @@
 """Tests for analysis.py. Run: python3 -m unittest discover backend"""
 
+import asyncio
 import contextlib
 import io
 import os
@@ -9,11 +10,18 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analysis import (  # noqa: E402
+    MAX_BODY_BYTES,
+    OPENROUTER_MAX_RETRIES,
+    OPENROUTER_TIMEOUT_SECONDS,
+    BodyTooLarge,
     build_response,
+    declared_length,
     format_timestamp,
     format_transcript,
     parse_analysis,
+    openrouter_client_kwargs,
     parse_time_to_seconds,
+    read_body_capped,
     run_analysis_safely,
 )
 
@@ -121,7 +129,22 @@ class BuildResponseTests(unittest.TestCase):
                     "reason": "none", "chapters": None}
         sa = build_response(SEGMENTS, "t", analysis)["sermon_analysis"]
         self.assertEqual(sa, {"sermon_start": None, "sermon_end": None, "title": None,
-                              "description": None, "chapters": None})
+                              "description": None, "chapters": None, "reason": "none"})
+
+    def test_no_sermon_found_passes_reason_and_nulls_the_rest(self):
+        # Even if the model fills fields in, sermon_found=false means nothing to cut.
+        analysis = {"sermon_found": False, "sermon_start": "1:00", "sermon_end": "9:00",
+                    "title": "Stray", "description": "d", "preacher": "P",
+                    "reason": "Only worship music, no teaching segment",
+                    "chapters": [["1:00", "x"]]}
+        sa = build_response(SEGMENTS, "t", analysis)["sermon_analysis"]
+        self.assertEqual(sa["reason"], "Only worship music, no teaching segment")
+        for key in ["sermon_start", "sermon_end", "title", "description", "chapters"]:
+            self.assertIsNone(sa[key], key)
+
+    def test_sermon_found_has_no_reason_key(self):
+        analysis = {"sermon_found": True, "sermon_start": "1:00", "reason": "longest"}
+        self.assertNotIn("reason", build_response(SEGMENTS, "t", analysis)["sermon_analysis"])
 
     def test_without_analysis(self):
         body = build_response(SEGMENTS, "t", None, "boom")
@@ -165,10 +188,95 @@ class RunAnalysisSafelyTests(unittest.TestCase):
         self.assertIsNone(analysis)
         self.assertIn("no content", error)
 
+    def test_client_timeout_keeps_transcript(self):
+        class APITimeoutError(TimeoutError):
+            """Stands in for openai.APITimeoutError."""
+
+        def fake_analyze(segments):
+            raise APITimeoutError("Request timed out.")
+
+        analysis, error = self.quiet(fake_analyze, SEGMENTS)
+        self.assertIsNone(analysis)
+        self.assertIn("APITimeoutError", error)
+        self.assertIn("timed out", error)
+
+        body = build_response(SEGMENTS, " Good morning.", analysis, error)
+        self.assertTrue(body["success"])
+        self.assertEqual(body["segments"], SEGMENTS)
+        self.assertEqual(body["text"], " Good morning.")
+        self.assertIsNone(body["sermon_analysis"])
+        self.assertIn("timed out", body["analysis_error"])
+
     def test_non_dict_result_is_failure(self):
         analysis, error = self.quiet(lambda segs: None, SEGMENTS)
         self.assertIsNone(analysis)
         self.assertIsNotNone(error)
+
+
+class OpenRouterClientTests(unittest.TestCase):
+    def test_timeout_and_retries(self):
+        kwargs = openrouter_client_kwargs("key")
+        self.assertEqual(kwargs["timeout"], 120)
+        self.assertEqual(kwargs["max_retries"], 1)
+        self.assertEqual(OPENROUTER_TIMEOUT_SECONDS, 120)
+        self.assertEqual(OPENROUTER_MAX_RETRIES, 1)
+        self.assertEqual(kwargs["api_key"], "key")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+
+
+class BodyCapTests(unittest.TestCase):
+    class Chunks:
+        """Async iterable of chunks that records how many were pulled."""
+
+        def __init__(self, chunks):
+            self.chunks = list(chunks)
+            self.pulled = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.pulled >= len(self.chunks):
+                raise StopAsyncIteration
+            self.pulled += 1
+            return self.chunks[self.pulled - 1]
+
+    def read(self, content_length, chunks, cap):
+        return asyncio.run(read_body_capped(content_length, chunks, cap))
+
+    def test_default_cap_is_about_300_mb(self):
+        self.assertEqual(MAX_BODY_BYTES, 300 * 1024 * 1024)
+
+    def test_content_length_over_cap_rejected_before_reading(self):
+        chunks = self.Chunks([b"x"])
+        with self.assertRaises(BodyTooLarge):
+            self.read("101", chunks, 100)
+        self.assertEqual(chunks.pulled, 0)
+        with self.assertRaises(BodyTooLarge):
+            asyncio.run(read_body_capped(str(MAX_BODY_BYTES + 1), self.Chunks([])))
+
+    def test_streamed_over_cap_without_content_length(self):
+        chunks = self.Chunks([b"a" * 40] * 10)
+        with self.assertRaises(BodyTooLarge):
+            self.read(None, chunks, 100)
+        self.assertEqual(chunks.pulled, 3)  # stopped once past the cap
+
+    def test_streamed_over_cap_with_lying_content_length(self):
+        with self.assertRaises(BodyTooLarge):
+            self.read("10", self.Chunks([b"a" * 60, b"a" * 60]), 100)
+
+    def test_under_cap(self):
+        self.assertEqual(self.read(None, self.Chunks([b'{"a"', b"", b": 1}"]), 100),
+                         b'{"a": 1}')
+        self.assertEqual(self.read("100", self.Chunks([b"a" * 100]), 100), b"a" * 100)
+        self.assertEqual(self.read("0", self.Chunks([]), 100), b"")
+
+    def test_declared_length(self):
+        self.assertEqual(declared_length("42"), 42)
+        self.assertEqual(declared_length(" 7 "), 7)
+        for value in [None, "", "abc", "-1", "1.5"]:
+            with self.subTest(value=value):
+                self.assertIsNone(declared_length(value))
 
 
 if __name__ == "__main__":

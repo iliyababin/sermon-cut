@@ -63,27 +63,63 @@ pub fn is_within(path: &Path, roots: &[PathBuf]) -> bool {
         .any(|root| resolved.starts_with(&root))
 }
 
-/// The folders the file commands below may touch: the library, the app's
-/// data, settings and tools folders, and the temp folder.
-fn allowed_roots(app_handle: &AppHandle, lib: &LibraryHandle) -> Vec<PathBuf> {
+/// What a file command does with a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Shown in Finder or opened in its own app.
+    Open,
+    /// Read or written for the webview.
+    Data,
+}
+
+/// The folders the file commands below may touch: the library, the
+/// standalone Thumbnail tab's folder and the temp folder. Opening in Finder
+/// may also reach the app's data, settings and tools folders (Settings
+/// shows them); reading and writing may not.
+pub fn allowed_roots(library_root: Option<PathBuf>, app_data: Option<PathBuf>, access: Access) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    roots.extend(lib.root());
-    roots.extend(app_handle.path().app_data_dir().ok());
-    roots.push(crate::state::state_dir());
-    roots.extend(crate::tools::tools_dir());
+    roots.extend(library_root);
+    roots.extend(app_data.as_ref().map(|d| d.join(STANDALONE_DIR)));
     roots.push(std::env::temp_dir());
+    if access == Access::Open {
+        roots.extend(app_data);
+        roots.push(crate::state::state_dir());
+        roots.extend(crate::tools::tools_dir());
+    }
     roots
+}
+
+/// state.json, its backup, its damaged and pre-library copies and its
+/// temp files: never read or written for the webview, wherever they are.
+fn is_state_file(path: &Path) -> bool {
+    let named = |p: &Path| {
+        p.file_name().map(|n| n.to_string_lossy().to_string()).is_some_and(|n| {
+            n == "state.json" || n.starts_with("state.json.") || n == "state.v0.json" || n.starts_with(".state.json")
+        })
+    };
+    named(path) || resolve_for_check(path).is_some_and(|p| named(&p))
+}
+
+/// Whether a file command may use `path`: inside `roots`, or picked by the
+/// user in a dialog; never one of state.json's files when reading or
+/// writing.
+pub fn path_allowed(path: &Path, roots: &[PathBuf], picked: bool, access: Access) -> bool {
+    if access == Access::Data && is_state_file(path) {
+        return false;
+    }
+    is_within(path, roots) || picked
 }
 
 /// Refuse a path outside the app's folders, unless the user picked it in an
 /// open/save dialog this session (the dialog adds picks to the fs scope).
-fn check_path(app_handle: &AppHandle, lib: &LibraryHandle, path: &str) -> Result<PathBuf, String> {
+pub fn check_path(app_handle: &AppHandle, lib: &LibraryHandle, path: &str, access: Access) -> Result<PathBuf, String> {
     use tauri_plugin_fs::FsExt;
     let p = Path::new(path);
     let picked = app_handle
         .try_fs_scope()
         .is_some_and(|scope| scope.is_allowed(p));
-    if is_within(p, &allowed_roots(app_handle, lib)) || picked {
+    let roots = allowed_roots(lib.root(), app_handle.path().app_data_dir().ok(), access);
+    if path_allowed(p, &roots, picked, access) {
         Ok(p.to_path_buf())
     } else {
         Err(format!("Sermon Cut can only use files in its own folders or ones you chose: {}", path))
@@ -226,7 +262,7 @@ pub async fn read_image_base64(
     path: String,
 ) -> Result<String, String> {
     use base64::Engine;
-    check_path(&app_handle, &lib, &path)?;
+    check_path(&app_handle, &lib, &path, Access::Data)?;
 
     let bytes = std::fs::read(&path)
         .map_err(|e| format!("Failed to read image: {}", e))?;
@@ -247,7 +283,7 @@ pub async fn read_image_base64(
 
 #[tauri::command]
 pub async fn open_file(app_handle: AppHandle, lib: State<'_, LibraryHandle>, path: String) -> Result<(), String> {
-    check_path(&app_handle, &lib, &path)?;
+    check_path(&app_handle, &lib, &path, Access::Open)?;
     println!("[open_file] Opening file: {}", path);
 
     #[cfg(target_os = "linux")]
@@ -279,7 +315,7 @@ pub async fn open_file(app_handle: AppHandle, lib: State<'_, LibraryHandle>, pat
 
 #[tauri::command]
 pub async fn open_folder(app_handle: AppHandle, lib: State<'_, LibraryHandle>, path: String) -> Result<(), String> {
-    check_path(&app_handle, &lib, &path)?;
+    check_path(&app_handle, &lib, &path, Access::Open)?;
     open_folder_path(path)
 }
 
@@ -502,6 +538,8 @@ pub async fn youtube_list_playlists(
     crate::youtube::list_playlists(&access_token).await
 }
 
+const STANDALONE_DIR: &str = "standalone-thumbnails";
+
 /// Working folder for the standalone Thumbnail tab, in the app's data folder
 /// (covered by the `$APPDATA/**` asset scope), so it works without a library.
 fn standalone_dir(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
@@ -509,7 +547,7 @@ fn standalone_dir(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> 
         .path()
         .app_data_dir()
         .map_err(|e| format!("Can't find the app data folder: {}", e))?
-        .join("standalone-thumbnails");
+        .join(STANDALONE_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
     Ok(dir)
 }
@@ -568,8 +606,8 @@ pub async fn copy_file(
     source: String,
     destination: String,
 ) -> Result<(), String> {
-    check_path(&app_handle, &lib, &source)?;
-    check_path(&app_handle, &lib, &destination)?;
+    check_path(&app_handle, &lib, &source, Access::Data)?;
+    check_path(&app_handle, &lib, &destination, Access::Data)?;
     if let Some(parent) = Path::new(&destination).parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create destination directory: {}", e))?;
@@ -644,6 +682,43 @@ mod tests {
             symlink(&root, tmp.path().join("alias")).unwrap();
             assert!(is_within(&tmp.path().join("alias/sub/a.jpg"), &roots));
             assert!(is_within(&root.join("sub/a.jpg"), &[tmp.path().join("alias")]));
+        }
+    }
+
+    #[test]
+    fn reading_and_copying_stay_out_of_the_app_settings_and_tools() {
+        // Outside the temp folder, which is itself allowed.
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let lib = tmp.path().join("lib");
+        let app_data = tmp.path().join("appdata");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(app_data.join("bin")).unwrap();
+        std::fs::create_dir_all(app_data.join(STANDALONE_DIR)).unwrap();
+        let data = allowed_roots(Some(lib.clone()), Some(app_data.clone()), Access::Data);
+        let open = allowed_roots(Some(lib.clone()), Some(app_data.clone()), Access::Open);
+        let state_json = crate::state::state_dir().join("state.json");
+        let tool = crate::tools::tools_dir().unwrap().join("ffmpeg");
+
+        for p in [&state_json, &tool, &app_data.join("bin/ffmpeg")] {
+            assert!(!path_allowed(p, &data, false, Access::Data), "{}", p.display());
+            assert!(path_allowed(p, &open, false, Access::Open), "{}", p.display());
+        }
+        assert!(path_allowed(&lib.join("a.jpg"), &data, false, Access::Data));
+        assert!(path_allowed(&app_data.join(STANDALONE_DIR).join("t.jpg"), &data, false, Access::Data));
+
+        // state.json and its copies, even where files may otherwise be used
+        // (the temp folder) or the user picked them.
+        let tmpdir = std::env::temp_dir();
+        for name in ["state.json", "state.json.bak", "state.json.corrupt-20260101-000000", "state.v0.json"] {
+            assert!(!path_allowed(&tmpdir.join(name), &data, true, Access::Data), "{}", name);
+            assert!(!path_allowed(&lib.join(name), &data, false, Access::Data), "{}", name);
+        }
+        #[cfg(unix)]
+        {
+            // Nor through a link with an innocent name.
+            std::fs::write(lib.join("state.json"), b"{}").unwrap();
+            std::os::unix::fs::symlink(lib.join("state.json"), lib.join("logo.png")).unwrap();
+            assert!(!path_allowed(&lib.join("logo.png"), &data, false, Access::Data));
         }
     }
 

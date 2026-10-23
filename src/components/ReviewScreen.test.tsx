@@ -452,4 +452,24 @@ describe("ReviewScreen", () => {
     await screen.findByText(/may have finished just before/);
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
+
+  it("won't upload without a title, and says why", async () => {
+    render(<ReviewScreen video={video({ review: { title: "   ", description: "", preacher: PREACHER } })} onBack={() => {}} />);
+    const upload = (await screen.findByRole("button", { name: /^upload$/i })) as HTMLButtonElement;
+    expect(upload.disabled).toBe(true);
+    expect(screen.getByRole("note").textContent).toBe("Add a title to upload.");
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(calls("youtube_upload_video")).toHaveLength(0);
+  });
+
+  it("disables Reprocess during an upload", async () => {
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    const reprocess = screen.getByRole("button", { name: /reprocess/i }) as HTMLButtonElement;
+    expect(reprocess.disabled).toBe(false);
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
+    expect(reprocess.disabled).toBe(true);
+    expect(reprocess.title).toBe("Wait for the upload to finish");
+  });
 });

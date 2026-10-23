@@ -174,7 +174,14 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     initialReviewState({ status: v.status, uploadProgress: v.upload_progress, uploads: v.uploads })
   );
   const phase = review.phase;
-  const uploadReady = thumbnailsReady && preacher.trim() !== "";
+  // What stops an upload, said next to the button.
+  const uploadBlocker =
+    youtubeTitle(title) === ""
+      ? "Add a title to upload."
+      : preacher.trim() === ""
+        ? "Add the speaker's name to upload."
+        : null;
+  const uploadReady = thumbnailsReady && uploadBlocker === null;
 
   // Privacy and playlist for this upload, starting from the last privacy
   // used and the default playlist in Settings. "" means no playlist.
@@ -560,8 +567,12 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         <div className="flex items-center gap-2">
           <button
             onClick={handleReprocess}
-            disabled={isReprocessing}
-            title="Re-transcribe and regenerate all suggestions"
+            disabled={isReprocessing || phase.kind === "uploading" || phase.kind === "confirming"}
+            title={
+              phase.kind === "uploading"
+                ? "Wait for the upload to finish"
+                : "Re-transcribe and regenerate all suggestions"
+            }
             className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 flex items-center gap-2 transition-colors"
           >
             {isReprocessing ? (
@@ -610,7 +621,8 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
               <button
                 onClick={handleUpload}
                 disabled={!canStartUpload(phase) || !uploadReady}
-                title={!preacher.trim() ? "Speaker name is required" : "Upload (⌘Enter)"}
+                title={uploadBlocker ?? "Upload (⌘Enter)"}
+                aria-describedby={uploadBlocker ? "upload-blocker" : undefined}
                 className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-colors"
               >
                 {phase.kind === "uploading" ? (
@@ -630,6 +642,11 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                 </>
               )}
             </button>
+            {uploadBlocker && canStartUpload(phase) && (
+              <span id="upload-blocker" role="note" className="text-xs text-muted-foreground max-w-40">
+                {uploadBlocker}
+              </span>
+            )}
             {phase.kind === "uploading" && (
               <button
                 onClick={handleCancelUpload}

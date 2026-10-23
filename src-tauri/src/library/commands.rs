@@ -333,6 +333,7 @@ pub async fn youtube_upload_video(
     end_time: Option<f64>,
     playlist_id: Option<String>,
 ) -> Result<UploadOutcome, String> {
+    check_title(&title)?;
     // Privacy and playlist as chosen next to Upload; the settings fill in
     // anything not sent.
     let options = UploadOptions::resolve(&state.lock().await.settings, privacy, playlist_id)?;
@@ -416,6 +417,15 @@ pub async fn youtube_upload_video(
     result.map_err(|e| e.user_message())
 }
 
+/// YouTube refuses a video without a title (and the webview disables
+/// Upload then); refused here too, before anything starts.
+fn check_title(title: &str) -> Result<(), String> {
+    if title.trim().is_empty() {
+        return Err("Add a title before uploading.".into());
+    }
+    Ok(())
+}
+
 /// Stop a running upload; the next Upload continues where it stopped.
 #[tauri::command]
 pub async fn cancel_upload(lib: State<'_, LibraryHandle>, video_id: String) -> Result<(), String> {
@@ -434,9 +444,7 @@ pub async fn youtube_update_metadata(
     title: String,
     description: String,
 ) -> Result<(), String> {
-    if title.trim().is_empty() {
-        return Err("Add a title first.".into());
-    }
+    check_title(&title)?;
     if !lib.has_upload(&video_id, &youtube_id) {
         return Err("That YouTube video isn't one of this video's uploads.".into());
     }
@@ -532,6 +540,13 @@ pub fn folder_warnings(path: &Path, home: Option<&Path>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use tauri::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn an_upload_needs_a_title() {
+        assert!(super::check_title("").is_err());
+        assert!(super::check_title(" \n\t").is_err());
+        assert!(super::check_title("Hope").is_ok());
+    }
     use tauri::ipc::InvokeBody;
 
     fn headers(pairs: &[(&'static str, &[u8])]) -> HeaderMap {

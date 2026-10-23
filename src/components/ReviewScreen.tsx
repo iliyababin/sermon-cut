@@ -468,7 +468,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
   const handleUpload = () => dispatch({ type: "upload", ready: uploadReady });
 
-  // ⌘Enter uploads, Esc goes back (see reviewShortcut).
+  // ⌘Enter uploads, Esc goes back or leaves a field (see reviewShortcut).
   const shortcutState = useRef({ blocked: false, canUpload: false, handleBack, handleUpload });
   shortcutState.current = {
     blocked: isEditorOpen || phase.kind === "confirming",
@@ -485,10 +485,14 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         key: e.key,
         metaKey: e.metaKey,
         ctrlKey: e.ctrlKey,
-        inTextarea: e.target instanceof HTMLTextAreaElement,
+        inField: isEditable(e.target),
+        // keyCode 229: Safari's key that an input method handles.
+        composing: e.isComposing || e.keyCode === 229,
         blocked: s.blocked,
       });
-      if (action === "back") {
+      if (action === "blur") {
+        (e.target as HTMLElement).blur();
+      } else if (action === "back") {
         e.preventDefault();
         void s.handleBack();
       } else if (action === "upload" && s.canUpload) {
@@ -987,5 +991,17 @@ function ErrorBanner({
         </button>
       )}
     </div>
+  );
+}
+
+/** A text field, select or other element that takes typing. */
+function isEditable(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    target.isContentEditable ||
+    target.closest('[contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]') !== null
   );
 }

@@ -132,21 +132,23 @@ export interface ShortcutKey {
   key: string;
   metaKey: boolean;
   ctrlKey: boolean;
-  /** Focus is in a multi-line text field. */
-  inTextarea: boolean;
+  /** Focus is in a text field, select or other editable element. */
+  inField: boolean;
+  /** An input method is composing text (the key belongs to it). */
+  composing: boolean;
   /** A dialog or the thumbnail editor is open. */
   blocked: boolean;
 }
 
 /**
  * The review screen's keyboard shortcuts: ⌘Enter (Ctrl+Enter) uploads and
- * Esc goes back. Nothing happens while a dialog or the editor is open. In
- * a textarea Esc does nothing (it isn't "leave" there), but ⌘Enter still
- * uploads, since it never types a newline.
+ * Esc goes back. Nothing happens while a dialog or the editor is open, or
+ * while an input method is composing. In a field Esc only leaves the field
+ * ("blur"), but ⌘Enter still uploads, since it never types a newline.
  */
-export function reviewShortcut(e: ShortcutKey): "upload" | "back" | null {
-  if (e.blocked) return null;
+export function reviewShortcut(e: ShortcutKey): "upload" | "back" | "blur" | null {
+  if (e.blocked || e.composing) return null;
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) return "upload";
-  if (e.key === "Escape" && !e.metaKey && !e.ctrlKey && !e.inTextarea) return "back";
+  if (e.key === "Escape" && !e.metaKey && !e.ctrlKey) return e.inField ? "blur" : "back";
   return null;
 }

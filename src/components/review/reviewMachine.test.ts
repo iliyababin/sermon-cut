@@ -119,7 +119,8 @@ describe("reviewShortcut", () => {
     key: "",
     metaKey: false,
     ctrlKey: false,
-    inTextarea: false,
+    inField: false,
+    composing: false,
     blocked: false,
     ...over,
   });
@@ -127,13 +128,19 @@ describe("reviewShortcut", () => {
   it("uploads on ⌘Enter or Ctrl+Enter, also from a textarea", () => {
     expect(reviewShortcut(key({ key: "Enter", metaKey: true }))).toBe("upload");
     expect(reviewShortcut(key({ key: "Enter", ctrlKey: true }))).toBe("upload");
-    expect(reviewShortcut(key({ key: "Enter", metaKey: true, inTextarea: true }))).toBe("upload");
+    expect(reviewShortcut(key({ key: "Enter", metaKey: true, inField: true }))).toBe("upload");
     expect(reviewShortcut(key({ key: "Enter" }))).toBeNull();
   });
 
-  it("goes back on Esc, except from a textarea", () => {
+  it("goes back on Esc; in a field Esc leaves the field", () => {
     expect(reviewShortcut(key({ key: "Escape" }))).toBe("back");
-    expect(reviewShortcut(key({ key: "Escape", inTextarea: true }))).toBeNull();
+    expect(reviewShortcut(key({ key: "Escape", inField: true }))).toBe("blur");
+  });
+
+  it("leaves keys to an input method that is composing", () => {
+    expect(reviewShortcut(key({ key: "Escape", composing: true }))).toBeNull();
+    expect(reviewShortcut(key({ key: "Escape", inField: true, composing: true }))).toBeNull();
+    expect(reviewShortcut(key({ key: "Enter", metaKey: true, composing: true }))).toBeNull();
   });
 
   it("does nothing while a dialog or the editor is open", () => {

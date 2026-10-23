@@ -189,6 +189,26 @@ describe("ReviewScreen", () => {
     await waitFor(() => expect(onBack).toHaveBeenCalledTimes(1));
   });
 
+  it("Esc in a field leaves the field, and is left to an input method", async () => {
+    const onBack = vi.fn();
+    render(<ReviewScreen video={video()} onBack={onBack} />);
+    const title = screen.getByDisplayValue(TITLE);
+    const preacher = screen.getByLabelText("Preacher");
+    for (const field of [title, preacher]) {
+      field.focus();
+      expect(document.activeElement).toBe(field);
+      fireEvent.keyDown(field, { key: "Escape" });
+      expect(document.activeElement).not.toBe(field);
+    }
+    // Composing (e.g. Japanese input): Esc cancels the composition only.
+    title.focus();
+    fireEvent.keyDown(title, { key: "Escape", isComposing: true });
+    fireEvent.keyDown(window, { key: "Escape", keyCode: 229 });
+    expect(document.activeElement).toBe(title);
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(onBack).not.toHaveBeenCalled();
+  });
+
   it("ignores Esc in the description and while hidden", async () => {
     const onBack = vi.fn();
     const { rerender } = render(<ReviewScreen video={video()} onBack={onBack} />);

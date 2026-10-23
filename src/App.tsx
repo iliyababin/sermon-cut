@@ -101,7 +101,7 @@ export default function App() {
           <VideoLibrary onVideoSelect={handleVideoSelect} visible={currentView === "library"} />
         </div>
         <div className={currentView === "download" ? "" : "hidden"}>
-          <DownloadForm onGoToLibrary={handleGoToLibrary} />
+          <DownloadForm onGoToLibrary={handleGoToLibrary} isActive={currentView === "download"} />
         </div>
         {selectedVideo && (
           <div className={currentView === "review" ? "" : "hidden"}>

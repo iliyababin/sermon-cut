@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { getVideoInfo, downloadVideo, cancelDownload, errorMessage } from "@/lib/tauri";
+import { useState, useEffect, useRef } from "react";
+import { getVideoInfo, downloadVideo, cancelDownload, getSettings, errorMessage } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import type { VideoInfo } from "@/lib/types";
 import { Loader2, AlertCircle, Clock, User, Zap, Download, X } from "lucide-react";
@@ -14,9 +14,12 @@ interface DownloadProgress {
 
 interface DownloadFormProps {
   onGoToLibrary: () => void;
+  /** Whether this screen is showing; a finished download only switches to
+   * the library if it still is. */
+  isActive: boolean;
 }
 
-export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
+export function DownloadForm({ onGoToLibrary, isActive }: DownloadFormProps) {
   const [url, setUrl] = useState("");
   const [quality, setQuality] = useState("best");
   const [loading, setLoading] = useState(false);
@@ -27,6 +30,18 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
   const [downloadStatus, setDownloadStatus] = useState<string>("downloading");
   const [error, setError] = useState<string | null>(null);
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
+  // The URL videoInfo was fetched for.
+  const [fetchedUrl, setFetchedUrl] = useState<string | null>(null);
+  const active = useRef(isActive);
+  active.current = isActive;
+
+  // Start from the quality chosen in Settings each time the screen opens.
+  useEffect(() => {
+    if (!isActive || downloading) return;
+    getSettings()
+      .then((s) => setQuality(s.download_quality || "best"))
+      .catch(() => {});
+  }, [isActive]);
 
   useEffect(() => {
     const unlisten = listen<DownloadProgress>("download-progress", (event) => {
@@ -43,8 +58,9 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
     };
   }, [videoInfo]);
 
-  async function handleFetchInfo() {
-    if (!url.trim()) {
+  async function handleFetchInfo(target = url) {
+    const wanted = target.trim();
+    if (!wanted) {
       setError("Please enter a YouTube URL");
       return;
     }
@@ -52,8 +68,9 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
     try {
       setLoading(true);
       setError(null);
-      const info = await getVideoInfo(url);
+      const info = await getVideoInfo(wanted);
       setVideoInfo(info);
+      setFetchedUrl(wanted);
     } catch (err) {
       setError(errorMessage(err, "Failed to fetch video info"));
       setVideoInfo(null);
@@ -73,12 +90,13 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
 
       // Downloads into the library folder; with `process` it's queued for
       // processing as soon as it lands.
-      await downloadVideo(url, quality, process);
+      await downloadVideo(fetchedUrl ?? url.trim(), quality, process);
 
       setDownloading(false);
       setVideoInfo(null);
+      setFetchedUrl(null);
       setUrl("");
-      onGoToLibrary();
+      if (active.current) onGoToLibrary();
     } catch (err) {
       setError(errorMessage(err, "Download failed"));
       setDownloading(false);
@@ -100,11 +118,28 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://youtube.com/watch?v=..."
+              aria-label="YouTube URL"
+              disabled={downloading}
               className="flex-1 px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring"
-              onKeyDown={(e) => e.key === "Enter" && handleFetchInfo()}
+              onPaste={(e) => {
+                // Pasting into an empty field looks the video up straight away.
+                if (url.trim() || loading) return;
+                const pasted = e.clipboardData.getData("text").trim();
+                if (!pasted) return;
+                e.preventDefault();
+                setUrl(pasted);
+                handleFetchInfo(pasted);
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter" || loading || downloading) return;
+                // Enter looks the video up, then (once shown) downloads and
+                // processes it.
+                if (videoInfo && fetchedUrl === url.trim()) handleDownload(true);
+                else handleFetchInfo();
+              }}
             />
             <button
-              onClick={handleFetchInfo}
+              onClick={() => handleFetchInfo()}
               disabled={loading}
               className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 transition-colors"
             >
@@ -119,8 +154,9 @@ export function DownloadForm({ onGoToLibrary }: DownloadFormProps) {
 
         {/* Quality Selector */}
         <div>
-          <label className="block text-sm font-medium mb-2">Quality</label>
+          <label htmlFor="download-quality" className="block text-sm font-medium mb-2">Quality</label>
           <select
+            id="download-quality"
             value={quality}
             onChange={(e) => setQuality(e.target.value)}
             className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring bg-background"

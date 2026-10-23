@@ -16,18 +16,36 @@ Needs one workspace secret named `openrouter-api-key`:
                                      `Authorization: Bearer <token>`
 """
 
-import json
 import os
-import re
+import tempfile
 
 import modal
 from fastapi import Header
 from fastapi.responses import JSONResponse
 
+from analysis import (
+    build_response,
+    format_transcript,
+    parse_analysis,
+    run_analysis_safely,
+)
+
 app = modal.App("youtube-clipper")
 
 GPU = "T4"
 TIMEOUT = 1800  # 30 min — long services take a while
+
+# Baked into the image at build time. Secrets aren't available during the
+# build, so a WHISPER_MODEL override downloads at runtime instead.
+DEFAULT_WHISPER_MODEL = "large-v3-turbo"
+MODEL_DIR = "/models"
+
+
+def download_whisper_model():
+    from faster_whisper import download_model
+
+    download_model(DEFAULT_WHISPER_MODEL, cache_dir=MODEL_DIR)
+
 
 # faster-whisper (CTranslate2) needs CUDA 12's cuBLAS and cuDNN 9 at runtime,
 # which a plain debian_slim image doesn't have.
@@ -35,6 +53,10 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04", add_python="3.11")
     .apt_install("ffmpeg")
     .pip_install("faster-whisper", "openai", "fastapi")
+    # copy=True: app.py imports analysis, and run_function imports app.py
+    # during the build, so the module has to be in the image before it.
+    .add_local_python_source("analysis", copy=True)
+    .run_function(download_whisper_model)
 )
 
 # Whisper does better on religious vocabulary when primed with it.
@@ -87,35 +109,34 @@ SERMON_SCHEMA = {
             "type": "object",
             "properties": {
                 "sermon_found": {"type": "boolean"},
-                "sermon_start": {"type": "string"},
-                "sermon_end": {"type": "string"},
-                "title": {"type": "string"},
-                "description": {"type": "string"},
+                "sermon_start": {"type": ["string", "null"]},
+                "sermon_end": {"type": ["string", "null"]},
+                "title": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
                 "preacher": {"type": ["string", "null"]},
                 "reason": {"type": "string"},
                 "chapters": {
-                    "type": "array",
+                    "type": ["array", "null"],
                     "items": {"type": "array", "items": {"type": "string"}},
                 },
             },
-            "required": ["sermon_found", "reason"],
+            # Strict mode wants every property listed; absent values are null.
+            "required": [
+                "sermon_found",
+                "sermon_start",
+                "sermon_end",
+                "title",
+                "description",
+                "preacher",
+                "reason",
+                "chapters",
+            ],
             "additionalProperties": False,
         },
     },
 }
 
 CORS = {"Access-Control-Allow-Origin": "*"}
-
-
-def parse_time_to_seconds(time_str: str):
-    """Convert HH:MM:SS or MM:SS to seconds. None if it isn't a time."""
-    try:
-        seconds = 0.0
-        for part in str(time_str).strip().split(":"):
-            seconds = seconds * 60 + float(part)
-        return int(seconds)
-    except ValueError:
-        return None
 
 
 def fail(message: str, status: int = 500):
@@ -126,13 +147,31 @@ def fail(message: str, status: int = 500):
     )
 
 
-def transcribe(audio_path: str):
-    """Run faster-whisper. Returns (segments, full_text, info)."""
-    from faster_whisper import WhisperModel
+_whisper_models = {}
 
-    model_name = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+
+def get_whisper_model():
+    """Load the Whisper model once per container."""
+    model_name = os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
+    model = _whisper_models.get(model_name)
+    if model is None:
+        from faster_whisper import WhisperModel
+
+        print(f"[INFO] Loading faster-whisper ({model_name})...")
+        model = WhisperModel(
+            model_name,
+            device="cuda",
+            compute_type="float16",
+            download_root=MODEL_DIR,
+        )
+        _whisper_models[model_name] = model
+    return model_name, model
+
+
+def transcribe(audio_path: str):
+    """Run faster-whisper. Returns (segments, full_text)."""
+    model_name, model = get_whisper_model()
     print(f"[INFO] Transcribing with faster-whisper ({model_name})...")
-    model = WhisperModel(model_name, device="cuda", compute_type="float16")
 
     fw_segments, info = model.transcribe(
         audio_path,
@@ -156,10 +195,7 @@ def analyze(segments: list) -> dict:
     """Ask the LLM to locate the sermon. Returns the raw analysis dict."""
     from openai import OpenAI
 
-    timestamped = "".join(
-        f"[{int(s['start'] // 60):02d}:{int(s['start'] % 60):02d}] {s['text']}\n"
-        for s in segments
-    )
+    timestamped = format_transcript(segments)
 
     model_name = os.environ.get("ANALYSIS_MODEL", "anthropic/claude-sonnet-5.5")
     print(f"[INFO] Analyzing transcript with {model_name}...")
@@ -177,18 +213,9 @@ def analyze(segments: list) -> dict:
         ],
     )
 
-    text = message.choices[0].message.content.strip()
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[^}]+\}", text)
-        if match:
-            return json.loads(match.group())
-        return {"sermon_found": False, "reason": "Could not parse analysis"}
+    if not message.choices:
+        raise ValueError("Analysis model returned no choices")
+    return parse_analysis(message.choices[0].message.content)
 
 
 @app.function(
@@ -202,7 +229,9 @@ def transcribe_audio(data: dict, authorization: str = Header(None)):
     """Transcribe audio and locate the sermon.
 
     Request:  {"audio_base64": "..."}  — 16kHz mono PCM WAV works best
-    Response: {"success", "segments", "text", "sermon_analysis"}
+    Response: {"success", "segments", "text", "sermon_analysis", "analysis_error"?}
+    A failed analysis keeps the transcript: sermon_analysis is null and
+    analysis_error says why.
     """
     import base64
 
@@ -214,53 +243,29 @@ def transcribe_audio(data: dict, authorization: str = Header(None)):
     if not audio_base64:
         return fail("audio_base64 is required", 400)
 
-    audio_path = "/tmp/audio.wav"
+    audio_path = None
     try:
         audio = base64.b64decode(audio_base64)
-        with open(audio_path, "wb") as f:
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            audio_path = f.name
             f.write(audio)
         print(f"[INFO] Received {len(audio) / 1024 / 1024:.1f} MB of audio")
 
         segments, full_text = transcribe(audio_path)
-        analysis = analyze(segments)
-        print(f"[INFO] Analysis: {analysis}")
-
-        chapters = None
-        if analysis.get("chapters"):
-            # Skip malformed chapters rather than failing after transcription.
-            chapters = [
-                {"time": parse_time_to_seconds(ch[0]), "title": ch[1]}
-                for ch in analysis["chapters"]
-                if len(ch) >= 2 and parse_time_to_seconds(ch[0]) is not None
-            ]
-
-        def seconds(key):
-            value = analysis.get(key)
-            return parse_time_to_seconds(value) if value else None
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "segments": segments,
-                "text": full_text,
-                "sermon_analysis": {
-                    "sermon_start": seconds("sermon_start"),
-                    "sermon_end": seconds("sermon_end"),
-                    "title": analysis.get("title"),
-                    "description": analysis.get("description"),
-                    "chapters": chapters,
-                },
-            },
-            headers=CORS,
-        )
-
     except Exception as e:
         print(f"[ERROR] Transcription failed: {e}")
         import traceback
 
         traceback.print_exc()
         return fail(str(e))
-
     finally:
-        if os.path.exists(audio_path):
+        if audio_path and os.path.exists(audio_path):
             os.unlink(audio_path)
+
+    analysis, analysis_error = run_analysis_safely(analyze, segments)
+    print(f"[INFO] Analysis: {analysis if analysis is not None else analysis_error}")
+
+    return JSONResponse(
+        content=build_response(segments, full_text, analysis, analysis_error),
+        headers=CORS,
+    )

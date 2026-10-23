@@ -82,11 +82,21 @@ The app caps uploads at 200 MB and videos at 2 hours.
 }
 ```
 
-`sermon_analysis` fields are null when the model finds no sermon. Errors return
+`sermon_analysis` fields are null when the model finds no sermon. If the AI
+step itself fails (OpenRouter error, empty or unparseable reply), the
+transcript is still returned with HTTP 200, `"sermon_analysis": null` and an
+`"analysis_error": "..."` string. Other errors return
 `{"success": false, "error": "..."}` with a 4xx/5xx status.
+
+Tests for the pure helpers in `analysis.py` (no Modal needed):
+
+```bash
+python3 -m unittest discover backend
+```
 
 ## Cost notes
 
-Runs on a T4 with a 30-minute timeout. Cold starts pay for the Whisper model
-download; back-to-back requests reuse a warm container. A ~90-minute service is
+Runs on a T4 with a 30-minute timeout. The default Whisper model is baked into
+the image at build time (a `WHISPER_MODEL` override downloads on first use) and
+loaded once per container; back-to-back requests reuse a warm container. A ~90-minute service is
 a few minutes of GPU time plus one Sonnet call over the transcript.

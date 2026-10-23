@@ -208,6 +208,8 @@ export interface Settings {
   youtube_channel_name: string | null;
   /** Speakers named in reviews, most recent first (the app keeps it). */
   recent_preachers: string[];
+  /** Process videos that appear in the library folder from now on. */
+  auto_process: boolean;
 }
 
 /** The settings a save may change. Absent fields are left alone; for the
@@ -219,6 +221,7 @@ export interface SettingsPatch {
   modal_api_key?: string;
   logo_path?: string;
   youtube_playlist_id?: string;
+  auto_process?: boolean;
 }
 
 export interface PlaylistInfo {

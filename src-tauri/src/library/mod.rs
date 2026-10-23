@@ -123,6 +123,16 @@ pub struct Entry {
     /// new file that reuses a name (a new entry).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
+    /// When the library first saw the file (ms since the epoch); 0 for
+    /// entries from before this was kept, and for files that were already
+    /// in a folder when the library started watching it. Auto-process only
+    /// takes files first seen after it was turned on.
+    #[serde(default)]
+    pub first_seen: i64,
+    /// Auto-process queued it once; it isn't queued by itself again (e.g.
+    /// after it was cancelled).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_queued: bool,
 }
 
 impl Entry {
@@ -144,6 +154,8 @@ impl Entry {
             added_at: chrono::Utc::now().to_rfc3339(),
             legacy_id: None,
             missing: false,
+            first_seen: chrono::Utc::now().timestamp_millis(),
+            auto_queued: false,
         }
     }
 

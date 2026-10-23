@@ -8,6 +8,7 @@ export const EDITABLE_SETTINGS = [
   "modal_api_key",
   "logo_path",
   "youtube_playlist_id",
+  "auto_process",
 ] as const satisfies readonly (keyof Settings & keyof SettingsPatch)[];
 
 /** What changed between the saved settings and the edited ones, as a patch.
@@ -16,7 +17,7 @@ export function settingsPatch(saved: Settings, edited: Settings): SettingsPatch 
   const patch: SettingsPatch = {};
   for (const key of EDITABLE_SETTINGS) {
     const value = edited[key] ?? "";
-    if (value !== (saved[key] ?? "")) patch[key] = value;
+    if (value !== (saved[key] ?? "")) (patch as Record<string, string | boolean>)[key] = value;
   }
   return patch;
 }

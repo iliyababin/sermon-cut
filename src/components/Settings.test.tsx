@@ -36,6 +36,7 @@ const initial: SettingsType = {
   upload_privacy: "public",
   youtube_signed_in: false,
   youtube_channel_name: null,  recent_preachers: [],
+  auto_process: false,
 };
 
 function saves() {
@@ -103,6 +104,16 @@ describe("Settings autosave", () => {
     expect((await screen.findByRole("alert")).textContent).toBe("Wait for the upload to finish.");
     // The folder in use is shown again.
     await waitFor(() => expect((screen.getByLabelText("Library Folder") as HTMLInputElement).value).toBe("/lib"));
+  });
+
+  it("saves the auto-process switch at once", async () => {
+    render(<Settings />);
+    const toggle = (await screen.findByLabelText(/Process new videos automatically/)) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+    await waitFor(() => expect(saves()).toHaveLength(1));
+    expect(saves()[0].patch).toEqual({ auto_process: true });
+    await waitFor(() => expect(toggle.checked).toBe(true));
   });
 
   it("saves a typed folder only on Enter", async () => {

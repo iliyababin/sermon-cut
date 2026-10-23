@@ -355,6 +355,24 @@ export function Settings() {
               </div>
             ))}
           </div>
+
+          <div className="mt-4">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.auto_process}
+                onChange={(e) => edit("auto_process", e.target.checked, 0)}
+                className="mt-1 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">Process new videos automatically</span>
+                <span className="block text-sm text-muted-foreground">
+                  Videos that show up in the library folder from now on are transcribed and trimmed right away. Videos already there are left for you to start.
+                </span>
+              </span>
+            </label>
+            <FieldError message={fieldErrors.auto_process} />
+          </div>
         </div>
 
         {/* Thumbnail Logo */}

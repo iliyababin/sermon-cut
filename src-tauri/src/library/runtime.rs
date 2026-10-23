@@ -84,6 +84,10 @@ struct Inner {
     /// An app update is being installed: no new work may start, since the
     /// app relaunches when it's done.
     updating: bool,
+    /// The next scan takes in a folder's existing videos (a switched or
+    /// rebuilt library), which auto-process must leave alone: the entries
+    /// it adds count as already there (`first_seen` 0).
+    baseline_scan: bool,
 }
 
 pub struct Library {
@@ -279,8 +283,16 @@ impl Inner {
     fn apply_scan(&mut self, obs: &[FileObs]) -> Vec<String> {
         let busy = self.busy_set();
         let last_present = self.scanned.then(|| std::mem::take(&mut self.last.present));
+        let known: Option<HashSet<String>> =
+            self.baseline_scan.then(|| self.manifest.entries.iter().map(|e| e.id.clone()).collect());
         let reconciled =
             scan::reconcile_adopting(&mut self.manifest.entries, obs, &busy, last_present.as_ref(), &mut self.orphans);
+        if let Some(known) = known {
+            for e in self.manifest.entries.iter_mut().filter(|e| !known.contains(&e.id)) {
+                e.first_seen = 0;
+            }
+            self.baseline_scan = false;
+        }
         let mut stale = Vec::new();
         if self.mode == Mode::Writable {
             stale = reconciled.replaced.clone();
@@ -300,6 +312,27 @@ impl Inner {
                 eprintln!("[library] Failed to save library.json: {}", e);
             }
         }
+    }
+
+    /// Videos auto-process should queue: new, first seen at or after
+    /// `since`, never auto-queued before, and ready to process.
+    fn auto_process_candidates(&self, since: i64) -> Vec<String> {
+        self.manifest
+            .entries
+            .iter()
+            .filter(|e| {
+                e.status == EntryStatus::New
+                    && !e.hidden
+                    && !e.auto_queued
+                    && e.first_seen >= since
+                    && e.duration.is_none_or(|d| d <= MAX_TRANSCRIBE_SECS)
+                    && self.present(&e.id)
+                    && !self.last.copying_ids.contains(&e.id)
+                    && !self.last.unreadable_ids.contains(&e.id)
+                    && !self.is_busy(&e.id)
+            })
+            .map(|e| e.id.clone())
+            .collect()
     }
 
     fn require_not_updating(&self) -> Result<(), String> {
@@ -766,6 +799,7 @@ impl Library {
                 notice: None,
                 orphans: std::collections::HashMap::new(),
                 updating: false,
+                baseline_scan: false,
             }),
             scan_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
@@ -793,6 +827,8 @@ impl Library {
 
         let mut notice = None;
         let mut recovered = false;
+        // The list starts over from what's in the folder.
+        let mut rebuilt = false;
         let (manifest, mut mode) = match paths.ensure_dir(&paths.data_dir()) {
             Err(e) => (
                 Manifest::default(),
@@ -813,6 +849,7 @@ impl Library {
                         )
                     });
                     recovered = restored;
+                    rebuilt = !restored;
                     (m, Mode::Writable)
                 }
                 Ok(Loaded::Restored(m)) => {
@@ -821,6 +858,7 @@ impl Library {
                     (m, Mode::Writable)
                 }
                 Ok(Loaded::Lost(m)) => {
+                    rebuilt = true;
                     notice = Some(
                         "The library's tracking file was missing, so the list was rebuilt. Processed videos keep their results; upload history isn't shown.".into(),
                     );
@@ -879,6 +917,9 @@ impl Library {
         g.cache = ScanCache::default();
         g.last = Reconciled::default();
         g.scanned = false;
+        if rebuilt {
+            g.baseline_scan = true;
+        }
     }
 
     /// Whether the library could move to `configured` right now.
@@ -908,6 +949,8 @@ impl Library {
             }
             g.configured = configured;
             g.mode = Mode::Unavailable("Switching folders…".into());
+            // The new folder's videos are a backlog, not new arrivals.
+            g.baseline_scan = true;
             (g.paths.take(), g.session.clone())
         };
         let lib = self.clone();
@@ -1108,7 +1151,42 @@ impl Library {
             }
         };
         self.finish_scan(&obs).await;
+
+        let since = {
+            let s = app_state.lock().await;
+            s.settings.auto_process.then_some(s.settings.auto_process_since).flatten()
+        };
+        if let Some(since) = since {
+            self.auto_process(since).await;
+        }
         Ok(())
+    }
+
+    /// Queue the videos auto-process should take (see
+    /// `auto_process_candidates`). Returns the ones queued.
+    async fn auto_process(self: &Arc<Self>, since: i64) -> Vec<String> {
+        let candidates = {
+            let g = self.inner();
+            if g.mode != Mode::Writable || g.updating {
+                return Vec::new();
+            }
+            g.auto_process_candidates(since)
+        };
+        let mut queued = Vec::new();
+        for id in candidates {
+            match self.enqueue(&id).await {
+                Ok(()) => {
+                    let mut g = self.inner();
+                    if let Ok(e) = g.entry_mut(&id) {
+                        e.auto_queued = true;
+                    }
+                    g.save_logged();
+                    queued.push(id);
+                }
+                Err(e) => eprintln!("[library] Auto-process couldn't queue {}: {}", id, e),
+            }
+        }
+        queued
     }
 
     /// Apply a scan, then delete replaced videos' old outputs outside the
@@ -2100,6 +2178,7 @@ impl Library {
                 std::fs::remove_dir_all(&data).map_err(|e| format!("Failed to delete {}: {}", data.display(), e))?;
             }
             lib.open_blocking(false);
+            lib.inner().baseline_scan = true;
             Ok(())
         })
         .await?
@@ -2946,6 +3025,59 @@ mod tests {
         assert!(!lib.inner().busy.contains(&id));
         assert!(dir.join("thumbnail_option_1.jpg").exists(), "thumbnails are kept");
         assert!(lib.set_trim_with(&id, 9.5, 10.0, &none).await.is_err(), "at least a second");
+    }
+
+    /// What a scan sees for a file in the library folder.
+    fn seen(root: &Path, name: &str) -> FileObs {
+        let fp = fsutil::fingerprint(&root.join(name)).unwrap();
+        FileObs { name: name.into(), size: fp.size, mtime_ms: fp.mtime_ms, state: ObsState::Ready, hash: Some(fp.hash), duration: Some(60.0) }
+    }
+
+    #[tokio::test]
+    async fn auto_process_takes_new_files_but_not_the_backlog() {
+        let (_t, lib, old, _dir) = processed_library();
+        let root = lib.root().unwrap();
+        std::fs::write(root.join("backlog.mp4"), b"old service").unwrap();
+        lib.inner().apply_scan(&[seen(&root, "a.mp4"), seen(&root, "backlog.mp4")]);
+        let backlog = lib.inner().manifest.entries.iter().find(|e| e.file_name == "backlog.mp4").unwrap().id.clone();
+
+        // Turned on now: what's there already stays put.
+        let since = chrono::Utc::now().timestamp_millis() + 1;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(lib.auto_process(since).await.is_empty());
+
+        std::fs::write(root.join("sunday.mp4"), b"new service").unwrap();
+        lib.inner().apply_scan(&[seen(&root, "a.mp4"), seen(&root, "backlog.mp4"), seen(&root, "sunday.mp4")]);
+        let new = lib.inner().manifest.entries.iter().find(|e| e.file_name == "sunday.mp4").unwrap().id.clone();
+        assert_eq!(lib.auto_process(since).await, vec![new.clone()]);
+        let g = lib.inner();
+        assert_eq!(g.queue.iter().cloned().collect::<Vec<_>>(), vec![new.clone()]);
+        assert!(!g.queue.contains(&backlog) && !g.queue.contains(&old));
+        drop(g);
+
+        // Cancelled, it isn't queued again by itself.
+        lib.cancel(&new).unwrap();
+        assert!(lib.auto_process(since).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_folders_never_queues_the_backlog() {
+        let (_t, lib, _id, _dir) = processed_library();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("old 1.mp4"), b"one").unwrap();
+        std::fs::write(other.path().join("old 2.mp4"), b"two").unwrap();
+        let since = chrono::Utc::now().timestamp_millis();
+        lib.switch(other.path().to_string_lossy().to_string()).await.unwrap();
+        let root = lib.root().unwrap();
+        lib.inner().apply_scan(&[seen(&root, "old 1.mp4"), seen(&root, "old 2.mp4")]);
+        assert_eq!(lib.inner().manifest.entries.len(), 2);
+        assert!(lib.auto_process(since).await.is_empty());
+        assert!(lib.inner().manifest.entries.iter().all(|e| e.first_seen == 0));
+
+        // A file that arrives afterwards is new.
+        std::fs::write(root.join("new.mp4"), b"three").unwrap();
+        lib.inner().apply_scan(&[seen(&root, "old 1.mp4"), seen(&root, "old 2.mp4"), seen(&root, "new.mp4")]);
+        assert_eq!(lib.auto_process(since).await.len(), 1);
     }
 
     #[test]

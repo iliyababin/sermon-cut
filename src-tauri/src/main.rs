@@ -111,6 +111,27 @@ fn main() {
                     }
                 });
                 tauri::async_runtime::spawn(library.clone().worker(handle.clone(), app_state.clone()));
+                // With auto-process on, new videos are picked up even while
+                // the library screen isn't showing (it scans on its own then).
+                tauri::async_runtime::spawn({
+                    let library = library.clone();
+                    let app_state = app_state.clone();
+                    let handle = handle.clone();
+                    async move {
+                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                        loop {
+                            tick.tick().await;
+                            if !app_state.lock().await.settings.auto_process {
+                                continue;
+                            }
+                            if let Err(e) = library.rescan(&app_state).await {
+                                eprintln!("[library] Scan failed: {}", e);
+                            }
+                            let _ = tauri::Emitter::emit(&handle, "library-changed", ());
+                            notify::refresh_badge(&handle);
+                        }
+                    }
+                });
                 tauri::async_runtime::spawn({
                     let library = library.clone();
                     async move {

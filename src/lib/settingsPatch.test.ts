@@ -12,6 +12,7 @@ const saved: Settings = {
   upload_privacy: "public",
   youtube_signed_in: true,
   youtube_channel_name: "Youth",  recent_preachers: [],
+  auto_process: false,
 };
 
 describe("settingsPatch", () => {
@@ -26,6 +27,11 @@ describe("settingsPatch", () => {
       modal_api_key: "",
       logo_path: "/l.png",
     });
+  });
+
+  it("sends the auto-process switch as a boolean", () => {
+    expect(settingsPatch(saved, { ...saved, auto_process: true })).toEqual({ auto_process: true });
+    expect(settingsPatch({ ...saved, auto_process: true }, saved)).toEqual({ auto_process: false });
   });
 
   it("never sends app-owned fields", () => {

@@ -111,6 +111,14 @@ pub struct Settings {
     /// only saving a review changes it.
     #[serde(default)]
     pub recent_preachers: Vec<String>,
+    /// Process new videos as soon as they appear in the library folder.
+    #[serde(default)]
+    pub auto_process: bool,
+    /// When auto-process was turned on (ms since the epoch); only videos
+    /// first seen after it are processed. Server-owned: set by turning
+    /// auto_process on, cleared by turning it off.
+    #[serde(default)]
+    pub auto_process_since: Option<i64>,
 }
 
 /// How many speakers `recent_preachers` keeps.
@@ -158,6 +166,7 @@ pub struct SettingsView {
     pub youtube_signed_in: bool,
     pub youtube_channel_name: Option<String>,
     pub recent_preachers: Vec<String>,
+    pub auto_process: bool,
 }
 
 /// What the webview may change: only the user-editable fields, each one
@@ -179,6 +188,8 @@ pub struct SettingsPatch {
     pub logo_path: Option<String>,
     #[serde(default)]
     pub youtube_playlist_id: Option<String>,
+    #[serde(default)]
+    pub auto_process: Option<bool>,
 }
 
 /// The transcription server (backend/app.py, deployed on Modal).
@@ -208,6 +219,8 @@ impl Default for Settings {
             youtube_playlist_id: None,
             upload_privacy: default_upload_privacy(),
             recent_preachers: Vec::new(),
+            auto_process: false,
+            auto_process_since: None,
         }
     }
 }
@@ -226,6 +239,7 @@ impl Settings {
             youtube_signed_in: auth.is_some_and(|a| a.access_token.is_some() || a.refresh_token.is_some()),
             youtube_channel_name: auth.and_then(|a| a.channel_name.clone()),
             recent_preachers: self.recent_preachers.clone(),
+            auto_process: self.auto_process,
         }
     }
 
@@ -250,6 +264,16 @@ impl Settings {
         }
         if let Some(v) = &patch.youtube_playlist_id {
             self.youtube_playlist_id = optional(v);
+        }
+        if let Some(on) = patch.auto_process {
+            // Turning it on starts the clock: videos already there are left
+            // alone. Turning it off forgets it.
+            if on && !self.auto_process {
+                self.auto_process_since = Some(chrono::Utc::now().timestamp_millis());
+            } else if !on {
+                self.auto_process_since = None;
+            }
+            self.auto_process = on;
         }
     }
 
@@ -488,6 +512,26 @@ mod tests {
         let auth = s.youtube_auth.as_ref().unwrap();
         assert_eq!(auth.refresh_token.as_deref(), Some("1//refresh"));
         assert_eq!(s.upload_privacy, "unlisted");
+    }
+
+    #[test]
+    fn turning_auto_process_on_starts_the_clock_and_off_clears_it() {
+        let mut s = Settings::default();
+        let on: SettingsPatch = serde_json::from_value(serde_json::json!({ "auto_process": true })).unwrap();
+        let before = chrono::Utc::now().timestamp_millis();
+        s.apply(&on);
+        let since = s.auto_process_since.unwrap();
+        assert!(s.auto_process && since >= before);
+        // Saving it on again keeps the original time.
+        s.auto_process_since = Some(5);
+        s.apply(&on);
+        assert_eq!(s.auto_process_since, Some(5));
+        // Other edits leave it alone.
+        s.apply(&serde_json::from_value(serde_json::json!({ "download_quality": "720p" })).unwrap());
+        assert_eq!((s.auto_process, s.auto_process_since), (true, Some(5)));
+        s.apply(&serde_json::from_value(serde_json::json!({ "auto_process": false })).unwrap());
+        assert_eq!((s.auto_process, s.auto_process_since), (false, None));
+        assert!(s.view().auto_process == false);
     }
 
     #[test]

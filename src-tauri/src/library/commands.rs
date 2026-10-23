@@ -3,7 +3,7 @@
 use super::manifest::Review;
 use super::runtime::{AppStateHandle, EntrySession, Library, LibraryView, UploadOptions, VideoDetail};
 use crate::upload::client::{video_metadata, VideoUpload};
-use crate::upload::{self, AfterUpload, TokenSource, UploadConfig, UploadError, UploadOutcome, UploadWarning};
+use crate::upload::{self, AfterUpload, Thumbnail, TokenSource, UploadConfig, UploadError, UploadOutcome, UploadWarning};
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::thumbnail::CropRect;
 use std::path::Path;
@@ -329,7 +329,7 @@ pub async fn youtube_upload_video(
     // Privacy and playlist as chosen next to Upload; the settings fill in
     // anything not sent.
     let options = UploadOptions::resolve(&state.lock().await.settings, privacy, playlist_id)?;
-    let job = lib.begin_upload(&video_id, thumbnail_source, render_key)?;
+    let mut job = lib.begin_upload(&video_id, thumbnail_source, render_key)?;
     changed(&app_handle);
     let library: &Library = &lib;
 
@@ -354,8 +354,16 @@ pub async fn youtube_upload_video(
             file_hash: &job.file_hash,
             metadata: video_metadata(&title, &description, &options.privacy),
         };
+        let thumbnail = match (job.thumbnail_path.clone(), job.thumbnail_data.take()) {
+            (Some(path), Some(data)) => Some(
+                tokio::task::spawn_blocking(move || Thumbnail::prepare(data, &path))
+                    .await
+                    .map_err(|e| UploadError::File(e.to_string()))?,
+            ),
+            _ => None,
+        };
         let after = AfterUpload {
-            thumbnail: job.thumbnail_path.clone(),
+            thumbnail,
             captions: job.segments.as_ref().map(|segs| {
                 upload::post::generate_srt(segs, start_time.unwrap_or(0.0), end_time.unwrap_or(f64::MAX))
             }),
@@ -419,6 +427,10 @@ pub async fn retry_thumbnail(
         let tokens = crate::commands::AppTokens { state: &state, app: &app_handle };
         let endpoints = upload::Endpoints::youtube();
         let http = upload::http_client();
+        let path = thumbnail.clone();
+        let thumbnail = tokio::task::spawn_blocking(move || Thumbnail::read(&path))
+            .await
+            .map_err(|e| UploadError::File(e.to_string()))??;
         let token = tokens.token().await?;
         match upload::post::set_thumbnail(&http, &endpoints, &token, &youtube_id, &thumbnail).await {
             Err(UploadError::Auth(_)) => {

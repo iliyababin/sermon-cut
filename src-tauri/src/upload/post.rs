@@ -8,7 +8,7 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// Thumbnails, captions and playlist calls are small; this is plenty.
@@ -34,10 +34,44 @@ impl UploadWarning {
     }
 }
 
+/// A thumbnail ready to send. Held in memory from the moment the upload
+/// starts, so edits made meanwhile (which replace render files) can't
+/// change or remove what's sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Thumbnail {
+    pub data: Vec<u8>,
+    pub mime: &'static str,
+}
+
+impl Thumbnail {
+    /// `data`, read from `path`, within YouTube's limits (1280×720, under
+    /// 2 MB), in memory: the file stays as the user made it. CPU work.
+    pub fn prepare(data: Vec<u8>, path: &Path) -> Self {
+        match crate::thumbnail::fit_for_youtube(&data) {
+            Ok(jpeg) => Thumbnail { data: jpeg, mime: "image/jpeg" },
+            Err(e) => {
+                // Let YouTube judge it; a refusal becomes an upload warning.
+                println!("[upload] Sending the thumbnail as it is ({})", e);
+                let mime = match content_type(path) {
+                    "image/png" => "image/png",
+                    _ => "image/jpeg",
+                };
+                Thumbnail { data, mime }
+            }
+        }
+    }
+
+    /// Read and prepare the file at `path`. Blocking.
+    pub fn read(path: &Path) -> Result<Self, UploadError> {
+        let data = std::fs::read(path).map_err(|e| UploadError::File(e.to_string()))?;
+        Ok(Self::prepare(data, path))
+    }
+}
+
 /// What to do once the video is up.
 #[derive(Debug, Default)]
 pub struct AfterUpload {
-    pub thumbnail: Option<PathBuf>,
+    pub thumbnail: Option<Thumbnail>,
     /// SRT text; empty or None skips captions.
     pub captions: Option<String>,
     pub playlist_id: Option<String>,
@@ -112,28 +146,9 @@ pub async fn set_thumbnail(
     endpoints: &Endpoints,
     token: &str,
     video_id: &str,
-    path: &Path,
+    thumbnail: &Thumbnail,
 ) -> Result<(), UploadError> {
-    let data = tokio::fs::read(path).await.map_err(|e| UploadError::File(e.to_string()))?;
-    // Within YouTube's limits (1280×720, under 2 MB), in memory: the file
-    // stays as the user made it.
-    let copy = data.clone();
-    let fitted = tokio::task::spawn_blocking(move || crate::thumbnail::fit_for_youtube(&copy))
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|r| r);
-    let (data, mime) = match fitted {
-        Ok(jpeg) => (jpeg, "image/jpeg"),
-        Err(e) => {
-            // Let YouTube judge it; a refusal becomes an upload warning.
-            println!("[upload] Sending the thumbnail as it is ({})", e);
-            let mime = match content_type(path) {
-                "image/png" => "image/png",
-                _ => "image/jpeg",
-            };
-            (data, mime)
-        }
-    };
+    let (data, mime) = (thumbnail.data.clone(), thumbnail.mime);
     println!("[upload] Setting thumbnail for {} ({} bytes)", video_id, data.len());
     let resp = http
         .post(format!("{}?videoId={}&uploadType=media", endpoints.thumbnails, urlencoding::encode(video_id)))

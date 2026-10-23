@@ -16,7 +16,7 @@ pub mod test_server;
 mod mock_tests;
 
 pub use error::UploadError;
-pub use post::{AfterUpload, UploadWarning, WarningKind};
+pub use post::{AfterUpload, Thumbnail, UploadWarning, WarningKind};
 pub use session::{SessionStore, UploadSession};
 
 use futures::future::BoxFuture;

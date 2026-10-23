@@ -2052,7 +2052,8 @@ impl Library {
     /// Everything an upload needs, with the video marked busy. The thumbnail
     /// is `thumbnail_source`'s render when its key is `render_key` (what the
     /// review screen showed), else the source itself; with no source given,
-    /// the selected one's render.
+    /// the selected one's render. Its bytes are read now: renders are allowed
+    /// during an upload and replace (delete) the file it came from.
     pub fn begin_upload(
         &self,
         id: &str,
@@ -2060,26 +2061,35 @@ impl Library {
         render_key: Option<String>,
     ) -> Result<UploadJob<'_>, String> {
         let (busy, paths, entry, data) = self.begin_op(id)?;
-        let prepare = || -> Result<(PathBuf, Option<PathBuf>, Option<Vec<crate::state::TranscriptSegment>>), String> {
+        type Prepared = (PathBuf, Option<(PathBuf, Vec<u8>)>, Option<Vec<crate::state::TranscriptSegment>>);
+        let prepare = || -> Result<Prepared, String> {
             let dir = paths.video_dir(id)?;
             let video_path = match data.trimmed_file.as_ref().map(|n| dir.join(n)).filter(|p| p.exists()) {
                 Some(p) => p,
                 None => paths.original(&entry.file_name)?,
             };
-            let thumbnail_path = resolve_thumbnail(&dir, &data, thumbnail_source.as_deref(), render_key.as_deref())?;
+            let thumbnail = match resolve_thumbnail(&dir, &data, thumbnail_source.as_deref(), render_key.as_deref())? {
+                Some(p) => {
+                    let bytes = std::fs::read(&p).map_err(|e| format!("Couldn't read the thumbnail: {}", e))?;
+                    Some((p, bytes))
+                }
+                None => None,
+            };
             let segments = manifest::load_transcript(&dir)
                 .filter(|t| t.file_hash == entry.fingerprint.hash)
                 .map(|t| t.transcription.segments);
-            Ok((video_path, thumbnail_path, segments))
+            Ok((video_path, thumbnail, segments))
         };
         // On an error, dropping the guard frees the video again.
-        let (video_path, thumbnail_path, segments) = prepare()?;
+        let (video_path, thumbnail, segments) = prepare()?;
         let cancel = CancellationToken::new();
         let active = ActiveUpload { percent: 0, cancel: cancel.clone() };
         self.inner().uploads.insert(id.to_string(), active);
+        let (thumbnail_path, thumbnail_data) = thumbnail.unzip();
         Ok(UploadJob {
             video_path,
             thumbnail_path,
+            thumbnail_data,
             segments,
             file_hash: entry.fingerprint.hash.clone(),
             cancel,
@@ -2395,7 +2405,11 @@ impl UploadOptions {
 
 pub struct UploadJob<'a> {
     pub video_path: PathBuf,
+    /// Where the thumbnail came from; the file may be gone by the time it's
+    /// sent.
     pub thumbnail_path: Option<PathBuf>,
+    /// The thumbnail as it was when the upload started.
+    pub thumbnail_data: Option<Vec<u8>>,
     pub segments: Option<Vec<crate::state::TranscriptSegment>>,
     pub file_hash: String,
     pub cancel: CancellationToken,
@@ -2973,6 +2987,25 @@ mod tests {
 
         assert!(lib.begin_upload(&id, Some("/etc/passwd".into()), None).is_err());
         assert!(!lib.inner().busy.contains(&id), "a refused upload doesn't stay busy");
+    }
+
+    #[tokio::test]
+    async fn an_edit_during_an_upload_does_not_lose_its_thumbnail() {
+        let (_t, lib, id, _dir) = processed_library();
+        let render = lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
+        let sent = std::fs::read(&render).unwrap();
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("k".into())).unwrap();
+
+        // The title changes mid-upload: a new render replaces (deletes) the old one.
+        let mut other = image::RgbImage::new(8, 8);
+        other.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        other.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k2", bytes.into_inner()).await.unwrap();
+        assert!(!Path::new(&render).exists());
+
+        assert_eq!(job.thumbnail_data.as_deref(), Some(sent.as_slice()));
+        lib.finish_upload(&id, job, None, &public());
     }
 
     #[test]

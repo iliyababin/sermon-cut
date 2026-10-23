@@ -318,7 +318,7 @@ async fn post_upload_problems_become_warnings() {
     let thumb = h._dir.path().join("thumb.jpg");
     std::fs::write(&thumb, b"jpg").unwrap();
     let after = AfterUpload {
-        thumbnail: Some(thumb),
+        thumbnail: Some(post::Thumbnail::read(&thumb).unwrap()),
         captions: Some("1\n00:00:00,000 --> 00:00:01,000\nhi\n".into()),
         playlist_id: Some("PL1".into()),
     };
@@ -334,7 +334,7 @@ async fn post_upload_problems_become_warnings() {
 
     // Setting the thumbnail again, by the stored video id, works once allowed.
     h.server.with(|s| s.thumbnail_status = 200);
-    post::set_thumbnail(&h.http, &h.cfg.endpoints, "tok1", &outcome.video_id, &after.thumbnail.clone().unwrap())
+    post::set_thumbnail(&h.http, &h.cfg.endpoints, "tok1", &outcome.video_id, after.thumbnail.as_ref().unwrap())
         .await
         .unwrap();
 }

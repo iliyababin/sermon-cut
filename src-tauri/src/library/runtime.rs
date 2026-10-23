@@ -38,6 +38,18 @@ enum Mode {
     Unavailable(String),
 }
 
+impl Mode {
+    /// This session holds lock.json: writable, or read-only only while the
+    /// pre-0.4 migration runs (which writes).
+    fn holds_lock(&self) -> bool {
+        match self {
+            Mode::Writable => true,
+            Mode::ReadOnly(why) => why == UPDATING_LIBRARY,
+            Mode::Unavailable(_) => false,
+        }
+    }
+}
+
 struct Running {
     id: String,
     stage: ProcessingStage,
@@ -123,6 +135,12 @@ struct Inner {
 pub struct Library {
     inner: Mutex<Inner>,
     scan_lock: tokio::sync::Mutex<()>,
+    /// Held while lock.json is written or the folder it's in changes:
+    /// heartbeat, open (switch, reopen, take over, clear data) and release.
+    /// Taken after `scan_lock`, before anything else (docs/INVARIANTS.md).
+    /// The heartbeat takes only this one, so a long scan or migration
+    /// can't starve it.
+    lock_file_mutex: tokio::sync::Mutex<()>,
     /// One lock per video folder, held around a read-modify-write of its
     /// video.json and any pruning of its files. Taken before `inner`, never
     /// across an `.await` (see docs/INVARIANTS.md). Use `video_lock`.
@@ -977,6 +995,7 @@ impl Library {
                 baseline_scan: false,
             }),
             scan_lock: tokio::sync::Mutex::new(()),
+            lock_file_mutex: tokio::sync::Mutex::new(()),
             video_locks: Mutex::new(std::collections::HashMap::new()),
             wake: tokio::sync::Notify::new(),
             migration_tried: std::sync::atomic::AtomicBool::new(false),
@@ -1159,6 +1178,7 @@ impl Library {
         // No scan, trash or download commit runs meanwhile; while the folder
         // changes, nothing can be written (the old paths are gone).
         let _scan = self.scan_lock.lock().await;
+        let _lock_file = self.lock_file_mutex.lock().await;
         let (paths, session) = {
             let mut g = self.inner();
             if g.configured == configured {
@@ -1187,15 +1207,34 @@ impl Library {
         self.inner().paths.as_ref().map(|p| p.root.clone())
     }
 
+    /// Let go of lock.json (the app is quitting). Sync, so it can run from
+    /// the exit handler: it waits briefly for a heartbeat in progress.
     pub fn release_lock(&self) {
-        let g = self.inner();
-        if let (Some(paths), Mode::Writable) = (&g.paths, &g.mode) {
-            lock::release(paths, &g.session);
-        }
+        let mut waited = 0;
+        let _lock_file = loop {
+            match self.lock_file_mutex.try_lock() {
+                Ok(guard) => break Some(guard),
+                // A heartbeat takes milliseconds; don't hang the quit on it.
+                Err(_) if waited >= 2000 => break None,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    waited += 20;
+                }
+            }
+        };
+        let (paths, session) = {
+            let g = self.inner();
+            match (&g.paths, &g.mode) {
+                (Some(paths), mode) if mode.holds_lock() => (paths.clone(), g.session.clone()),
+                _ => return,
+            }
+        };
+        lock::release(&paths, &session);
     }
 
     pub async fn take_over(self: &Arc<Self>) -> Result<(), String> {
         let _scan = self.scan_lock.lock().await;
+        let _lock_file = self.lock_file_mutex.lock().await;
         // What arrived while another computer had it is a backlog.
         self.inner().baseline_scan = true;
         let lib = self.clone();
@@ -1204,10 +1243,11 @@ impl Library {
 
     /// Refresh lock.json; go read-only if another computer took over.
     /// `Regained` means another computer let go of a library we were locked
-    /// out of, so it should be reopened for writing. Holds the scan lock so
+    /// out of, so it should be reopened for writing. Holds the lock-file
+    /// mutex (not the scan lock, which a migration may hold for minutes) so
     /// it can't write the lock file of a folder being switched away from.
     pub async fn heartbeat(self: &Arc<Self>) -> HeartbeatOutcome {
-        let _scan = self.scan_lock.lock().await;
+        let _lock_file = self.lock_file_mutex.lock().await;
         let (paths, session, mode) = {
             let g = self.inner();
             let Some(paths) = g.paths.clone() else { return HeartbeatOutcome::Unchanged };
@@ -1215,12 +1255,12 @@ impl Library {
         };
         let lib = self.clone();
         let outcome = blocking(move || match mode {
-            Mode::Writable => match lock::heartbeat(&paths, &session) {
+            _ if mode.holds_lock() => match lock::heartbeat(&paths, &session) {
                 Ok(Some(host)) => {
                     let mut g = lib.inner();
-                    // Unchanged meanwhile (the scan lock keeps switches out,
-                    // but not every mode change).
-                    if g.mode == Mode::Writable {
+                    // Unchanged meanwhile (the lock-file mutex keeps opens
+                    // and switches out, but not every mode change).
+                    if g.mode.holds_lock() {
                         g.mode = Mode::ReadOnly(format!("locked:{}", host));
                         return HeartbeatOutcome::LostTo(host);
                     }
@@ -1248,6 +1288,7 @@ impl Library {
     /// computer had the library is a backlog, not new arrivals.
     pub async fn reopen(self: &Arc<Self>) -> Result<(), String> {
         let _scan = self.scan_lock.lock().await;
+        let _lock_file = self.lock_file_mutex.lock().await;
         self.inner().baseline_scan = true;
         let lib = self.clone();
         blocking(move || lib.open_blocking(false)).await
@@ -1339,6 +1380,7 @@ impl Library {
 
         let needs_open = !matches!(self.inner().mode, Mode::Writable | Mode::ReadOnly(_));
         if needs_open {
+            let _lock_file = self.lock_file_mutex.lock().await;
             let lib = self.clone();
             blocking(move || lib.open_blocking(false)).await?;
         }
@@ -2521,6 +2563,7 @@ impl Library {
             }
             paths
         };
+        let _lock_file = self.lock_file_mutex.lock().await;
         let lib = self.clone();
         blocking(move || {
             let data = paths.data_dir();
@@ -4035,6 +4078,20 @@ mod tests {
         assert_eq!(lib.heartbeat().await, HeartbeatOutcome::Regained);
         lib.reopen().await.unwrap();
         assert!(lib.view(vec![]).writable);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_runs_while_a_scan_or_migration_holds_the_scan_lock() {
+        let (_t, lib, _id, _dir) = processed_library();
+        let paths = lib.inner().paths.clone().unwrap();
+        let _scanning = lib.scan_lock.lock().await;
+        let before = std::fs::read_to_string(paths.lock_file()).unwrap();
+        lib.inner().mode = Mode::ReadOnly(UPDATING_LIBRARY.into());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let beat = tokio::time::timeout(std::time::Duration::from_secs(5), lib.heartbeat()).await;
+        assert_eq!(beat.expect("heartbeat waited for the scan lock"), HeartbeatOutcome::Unchanged);
+        // The migration's lock is kept fresh.
+        assert_ne!(std::fs::read_to_string(paths.lock_file()).unwrap(), before);
     }
 
     #[tokio::test]

@@ -7,7 +7,9 @@ this file in the same commit and say why.
 ## Locks
 
 1. Order: `scan_lock` (tokio) → `lock_file_mutex` (tokio) → per-video mutex
-   (std) → `inner` (std). Never take them in reverse.
+   (std) → `inner` (std). Never take them in reverse. Every open of the
+   folder (which writes lock.json) holds `lock_file_mutex`; the heartbeat
+   takes only that one, so a scan or migration can't starve it.
 2. Never hold a std mutex (`inner`, per-video) across `.await`.
 3. Never wait on a guard, a join handle or a channel while holding any lock.
    The token-refresh lock (`commands::REFRESH`, tokio) is the exception

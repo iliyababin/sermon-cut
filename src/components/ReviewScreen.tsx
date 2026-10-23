@@ -100,6 +100,8 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   // saved yet starts with the most recent one.
   const [recentPreachers, setRecentPreachers] = useState<string[]>([]);
   const preacherTouched = useRef(false);
+  // The speaker was filled in from the last video, not by the user.
+  const [preacherPrefilled, setPreacherPrefilled] = useState(false);
 
   // Trim boundaries: where the trimmed video really starts and ends in the
   // original, which chapters and captions are timed from. The trim panel
@@ -303,6 +305,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         setRecentPreachers(recent);
         if (video.review.preacher == null && !preacherTouched.current && recent[0]) {
           setPreacher(recent[0]);
+          setPreacherPrefilled(true);
         }
         if (choicesTouched.current) return;
         setPrivacy(s.upload_privacy);
@@ -962,6 +965,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                   list="recent-preachers"
                   onChange={(e) => {
                     preacherTouched.current = true;
+                    setPreacherPrefilled(false);
                     setPreacher(e.target.value);
                   }}
                   placeholder="Enter speaker name"
@@ -969,6 +973,9 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                     !preacher.trim() ? "border-red-300" : "border-input"
                   }`}
                 />
+                {preacherPrefilled && (
+                  <p className="mt-1 text-xs text-muted-foreground">(from last time — change if needed)</p>
+                )}
                 <datalist id="recent-preachers">
                   {recentPreachers.map((name) => (
                     <option key={name} value={name} />

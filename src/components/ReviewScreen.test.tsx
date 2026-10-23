@@ -300,6 +300,24 @@ describe("ReviewScreen", () => {
     const input = screen.getByLabelText("Preacher") as HTMLInputElement;
     await waitFor(() => expect(input.value).toBe("Pastor Y"));
     expect(document.querySelectorAll("#recent-preachers option")).toHaveLength(2);
+    // Said to be a guess until the user edits it.
+    expect(screen.getByText("(from last time — change if needed)")).toBeTruthy();
+    fireEvent.change(input, { target: { value: "Pastor Z" } });
+    expect(screen.queryByText("(from last time — change if needed)")).toBeNull();
+  });
+
+  it("doesn't call a saved speaker a guess", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "get_settings"
+        ? Promise.resolve({ upload_privacy: "public", youtube_playlist_id: null, recent_preachers: ["Pastor Y"] })
+        : base(cmd, args)
+    );
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    await waitFor(() => expect(invoke.mock.calls.some(([c]) => c === "get_settings")).toBe(true));
+    await act(async () => {});
+    expect((screen.getByLabelText("Preacher") as HTMLInputElement).value).toBe(PREACHER);
+    expect(screen.queryByText("(from last time — change if needed)")).toBeNull();
   });
 
   it("starts from the last privacy and the default playlist", async () => {

@@ -106,7 +106,7 @@ pub struct Uploader<'a> {
 impl Uploader<'_> {
     /// Upload the video, continuing a stored session when it still fits.
     /// Returns the new video's id. The session is kept on failure or
-    /// cancel, and cleared on success or when YouTube dropped it.
+    /// cancel, and completed on success, cleared when YouTube dropped it.
     pub async fn upload(&self, store: &dyn SessionStore, video: &VideoUpload<'_>, on_progress: Progress<'_>) -> Result<String, UploadError> {
         let meta = std::fs::metadata(video.path).map_err(|e| UploadError::File(e.to_string()))?;
         let size = meta.len();
@@ -165,7 +165,7 @@ impl Uploader<'_> {
                     confirmed = 0;
                 }
                 Ok(Step::Done(id)) => {
-                    store.save(None);
+                    store.complete(&id);
                     on_progress(size, size);
                     return Ok(id);
                 }

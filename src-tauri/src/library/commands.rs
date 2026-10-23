@@ -369,7 +369,7 @@ pub async fn youtube_upload_video(
             }),
             playlist_id: options.playlist_id.clone(),
         };
-        let store = EntrySession { lib: library, id: &video_id };
+        let store = EntrySession { lib: library, id: &video_id, file_hash: &job.file_hash, options: &options };
         let last_percent = AtomicU32::new(u32::MAX);
         let on_progress = |sent: u64, total: u64| {
             let percent = (sent.saturating_mul(95) / total.max(1)) as u32;

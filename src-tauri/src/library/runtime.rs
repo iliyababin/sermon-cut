@@ -2130,25 +2130,42 @@ impl Library {
         g.save_logged();
     }
 
-    /// End an upload; with an outcome it succeeded and is recorded, with
-    /// the privacy and playlist it was uploaded with and any warnings.
+    /// The video is on YouTube: record it and drop the session, in one
+    /// save, before the post-upload steps. Recording the same video twice
+    /// keeps one record.
+    pub fn record_upload(&self, id: &str, file_hash: &str, options: &UploadOptions, video_id: &str) {
+        let mut g = self.inner();
+        let Ok(e) = g.entry_mut(id) else { return };
+        if !e.uploads.iter().any(|u| u.video_id.as_deref() == Some(video_id)) {
+            e.uploads.push(UploadRecord {
+                url: crate::upload::watch_url(video_id),
+                uploaded_at: chrono::Utc::now().to_rfc3339(),
+                file_hash: file_hash.to_string(),
+                privacy: Some(options.privacy.clone()),
+                playlist_id: options.playlist_id.clone(),
+                video_id: Some(video_id.to_string()),
+                warnings: Vec::new(),
+            });
+        }
+        e.upload_session = None;
+        e.status = EntryStatus::Done;
+        e.error = None;
+        g.save_logged();
+    }
+
+    /// End an upload; with an outcome it succeeded. Its record (made by
+    /// `record_upload` when the video went up) gets the warnings.
     pub fn finish_upload(&self, id: &str, job: UploadJob<'_>, outcome: Option<&UploadOutcome>, options: &UploadOptions) {
+        if let Some(outcome) = outcome {
+            self.record_upload(id, &job.file_hash, options, &outcome.video_id);
+        }
         let mut g = self.inner();
         g.uploads.remove(id);
         let Some(outcome) = outcome else { return };
         if let Ok(e) = g.entry_mut(id) {
-            e.uploads.push(UploadRecord {
-                url: outcome.url.clone(),
-                uploaded_at: chrono::Utc::now().to_rfc3339(),
-                file_hash: job.file_hash.clone(),
-                privacy: Some(options.privacy.clone()),
-                playlist_id: options.playlist_id.clone(),
-                video_id: Some(outcome.video_id.clone()),
-                warnings: outcome.warnings.clone(),
-            });
-            e.upload_session = None;
-            e.status = EntryStatus::Done;
-            e.error = None;
+            if let Some(rec) = e.uploads.iter_mut().rev().find(|u| u.video_id.as_deref() == Some(&outcome.video_id)) {
+                rec.warnings = outcome.warnings.clone();
+            }
         }
         g.save_logged();
         // Recorded first, then free (the job's guard): a second upload can't
@@ -2436,6 +2453,9 @@ impl Drop for BusyGuard<'_> {
 pub struct EntrySession<'a> {
     pub lib: &'a Library,
     pub id: &'a str,
+    /// What the finished upload is recorded with.
+    pub file_hash: &'a str,
+    pub options: &'a UploadOptions,
 }
 
 impl SessionStore for EntrySession<'_> {
@@ -2444,6 +2464,9 @@ impl SessionStore for EntrySession<'_> {
     }
     fn save(&self, session: Option<&UploadSession>) {
         self.lib.set_upload_session(self.id, session);
+    }
+    fn complete(&self, video_id: &str) {
+        self.lib.record_upload(self.id, self.file_hash, self.options, video_id);
     }
 }
 
@@ -2708,7 +2731,8 @@ mod tests {
     fn upload_session_persists_and_is_cleared_on_success() {
         let (_t, lib, id, _dir) = processed_library();
         let job = lib.begin_upload(&id, None, None).unwrap();
-        let store = EntrySession { lib: &lib, id: &id };
+        let options = public();
+        let store = EntrySession { lib: &lib, id: &id, file_hash: &job.file_hash, options: &options };
         let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
         store.save(Some(&session));
         lib.finish_upload(&id, job, None, &public());
@@ -2724,6 +2748,36 @@ mod tests {
         assert_eq!(lib.upload_session(&id), None);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads[0].video_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_finished_upload_is_recorded_before_the_post_upload_steps() {
+        let (_t, lib, id, _dir) = processed_library();
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        let options = UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PL1".into()) };
+        let store = EntrySession { lib: &lib, id: &id, file_hash: &job.file_hash, options: &options };
+        let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
+        store.save(Some(&session));
+        store.complete("vid7");
+
+        // A crash now: library.json already has the video and no session,
+        // so the next Upload can't send it again.
+        let root = lib.root().unwrap();
+        let reopened = Library::new(root.to_string_lossy().to_string());
+        reopened.open_blocking(true);
+        assert_eq!(reopened.upload_session(&id), None);
+        let v = reopened.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.uploads.len(), 1);
+        assert_eq!(v.uploads[0].video_id.as_deref(), Some("vid7"));
+        assert_eq!(v.uploads[0].privacy.as_deref(), Some("unlisted"));
+        assert_eq!(v.uploads[0].playlist_id.as_deref(), Some("PL1"));
+
+        // Without a crash, the warnings join that record; no second one.
+        let captions = UploadWarning { kind: WarningKind::Captions, message: "c".into() };
+        lib.finish_upload(&id, job, Some(&outcome("vid7", vec![captions.clone()])), &options);
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.uploads.len(), 1);
+        assert_eq!(v.uploads[0].warnings, vec![captions]);
     }
 
     #[test]

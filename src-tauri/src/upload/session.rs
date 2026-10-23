@@ -62,6 +62,14 @@ pub fn metadata_hash(metadata_json: &str, content_type: &str, file_name: &str, m
 pub trait SessionStore: Send + Sync {
     fn load(&self) -> Option<UploadSession>;
     fn save(&self, session: Option<&UploadSession>);
+    /// YouTube has the whole video, as `video_id`: drop the session and
+    /// record the upload in one step, so a crash afterwards (during the
+    /// thumbnail, captions or playlist) neither loses the video nor sends
+    /// it again.
+    fn complete(&self, video_id: &str) {
+        let _ = video_id;
+        self.save(None);
+    }
 }
 
 /// A store in memory, for tests.

@@ -469,47 +469,88 @@ pub async fn fresh_access_token(state: &AppStateHandle, app_handle: &AppHandle) 
     access_token(state, app_handle, false).await.map_err(|e| e.user_message())
 }
 
+/// One token refresh at a time, app-wide: concurrent callers (the upload,
+/// a playlist list, a thumbnail retry) wait for it and use its result.
+/// Taken before AppState's lock, never while holding it.
+static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub const ACCOUNT_CHANGED: &str = "The YouTube account changed while Sermon Cut was renewing the sign-in. Try again.";
+
 /// The access token, refreshed when it's about to expire or `force` is set
 /// (after a 401). With no refresh token to renew it, the user has to sign
 /// in again.
 pub async fn access_token(state: &AppStateHandle, app_handle: &AppHandle, force: bool) -> Result<String, UploadError> {
-    use crate::youtube::{self, YouTubeCredentials};
+    let endpoints = crate::youtube::OAuthEndpoints::google();
+    let credentials = || crate::youtube::YouTubeCredentials::load_from_resource(app_handle);
+    access_token_with(state, force, credentials, &endpoints.token, &REFRESH).await
+}
 
-    let (access_token, refresh_token, needs_refresh) = {
-        let state_guard = state.lock().await;
-        let auth = state_guard
-            .settings
-            .youtube_auth
-            .as_ref()
-            .ok_or_else(|| UploadError::Auth("not signed in".into()))?;
+/// What the signed-in account looks like at one moment.
+#[derive(PartialEq)]
+struct AuthSnapshot {
+    access: Option<String>,
+    refresh: Option<String>,
+    channel_id: Option<String>,
+    expiring: bool,
+}
 
-        let access_token = auth.access_token.clone();
-        let refresh_token = auth.refresh_token.clone();
-        let needs_refresh = force
-            || access_token.is_none()
-            || auth.expires_at
-                .map(|exp| exp - chrono::Utc::now().timestamp() < 300)
-                .unwrap_or(true);
+async fn snapshot(state: &AppStateHandle) -> Result<AuthSnapshot, UploadError> {
+    let g = state.lock().await;
+    let auth = g.settings.youtube_auth.as_ref().ok_or_else(|| UploadError::Auth("not signed in".into()))?;
+    Ok(AuthSnapshot {
+        access: auth.access_token.clone(),
+        refresh: auth.refresh_token.clone(),
+        channel_id: auth.channel_id.clone(),
+        expiring: auth.expires_at.map(|exp| exp - chrono::Utc::now().timestamp() < 300).unwrap_or(true),
+    })
+}
 
-        (access_token.unwrap_or_default(), refresh_token, needs_refresh)
-    };
-
-    if !needs_refresh {
-        return Ok(access_token);
+/// `access_token` with the pieces injected (tests use a mock token
+/// endpoint and their own lock).
+///
+/// - Single flight: refreshes take `refresh_lock`; a caller that waited
+///   finds the token another one fetched meanwhile and uses it.
+/// - Compare and swap: the new token is written back only if the account
+///   (channel and refresh token) is still the one it was fetched for;
+///   after a sign-in to another account it is dropped.
+pub(crate) async fn access_token_with(
+    state: &AppStateHandle,
+    force: bool,
+    credentials: impl FnOnce() -> Result<crate::youtube::YouTubeCredentials, String>,
+    token_url: &str,
+    refresh_lock: &tokio::sync::Mutex<()>,
+) -> Result<String, UploadError> {
+    let seen = snapshot(state).await?;
+    if !force && !seen.expiring {
+        if let Some(access) = seen.access {
+            return Ok(access);
+        }
     }
-    let Some(refresh) = refresh_token else {
+
+    let _one = refresh_lock.lock().await;
+    let current = snapshot(state).await?;
+    if current.access.is_some() && current.access != seen.access && !current.expiring {
+        // Refreshed (or signed in again) while this caller waited.
+        return Ok(current.access.unwrap_or_default());
+    }
+    let Some(refresh) = current.refresh.clone() else {
         return Err(UploadError::Auth("no refresh token".into()));
     };
 
-    let credentials = YouTubeCredentials::load_from_resource(app_handle).map_err(UploadError::Other)?;
-    let new_tokens = youtube::refresh_access_token(&credentials, &refresh).await?;
-    {
-        let mut state_guard = state.lock().await;
-        if let Some(ref mut auth) = state_guard.settings.youtube_auth {
-            auth.access_token = Some(new_tokens.access_token.clone());
-            auth.expires_at = new_tokens.expires_at;
-        }
-        if let Err(e) = state_guard.save() { eprintln!("[warn] Failed to save state: {}", e); }
+    let credentials = credentials().map_err(UploadError::Other)?;
+    let new_tokens = crate::youtube::refresh_access_token_at(&credentials, &refresh, token_url).await?;
+    let mut g = state.lock().await;
+    let Some(auth) = g.settings.youtube_auth.as_mut() else {
+        return Err(UploadError::Auth("signed out".into()));
+    };
+    if auth.channel_id != current.channel_id || auth.refresh_token.as_ref() != Some(&refresh) {
+        println!("[youtube] The account changed during a token refresh; not saving it");
+        return Err(UploadError::Other(ACCOUNT_CHANGED.into()));
+    }
+    auth.access_token = Some(new_tokens.access_token.clone());
+    auth.expires_at = new_tokens.expires_at;
+    if let Err(e) = g.save() {
+        eprintln!("[warn] Failed to save state: {}", e);
     }
     Ok(new_tokens.access_token)
 }
@@ -634,6 +675,78 @@ mod tests {
             ..Default::default()
         });
         Arc::new(Mutex::new(s))
+    }
+
+    /// Signed in as channel UC1 with an access token that has expired.
+    fn state_with_expired_token() -> AppStateHandle {
+        let mut s = AppState::default();
+        s.settings.youtube_auth = Some(YouTubeAuth {
+            access_token: Some("old".into()),
+            refresh_token: Some("r1".into()),
+            expires_at: Some(0),
+            channel_name: Some("Youth".into()),
+            channel_id: Some("UC1".into()),
+        });
+        Arc::new(Mutex::new(s))
+    }
+
+    fn credentials() -> Result<crate::youtube::YouTubeCredentials, String> {
+        Ok(crate::youtube::YouTubeCredentials { client_id: "c".into(), client_secret: "s".into() })
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_make_one_request() {
+        let server = crate::upload::test_server::MockServer::start().await;
+        server.with(|s| s.token_delay = std::time::Duration::from_millis(200));
+        let url = format!("{}/token", server.base);
+        let state = state_with_expired_token();
+        let lock = tokio::sync::Mutex::new(());
+        let (a, b, c) = tokio::join!(
+            access_token_with(&state, false, credentials, &url, &lock),
+            access_token_with(&state, false, credentials, &url, &lock),
+            // After a 401 with the old token: the one being fetched will do.
+            access_token_with(&state, true, credentials, &url, &lock),
+        );
+        assert_eq!((a.unwrap(), b.unwrap(), c.unwrap()), ("new-access".into(), "new-access".into(), "new-access".into()));
+        assert_eq!(server.with(|s| s.token_requests.len()), 1);
+        let auth = state.lock().await.settings.youtube_auth.clone().unwrap();
+        assert_eq!(auth.access_token.as_deref(), Some("new-access"));
+        assert!(auth.expires_at.unwrap() > chrono::Utc::now().timestamp());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_for_an_account_switched_away_from_isnt_saved() {
+        let server = crate::upload::test_server::MockServer::start().await;
+        server.with(|s| s.token_delay = std::time::Duration::from_millis(300));
+        let url = format!("{}/token", server.base);
+        let state = state_with_expired_token();
+        let lock = tokio::sync::Mutex::new(());
+        let refresh = access_token_with(&state, true, credentials, &url, &lock);
+        let switch = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            state.lock().await.settings.youtube_auth = Some(YouTubeAuth {
+                access_token: Some("other-access".into()),
+                refresh_token: Some("r2".into()),
+                expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+                channel_name: Some("Other".into()),
+                channel_id: Some("UC2".into()),
+            });
+        };
+        let (result, _) = tokio::join!(refresh, switch);
+        assert_eq!(result.unwrap_err(), UploadError::Other(ACCOUNT_CHANGED.into()));
+        let auth = state.lock().await.settings.youtube_auth.clone().unwrap();
+        assert_eq!((auth.channel_id.as_deref(), auth.access_token.as_deref()), (Some("UC2"), Some("other-access")));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_token_is_used_without_a_request() {
+        let server = crate::upload::test_server::MockServer::start().await;
+        let url = format!("{}/token", server.base);
+        let state = state_with_expired_token();
+        state.lock().await.settings.youtube_auth.as_mut().unwrap().expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        let lock = tokio::sync::Mutex::new(());
+        assert_eq!(access_token_with(&state, false, credentials, &url, &lock).await.unwrap(), "old");
+        assert!(server.with(|s| s.token_requests.is_empty()));
     }
 
     fn patch(json: serde_json::Value) -> SettingsPatch {

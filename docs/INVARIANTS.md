@@ -10,6 +10,10 @@ this file in the same commit and say why.
    (std) → `inner` (std). Never take them in reverse.
 2. Never hold a std mutex (`inner`, per-video) across `.await`.
 3. Never wait on a guard, a join handle or a channel while holding any lock.
+   The token-refresh lock (`commands::REFRESH`, tokio) is the exception
+   that proves the rule: it is held across the refresh request on purpose
+   (single flight), taken before AppState's lock and never while holding
+   any other lock.
 
 ## Library state
 
@@ -42,6 +46,11 @@ this file in the same commit and say why.
    a session. A finished session for other metadata or an earlier cut is
    recorded and offered (update the title, or upload a new copy after a
    confirm), never silently re-uploaded.
+
+## Sign-in
+
+- A refreshed token is written back only if the account (channel and
+  refresh token) is still the one it was fetched for.
 
 ## Errors and safety
 

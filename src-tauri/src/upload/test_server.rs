@@ -73,6 +73,8 @@ pub struct MockState {
     /// Form bodies sent to /token.
     pub token_requests: Vec<String>,
     pub token_reply: (u16, String),
+    /// How long /token takes to answer.
+    pub token_delay: Duration,
     /// Bodies sent to videos.update.
     pub video_updates: Vec<serde_json::Value>,
     pub videos_status: u16,
@@ -114,6 +116,7 @@ impl MockServer {
             playlist_adds: 0,
             token_requests: Vec::new(),
             token_reply: (200, r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#.into()),
+            token_delay: Duration::ZERO,
             video_updates: Vec::new(),
             videos_status: 200,
         }));
@@ -178,6 +181,10 @@ impl MockServer {
         }
         let mut stream = reader.into_inner();
         let reply = self.handle(&req);
+        if req.path.starts_with("/token") {
+            let delay = self.with(|s| s.token_delay);
+            tokio::time::sleep(delay).await;
+        }
         match reply {
             Reply::Send(status, headers, body) => {
                 let _ = write_response(&mut stream, status, &headers, &body).await;

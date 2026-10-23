@@ -352,15 +352,9 @@ async fn exchange_code_for_tokens(
     })
 }
 
-/// A new access token from the refresh token. An `invalid_grant` (revoked
-/// or expired sign-in) comes back as `UploadError::Auth`.
-pub async fn refresh_access_token(
-    credentials: &YouTubeCredentials,
-    refresh_token: &str,
-) -> Result<YouTubeTokens, UploadError> {
-    refresh_access_token_at(credentials, refresh_token, TOKEN_URL).await
-}
-
+/// A new access token from the refresh token, from `token_url`. An
+/// `invalid_grant` (revoked or expired sign-in) comes back as
+/// `UploadError::Auth`.
 pub async fn refresh_access_token_at(
     credentials: &YouTubeCredentials,
     refresh_token: &str,

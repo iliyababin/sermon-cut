@@ -664,6 +664,37 @@ fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
     }
 }
 
+/// The outside tools a processing job runs, so tests can stand in for
+/// ffmpeg and the thumbnail model.
+pub(crate) trait JobTools: Sync {
+    async fn extract_audio(&self, video: &Path, audio: &Path) -> Result<(), String>;
+    async fn duration(&self, video: &Path) -> Result<f64, String>;
+    /// Cut `video` from `start` to `end` into `out`; returns where the cut
+    /// really starts (see `ffmpeg::trim_accurate`).
+    async fn trim(&self, video: &Path, start: f64, end: f64, out: &Path, on_step: &(dyn Fn(f32, &str) + Send + Sync)) -> Result<f64, String>;
+    /// Thumbnail options (and their plain crops) for the cut, into `out`;
+    /// returns their paths.
+    async fn thumbnails(&self, video: &Path, start: f64, end: f64, title: &str, out: &Path) -> Result<Vec<String>, String>;
+}
+
+/// ffmpeg and the thumbnail model.
+struct RealTools;
+
+impl JobTools for RealTools {
+    async fn extract_audio(&self, video: &Path, audio: &Path) -> Result<(), String> {
+        crate::ffmpeg::extract_audio(video, audio).await
+    }
+    async fn duration(&self, video: &Path) -> Result<f64, String> {
+        crate::ffmpeg::get_duration(&path_string(video)).await
+    }
+    async fn trim(&self, video: &Path, start: f64, end: f64, out: &Path, on_step: &(dyn Fn(f32, &str) + Send + Sync)) -> Result<f64, String> {
+        Ok(crate::ffmpeg::trim_accurate(video, start, end, out, on_step).await?.start)
+    }
+    async fn thumbnails(&self, video: &Path, start: f64, end: f64, title: &str, out: &Path) -> Result<Vec<String>, String> {
+        crate::thumbnail::generate_thumbnail_options(video, start, end, title, out, 10).await
+    }
+}
+
 /// What a processing job made, for `commit_job`.
 struct JobOutputs {
     trimmed_name: String,
@@ -1777,6 +1808,19 @@ impl Library {
     /// Extract audio → transcribe → trim → thumbnails, into a staging folder
     /// that's committed only if the file is unchanged at the end.
     async fn run_job(self: &Arc<Self>, app: &AppHandle, app_state: &AppStateHandle, id: &str) -> Result<(), String> {
+        let progress = |stage: ProcessingStage, done: f32, message: &str| self.set_progress(app, id, stage, done, message);
+        self.run_job_with(app_state, id, &progress, &RealTools).await
+    }
+
+    /// `run_job` with the outside tools (ffmpeg, the thumbnail model) and
+    /// the progress reports given; Modal is reached at the settings' URL.
+    async fn run_job_with<T: JobTools>(
+        self: &Arc<Self>,
+        app_state: &AppStateHandle,
+        id: &str,
+        progress: &(dyn Fn(ProcessingStage, f32, &str) + Send + Sync),
+        tools: &T,
+    ) -> Result<(), String> {
         let (paths, file_name, expected, duration, display_title) = {
             let g = self.inner();
             let paths = g.writable()?.clone();
@@ -1789,7 +1833,7 @@ impl Library {
         };
         let video_path = paths.original(&file_name)?;
 
-        self.set_progress(app, id, ProcessingStage::ExtractingAudio, 0.0, "Checking the video file...");
+        progress(ProcessingStage::ExtractingAudio, 0.0, "Checking the video file...");
         let check_path = video_path.clone();
         let now = blocking(move || fsutil::fingerprint(&check_path)).await??;
         if !fingerprint_matches(&now, &expected) {
@@ -1807,9 +1851,9 @@ impl Library {
                 t.transcription
             }
             None => {
-                self.set_progress(app, id, ProcessingStage::ExtractingAudio, 5.0, "Extracting audio from video...");
+                progress(ProcessingStage::ExtractingAudio, 5.0, "Extracting audio from video...");
                 let audio = staging.join("audio.ogg");
-                crate::ffmpeg::extract_audio(&video_path, &audio).await?;
+                tools.extract_audio(&video_path, &audio).await?;
 
                 // The server answers only when it's done, so show how long
                 // it has been going.
@@ -1821,9 +1865,7 @@ impl Library {
                 let result = loop {
                     tokio::select! {
                         r = &mut transcribe => break r,
-                        _ = tick.tick() => self.set_progress(
-                            app,
-                            id,
+                        _ = tick.tick() => progress(
                             ProcessingStage::Transcribing,
                             25.0,
                             &crate::modal::transcribing_message(started.elapsed()),
@@ -1846,10 +1888,10 @@ impl Library {
             }
         };
 
-        self.set_progress(app, id, ProcessingStage::Trimming, 50.0, "Trimming video to sermon boundaries...");
+        progress(ProcessingStage::Trimming, 50.0, "Trimming video to sermon boundaries...");
         let duration = match duration {
             Some(d) => d,
-            None => crate::ffmpeg::get_duration(&path_string(&video_path)).await?,
+            None => tools.duration(&video_path).await?,
         };
         let mut start = transcription.sermon_start.unwrap_or(0.0).clamp(0.0, duration);
         let mut end = transcription.sermon_end.unwrap_or(duration).clamp(0.0, duration);
@@ -1861,13 +1903,13 @@ impl Library {
         // The cut may start at a keyframe a moment early; chapters and
         // captions are timed from where it really starts.
         let on_step = |f: f32, _: &str| {
-            self.set_progress(app, id, ProcessingStage::Trimming, 50.0 + 25.0 * f, "Trimming video to sermon boundaries...");
+            progress(ProcessingStage::Trimming, 50.0 + 25.0 * f, "Trimming video to sermon boundaries...");
         };
-        let start = crate::ffmpeg::trim_accurate(&video_path, start, end, &staging.join(&trimmed_name), &on_step).await?.start;
+        let start = tools.trim(&video_path, start, end, &staging.join(&trimmed_name), &on_step).await?;
 
-        self.set_progress(app, id, ProcessingStage::GeneratingThumbnails, 75.0, "Generating thumbnail options...");
+        progress(ProcessingStage::GeneratingThumbnails, 75.0, "Generating thumbnail options...");
         let title = transcription.suggested_title.clone().unwrap_or(display_title);
-        let thumbs = crate::thumbnail::generate_thumbnail_options(&video_path, start, end, &title, &staging, 10).await?;
+        let thumbs = tools.thumbnails(&video_path, start, end, &title, &staging).await?;
         let thumb_names: Vec<String> = thumbs
             .iter()
             .filter_map(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
@@ -1882,7 +1924,7 @@ impl Library {
         let outputs = JobOutputs { trimmed_name, start, end, thumb_names, duration };
         self.commit_job(id, &video_dir, &staging, &expected.hash, outputs, || {}).await?;
         drop(staging_dir);
-        self.set_progress(app, id, ProcessingStage::Complete, 100.0, "Processing complete!");
+        progress(ProcessingStage::Complete, 100.0, "Processing complete!");
         Ok(())
     }
 
@@ -3294,6 +3336,160 @@ mod tests {
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads[0].privacy.as_deref(), Some("unlisted"));
         assert_eq!(v.uploads[0].playlist_id.as_deref(), Some("PL1"));
+    }
+
+    /// Stands in for ffmpeg and the thumbnail model, writing small files
+    /// where the real tools would and noting each call.
+    #[derive(Default)]
+    struct FakeTools {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl JobTools for FakeTools {
+        async fn extract_audio(&self, _video: &Path, audio: &Path) -> Result<(), String> {
+            self.calls.lock().unwrap().push("extract_audio".into());
+            std::fs::write(audio, b"fake audio").map_err(|e| e.to_string())
+        }
+        async fn duration(&self, _video: &Path) -> Result<f64, String> {
+            self.calls.lock().unwrap().push("duration".into());
+            Ok(60.0)
+        }
+        async fn trim(&self, _video: &Path, start: f64, end: f64, out: &Path, on_step: &(dyn Fn(f32, &str) + Send + Sync)) -> Result<f64, String> {
+            self.calls.lock().unwrap().push(format!("trim {start}-{end}"));
+            on_step(0.5, "half");
+            std::fs::write(out, b"the cut").map_err(|e| e.to_string())?;
+            // The cut starts at a keyframe half a second early.
+            Ok(start - 0.5)
+        }
+        async fn thumbnails(&self, _video: &Path, start: f64, _end: f64, title: &str, out: &Path) -> Result<Vec<String>, String> {
+            self.calls.lock().unwrap().push(format!("thumbnails from {start} for {title}"));
+            let mut paths = Vec::new();
+            for n in 1..=2 {
+                std::fs::write(out.join(format!("thumbnail_option_{n}_raw.jpg")), b"raw").unwrap();
+                let p = out.join(format!("thumbnail_option_{n}.jpg"));
+                std::fs::write(&p, b"jpg").unwrap();
+                paths.push(path_string(&p));
+            }
+            Ok(paths)
+        }
+    }
+
+    /// A Modal stand-in on localhost: answers each POST with `reply` and
+    /// keeps the bodies it was sent.
+    async fn modal_mock(reply: &'static str) -> (String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/transcribe", listener.local_addr().unwrap());
+        let bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let head_end = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "the request ended early");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                    .unwrap_or(0);
+                while buf.len() < head_end + length {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                seen.lock().unwrap().push(buf[head_end..].to_vec());
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.len(),
+                    reply
+                );
+                sock.write_all(answer.as_bytes()).await.unwrap();
+            }
+        });
+        (url, bodies)
+    }
+
+    const MODAL_REPLY: &str = r#"{"segments":[{"start":12,"end":13,"text":"Hope"}],"text":"Hope","sermon_analysis":{"sermon_start":12.0,"sermon_end":50.0,"title":"The Hope We Have","description":"About hope","chapters":[{"time":12.0,"title":"Hope"}]}}"#;
+
+    #[tokio::test]
+    async fn a_job_runs_end_to_end_and_reuses_its_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("sunday.mp4"), b"video").unwrap();
+        let lib = Library::new(root.to_string_lossy().to_string());
+        lib.open_blocking(false);
+        lib.inner().apply_scan(&[seen(&root, "sunday.mp4")]);
+        let id = lib.inner().manifest.entries[0].id.clone();
+        let (url, bodies) = modal_mock(MODAL_REPLY).await;
+        let mut state = AppState::for_test();
+        (state.settings.modal_api_url, state.settings.modal_api_key) = (url, Some("k".into()));
+        let app_state: AppStateHandle = Arc::new(tokio::sync::Mutex::new(state));
+
+        let run = |tools: &'static FakeTools| {
+            let (lib, app_state, id) = (lib.clone(), app_state.clone(), id.clone());
+            async move {
+                lib.enqueue(&id).await.unwrap();
+                let (started, _token) = lib.start_next().unwrap();
+                assert_eq!(started, id);
+                let stages = std::sync::Mutex::new(Vec::new());
+                let progress = |stage: ProcessingStage, done: f32, _: &str| stages.lock().unwrap().push((stage, done));
+                let result = lib.run_job_with(&app_state, &id, &progress, tools).await;
+                lib.finish_job(&id, &Some(result.clone()));
+                result.unwrap();
+                stages.into_inner().unwrap()
+            }
+        };
+
+        let tools: &'static FakeTools = Box::leak(Box::default());
+        let stages = run(tools).await;
+        assert_eq!(
+            *tools.calls.lock().unwrap(),
+            ["extract_audio", "trim 12-50", "thumbnails from 11.5 for The Hope We Have"]
+        );
+        // The audio went to Modal once, as base64.
+        {
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            let sent: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+            use base64::Engine;
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(sent["audio_base64"].as_str().unwrap()).unwrap(), b"fake audio");
+        }
+        assert!(stages.iter().any(|(s, done)| *s == ProcessingStage::Trimming && (*done - 62.5).abs() < 0.01));
+        assert_eq!(stages.last().unwrap().0, ProcessingStage::Complete);
+
+        let dir = lib.inner().paths.as_ref().unwrap().video_dir(&id).unwrap();
+        let data = manifest::load_video_data(&dir);
+        let trimmed = data.trimmed_file.clone().unwrap();
+        assert_eq!(std::fs::read(dir.join(&trimmed)).unwrap(), b"the cut");
+        assert_eq!((data.trim_start, data.trim_end), (Some(11.5), Some(50.0)), "times from where the cut really starts");
+        assert_eq!(data.thumbnail_options, ["thumbnail_option_1.jpg", "thumbnail_option_2.jpg"]);
+        assert_eq!(data.selected_source.as_deref(), Some("thumbnail_option_1.jpg"));
+        assert!(dir.join("thumbnail_option_2_raw.jpg").exists());
+        let transcript = manifest::load_transcript(&dir).unwrap();
+        assert_eq!(transcript.transcription.suggested_title.as_deref(), Some("The Hope We Have"));
+        {
+            let g = lib.inner();
+            let e = g.entry(&id).unwrap();
+            assert_eq!(e.status, EntryStatus::ReadyForReview);
+            assert!(g.running.is_none() && g.queue.is_empty());
+        }
+        let tmp_dir = lib.inner().paths.as_ref().unwrap().tmp_dir();
+        assert!(std::fs::read_dir(&tmp_dir).map(|d| d.count()).unwrap_or(0) == 0, "the work folder is gone");
+
+        // Again (e.g. Reprocess without reset): the saved transcript is
+        // used; Modal isn't asked again and no audio is extracted.
+        let again: &'static FakeTools = Box::leak(Box::default());
+        run(again).await;
+        assert_eq!(*again.calls.lock().unwrap(), ["trim 12-50", "thumbnails from 11.5 for The Hope We Have"]);
+        assert_eq!(bodies.lock().unwrap().len(), 1);
     }
 
     /// A writable library with one processed video that has two generated

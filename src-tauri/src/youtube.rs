@@ -516,7 +516,6 @@ pub async fn list_playlists(access_token: &str) -> Result<Vec<PlaylistInfo>, Str
 mod tests {
     use super::*;
     use crate::upload::test_server::MockServer;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn credentials() -> YouTubeCredentials {

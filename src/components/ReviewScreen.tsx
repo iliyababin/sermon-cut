@@ -20,6 +20,7 @@ import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
 import { getDefaultTemplate } from "@/templates";
 import { splitTitleIntoLines } from "@/lib/utils";
 import { renderKey } from "./review/renderKey";
+import { buildYoutubeDescription, youtubeChapters, youtubeTitle } from "@/lib/youtube";
 import { canStartUpload, initialReviewState, reviewReducer, reviewShortcut } from "./review/reviewMachine";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
@@ -93,7 +94,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   const [description, setDescription] = useState(
     video.review.description ?? video.transcription?.suggested_description ?? ""
   );
-  const chapters: Chapter[] = video.transcription?.suggested_chapters || [];
+  const chapters: Chapter[] = useMemo(() => video.transcription?.suggested_chapters || [], [video]);
   const [preacher, setPreacher] = useState(video.review.preacher ?? "");
   // Speakers named before, offered as suggestions; a video with no speaker
   // saved yet starts with the most recent one.
@@ -103,6 +104,12 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   // Trim boundaries (what the trimmed video was cut to, used for chapters and captions)
   const startTime = video.trim_start ?? video.transcription?.sermon_start ?? 0;
   const endTime = video.trim_end ?? video.transcription?.sermon_end ?? video.duration ?? 0;
+  // What YouTube gets: chapters of the trimmed video, within its limits.
+  const shownChapters = useMemo(() => youtubeChapters(chapters, startTime, endTime), [chapters, startTime, endTime]);
+  const youtubeDescription = useMemo(
+    () => buildYoutubeDescription({ description, chapters, startTime, endTime, footer: SOCIAL_LINKS }),
+    [description, chapters, startTime, endTime]
+  );
 
   // Thumbnails: sources by id, plus a stored template render per source.
   const [thumbnailOptions, setThumbnailOptions] = useState<ThumbnailOption[]>(video.thumbnail_options);
@@ -197,6 +204,9 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   // Reprocessing state
   const [isReprocessing, setIsReprocessing] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // Review autosave status, for "Saving… / Saved".
+  const [savesInFlight, setSavesInFlight] = useState(0);
+  const [savedOnce, setSavedOnce] = useState(false);
   // Regenerate or Reprocess failed.
   const [actionError, setActionError] = useState<string | null>(null);
   // The YouTube sign-in or playlists couldn't be loaded.
@@ -217,6 +227,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       if (!dirty.current) return true;
       dirty.current = false;
       const v = latest.current;
+      setSavesInFlight((n) => n + 1);
       return saveReview(
         video.id,
         { title: v.title, description: v.description, preacher: v.preacher },
@@ -224,6 +235,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       )
         .then(() => {
           setSaveError(null);
+          setSavedOnce(true);
           return true;
         })
         .catch((err) => {
@@ -231,7 +243,8 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
           dirty.current = true;
           setSaveError(errorMessage(err, "Couldn't save your changes"));
           return false;
-        });
+        })
+        .finally(() => setSavesInFlight((n) => n - 1));
     });
     saving.current = run;
     return run;
@@ -381,7 +394,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     const again = review.uploadCount > 0;
     const warn = again || !!video.duplicate_upload;
     const lines = [
-      `Upload "${title.trim()}" by ${preacher.trim()} as ${PRIVACY_LABELS[privacy]}?`,
+      `Upload "${youtubeTitle(title)}" by ${preacher.trim()} as ${PRIVACY_LABELS[privacy]}?`,
     ];
     if (again) {
       lines.push("This video has already been uploaded to YouTube. This makes a new, separate YouTube video.");
@@ -416,26 +429,11 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       try {
         await flush();
 
-        // Build description with chapters (adjusted for clip) and social links
-        let fullDescription = description;
-        const adjustedChapters = chapters.filter(
-          (ch) => ch.time >= startTime && ch.time <= endTime
-        );
-        if (adjustedChapters.length > 0) {
-          fullDescription += "\n\nChapters:\n";
-          fullDescription += adjustedChapters
-            .map((ch) => `${formatTime(ch.time - startTime)} ${ch.title}`)
-            .join("\n");
-        }
-
-        // Add social links footer
-        fullDescription += `\n\n---\n${SOCIAL_LINKS}`;
-
         const source = selectedOption?.id;
         const outcome = await youtubeUploadVideo(
           video.id,
-          title,
-          fullDescription,
+          youtubeTitle(title),
+          youtubeDescription,
           source,
           source ? keys[source] : undefined,
           privacy,
@@ -791,7 +789,12 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
             {/* Metadata */}
             <div className="bg-card border border-border rounded-lg p-4 space-y-4">
-              <h3 className="font-semibold">Metadata</h3>
+              <div className="flex items-baseline justify-between">
+                <h3 className="font-semibold">Metadata</h3>
+                <span className="text-xs text-muted-foreground" aria-live="polite">
+                  {savesInFlight > 0 ? "Saving…" : savedOnce && !saveError ? "Saved" : ""}
+                </span>
+              </div>
 
               <div>
                 <label className="block text-sm font-medium mb-1">Title</label>
@@ -855,23 +858,32 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                 />
               </div>
 
-              {chapters.filter((ch) => ch.time >= startTime && ch.time <= endTime).length > 0 && (
+              {shownChapters.length > 0 ? (
                 <div>
                   <label className="block text-sm font-medium mb-1">
                     Chapters
                   </label>
                   <div className="text-sm text-muted-foreground space-y-1 bg-muted p-2 rounded-lg max-h-32 overflow-y-auto">
-                    {chapters
-                      .filter((ch) => ch.time >= startTime && ch.time <= endTime)
-                      .map((ch, index) => (
+                    {shownChapters.map((ch, index) => (
                       <div key={index} className="flex gap-2">
-                        <span className="font-mono">{formatTime(ch.time - startTime)}</span>
+                        <span className="font-mono">{formatTime(ch.time)}</span>
                         <span>{ch.title}</span>
                       </div>
                     ))}
                   </div>
                 </div>
-              )}
+              ) : chapters.length > 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  No chapters: YouTube needs at least 3, each at least 10 seconds long.
+                </p>
+              ) : null}
+
+              <details className="text-sm">
+                <summary className="cursor-pointer font-medium">Preview YouTube description</summary>
+                <pre className="mt-2 p-2 bg-muted rounded-lg whitespace-pre-wrap break-words font-sans text-xs text-muted-foreground max-h-64 overflow-y-auto">
+                  {youtubeDescription}
+                </pre>
+              </details>
 
             </div>
           </div>

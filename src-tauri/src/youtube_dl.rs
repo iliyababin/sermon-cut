@@ -171,36 +171,34 @@ pub async fn download_video(
             }
             line = reader.next_line() => {
                 match line {
-                    Ok(Some(line)) => {
-                        // Detect post-processing phase (merging audio/video)
-                        if line.contains("[Merger]") || line.contains("[ffmpeg]") || line.contains("[ExtractAudio]") {
-                            if !sent_processing {
-                                sent_processing = true;
-                                let _ = app_handle.emit("download-progress", DownloadProgress {
-                                    video_id: video_id.to_string(),
-                                    progress: 100.0,
-                                    speed: None,
-                                    eta: None,
-                                    status: "processing".to_string(),
-                                });
-                            }
+                    Ok(Some(line)) => match parse_line(&line) {
+                        // Post-processing (merging audio and video), once.
+                        Some(Line::Processing) if !sent_processing => {
+                            sent_processing = true;
+                            let _ = app_handle.emit("download-progress", DownloadProgress {
+                                video_id: video_id.to_string(),
+                                progress: 100.0,
+                                speed: None,
+                                eta: None,
+                                status: "processing".to_string(),
+                            });
                         }
-                        // Parse progress info
-                        else if let Some(progress_info) = parse_progress(&line) {
-                            // Only emit if enough time has passed (throttle)
+                        Some(Line::Progress { percent, speed, eta }) => {
+                            // Throttled, to avoid UI jitter.
                             let now = std::time::Instant::now();
                             if now.duration_since(last_update) >= update_interval {
                                 last_update = now;
                                 let _ = app_handle.emit("download-progress", DownloadProgress {
                                     video_id: video_id.to_string(),
-                                    progress: progress_info.0,
-                                    speed: progress_info.1,
-                                    eta: progress_info.2,
+                                    progress: percent,
+                                    speed,
+                                    eta,
                                     status: "downloading".to_string(),
                                 });
                             }
                         }
-                    }
+                        _ => {}
+                    },
                     Ok(None) => break,
                     Err(e) => return Err(format!("Error reading output: {}", e)),
                 }
@@ -231,37 +229,57 @@ fn find_downloaded_file(dir: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "Download finished but no video file was found".to_string())
 }
 
+/// What a line of yt-dlp's output says.
+#[derive(Debug, PartialEq)]
+enum Line {
+    /// A progress line (from our --progress-template).
+    Progress { percent: f32, speed: Option<String>, eta: Option<String> },
+    /// Downloading is done; the parts are being merged or converted.
+    Processing,
+}
+
+fn parse_line(line: &str) -> Option<Line> {
+    if line.contains("[Merger]") || line.contains("[ffmpeg]") || line.contains("[ExtractAudio]") {
+        return Some(Line::Processing);
+    }
+    let (percent, speed, eta) = parse_progress(line)?;
+    Some(Line::Progress { percent, speed, eta })
+}
+
+/// "PROGRESS:percent|speed|eta" (see download_args); unknown parts (empty,
+/// N/A, Unknown) are None. Colour codes, if yt-dlp adds any, are ignored.
 fn parse_progress(line: &str) -> Option<(f32, Option<String>, Option<String>)> {
-    // Parse progress line format: "PROGRESS:XX.X%|speed|eta"
-    let line = line.trim();
-    if !line.starts_with("PROGRESS:") {
+    let line = strip_ansi(line);
+    let data = line.trim().strip_prefix("PROGRESS:")?;
+    let mut parts = data.split('|').map(str::trim);
+    let percent = parts.next()?.trim_end_matches('%').trim().parse::<f32>().ok()?;
+    if !percent.is_finite() {
         return None;
     }
+    let known = |s: Option<&str>| s.filter(|s| !s.is_empty() && *s != "N/A" && *s != "Unknown").map(str::to_string);
+    let speed = known(parts.next());
+    let eta = known(parts.next());
+    Some((percent.clamp(0.0, 100.0), speed, eta))
+}
 
-    let data = line.strip_prefix("PROGRESS:")?;
-    let parts: Vec<&str> = data.split('|').collect();
-
-    if parts.is_empty() {
-        return None;
+/// `s` without ANSI escape sequences (ESC [ ... letter).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
     }
-
-    // Parse percentage
-    let percent_str = parts[0].trim().trim_end_matches('%');
-    let percent = percent_str.parse::<f32>().ok()?;
-
-    // Parse speed (optional)
-    let speed = parts.get(1)
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && *s != "N/A" && *s != "Unknown")
-        .map(|s| s.to_string());
-
-    // Parse ETA (optional)
-    let eta = parts.get(2)
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && *s != "N/A" && *s != "Unknown")
-        .map(|s| s.to_string());
-
-    Some((percent, speed, eta))
+    out
 }
 
 #[cfg(test)]
@@ -297,6 +315,48 @@ mod tests {
             assert_eq!(args[0], "--ignore-config");
             assert_eq!(&args[args.len() - 2..], ["--", url]);
             assert_eq!(args.iter().filter(|a| *a == "--").count(), 1);
+        }
+    }
+
+    #[test]
+    fn progress_lines_are_read() {
+        let p = |percent: f32, speed: Option<&str>, eta: Option<&str>| {
+            Some(Line::Progress { percent, speed: speed.map(Into::into), eta: eta.map(Into::into) })
+        };
+        assert_eq!(parse_line("PROGRESS: 12.3%|2.50MiB/s|00:42"), p(12.3, Some("2.50MiB/s"), Some("00:42")));
+        assert_eq!(parse_line("  PROGRESS:100%|N/A|Unknown  "), p(100.0, None, None));
+        assert_eq!(parse_line("PROGRESS:7.0%||"), p(7.0, None, None));
+        assert_eq!(parse_line("PROGRESS:7.0%"), p(7.0, None, None));
+        // Coloured output.
+        assert_eq!(parse_line("PROGRESS:\u{1b}[0;94m 45.1%\u{1b}[0m|\u{1b}[0;32m1.0MiB/s\u{1b}[0m|00:10"), p(45.1, Some("1.0MiB/s"), Some("00:10")));
+        // Out of range is kept in range.
+        assert_eq!(parse_line("PROGRESS:100.4%|x|y"), p(100.0, Some("x"), Some("y")));
+    }
+
+    #[test]
+    fn other_lines_are_not_progress() {
+        for line in [
+            "",
+            "[youtube] dQw4w9WgXcQ: Downloading webpage",
+            "[download] Destination: /tmp/x.webm",
+            "PROGRESS:N/A|N/A|N/A",
+            "PROGRESS:abc%|1|2",
+            "PROGRESS:NaN%|1|2",
+            "progress:12%|1|2",
+            "xPROGRESS:12%|1|2",
+        ] {
+            assert_eq!(parse_line(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn merging_is_processing() {
+        for line in [
+            "[Merger] Merging formats into \"/tmp/x.mkv\"",
+            "[ffmpeg] Merging formats into \"/tmp/x.mp4\"",
+            "[ExtractAudio] Destination: /tmp/x.m4a",
+        ] {
+            assert_eq!(parse_line(line), Some(Line::Processing), "{line:?}");
         }
     }
 }

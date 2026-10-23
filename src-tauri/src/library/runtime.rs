@@ -493,6 +493,7 @@ fn sweep(paths: &LibraryPaths) {
         }
     }
     for dir in dirs {
+        recover_commit(&dir);
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for e in entries.flatten() {
             if e.file_name().to_string_lossy().contains(TMP_MARKER) {
@@ -502,19 +503,106 @@ fn sweep(paths: &LibraryPaths) {
     }
 }
 
-/// Remove generated files from a video folder, keeping the transcript and
-/// review data (used before committing new outputs).
-fn clear_outputs(dir: &Path, keep_custom: bool) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let keep = name == "transcript.json"
-            || name == "video.json"
-            || (keep_custom && name.starts_with("custom_thumbnail_"));
-        if !keep && e.path().is_file() {
-            let _ = std::fs::remove_file(e.path());
+/// Where a commit keeps a video's previous outputs until the new ones are
+/// in. Hidden, so no video.json can name it; a file `DONE` inside means
+/// the commit finished and only the clean-up was interrupted.
+const COMMIT_BACKUP: &str = ".commit-backup";
+const COMMIT_DONE: &str = "DONE";
+
+/// Generated files in a video folder: everything but the transcript and
+/// the review data.
+fn is_output(name: &str) -> bool {
+    name != "transcript.json" && name != "video.json" && !name.contains(TMP_MARKER)
+}
+
+/// Plain files directly in `dir` (sorted, so a commit is repeatable).
+fn files_in(dir: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.file_name())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Swap a job's staged outputs into the video folder, then write its new
+/// video.json with `write_data`. The old outputs are moved aside first and
+/// put back if anything fails, so the folder is never left half old, half
+/// new; on success they're deleted.
+fn swap_in_outputs(dir: &Path, staging: &Path, write_data: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    recover_commit(dir);
+    let backup = dir.join(COMMIT_BACKUP);
+    std::fs::create_dir(&backup).map_err(|e| format!("Failed to save results: {}", e))?;
+
+    let mut aside = Vec::new();
+    let mut moved_in = Vec::new();
+    let result = (|| -> Result<(), String> {
+        let old = files_in(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
+        for name in old.into_iter().filter(|n| is_output(&n.to_string_lossy())) {
+            std::fs::rename(dir.join(&name), backup.join(&name)).map_err(|e| format!("Failed to save results: {}", e))?;
+            aside.push(name);
+        }
+        let staged: Vec<_> = {
+            let mut v: Vec<_> = std::fs::read_dir(staging)
+                .map_err(|e| format!("Failed to read work folder: {}", e))?
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            v.sort();
+            v
+        };
+        for name in staged {
+            std::fs::rename(staging.join(&name), dir.join(&name)).map_err(|e| format!("Failed to save results: {}", e))?;
+            moved_in.push(name);
+        }
+        write_data()
+    })();
+
+    match result {
+        Ok(()) => {
+            // Committed. Mark it so an interrupted clean-up isn't undone.
+            let _ = std::fs::write(backup.join(COMMIT_DONE), b"");
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            for name in &moved_in {
+                if std::fs::rename(dir.join(name), staging.join(name)).is_err() {
+                    let _ = std::fs::remove_file(dir.join(name));
+                }
+            }
+            let mut restored = true;
+            for name in &aside {
+                restored &= std::fs::rename(backup.join(name), dir.join(name)).is_ok();
+            }
+            if restored {
+                let _ = std::fs::remove_dir_all(&backup);
+            } // else left for recover_commit on the next open
+            Err(e)
         }
     }
+}
+
+/// Finish a commit a crash interrupted: one that got as far as DONE is
+/// kept; otherwise the folder goes back to the old outputs.
+fn recover_commit(dir: &Path) {
+    let backup = dir.join(COMMIT_BACKUP);
+    if !std::fs::symlink_metadata(&backup).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    if !backup.join(COMMIT_DONE).exists() {
+        let saved = files_in(&backup).unwrap_or_default();
+        if let Ok(current) = files_in(dir) {
+            for name in current.iter().filter(|n| is_output(&n.to_string_lossy())) {
+                let _ = std::fs::remove_file(dir.join(name));
+            }
+        }
+        for name in saved {
+            let _ = std::fs::rename(backup.join(&name), dir.join(&name));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&backup);
 }
 
 fn newer_library_message(wanted: Option<&str>) -> String {
@@ -1308,21 +1396,20 @@ impl Library {
             return Err("The file changed while it was being processed, so the results were thrown away. Try again once it has finished copying.".into());
         }
 
-        // Commit: swap the new outputs in and mark the video ready.
+        // Commit: swap the new outputs in and mark the video ready. Nothing
+        // else writes this folder while the video is processing (reviews,
+        // renders and thumbnail edits are refused), so the swap runs
+        // without the library lock.
         {
-            let mut g = self.inner();
+            let g = self.inner();
             g.writable()?;
-            let e = g.entry(id)?;
-            if e.fingerprint.hash != expected.hash {
+            if g.entry(id)?.fingerprint.hash != expected.hash {
                 return Err(FILE_CHANGED.into());
             }
-            let old = manifest::load_video_data(&video_dir);
-            clear_outputs(&video_dir, false);
-            let files = std::fs::read_dir(&staging).map_err(|e| format!("Failed to read work folder: {}", e))?;
-            for f in files.flatten() {
-                std::fs::rename(f.path(), video_dir.join(f.file_name()))
-                    .map_err(|e| format!("Failed to save results: {}", e))?;
-            }
+        }
+        let dir = video_dir.clone();
+        blocking(move || {
+            let old = manifest::load_video_data(&dir);
             let data = VideoData {
                 trimmed_file: Some(trimmed_name),
                 trim_start: Some(start),
@@ -1336,7 +1423,11 @@ impl Library {
                 },
                 ..Default::default()
             };
-            manifest::save_video_data(&video_dir, &data)?;
+            swap_in_outputs(&dir, &staging, || manifest::save_video_data(&dir, &data))
+        })
+        .await??;
+        {
+            let mut g = self.inner();
             let e = g.entry_mut(id)?;
             e.status = EntryStatus::ReadyForReview;
             e.error = None;
@@ -2687,6 +2778,93 @@ mod tests {
         assert!(!dir.exists());
         assert!(!lib.inner().busy.contains(&id));
         assert_eq!(lib.view(vec![]).videos[0].status, ViewStatus::New);
+    }
+
+    /// A video folder with old outputs, and a staging folder with new ones.
+    fn commit_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("video");
+        let staging = tmp.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        for (name, body) in [("transcript.json", "t"), ("video.json", "old"), ("trimmed.mp4", "old trim"), ("thumbnail_option_1.jpg", "old 1"), ("thumbnail_option_9.jpg", "old 9")] {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        for (name, body) in [("trimmed.mp4", "new trim"), ("thumbnail_option_1.jpg", "new 1")] {
+            std::fs::write(staging.join(name), body).unwrap();
+        }
+        (tmp, dir, staging)
+    }
+
+    fn contents(dir: &Path) -> Vec<(String, String)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                let body = std::fs::read_to_string(e.path()).unwrap_or_else(|_| "<dir>".into());
+                (e.file_name().to_string_lossy().to_string(), body)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn commit_swaps_outputs_in() {
+        let (_t, dir, staging) = commit_fixture();
+        swap_in_outputs(&dir, &staging, || std::fs::write(dir.join("video.json"), "new").map_err(|e| e.to_string())).unwrap();
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            contents(&dir),
+            vec![s("thumbnail_option_1.jpg", "new 1"), s("transcript.json", "t"), s("trimmed.mp4", "new trim"), s("video.json", "new")]
+        );
+    }
+
+    #[test]
+    fn failed_commit_puts_the_old_outputs_back() {
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        // The last staged item can't be moved in: a folder with something
+        // in it already has its name.
+        std::fs::create_dir_all(staging.join("zz_blocked")).unwrap();
+        std::fs::write(staging.join("zz_blocked/x"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("zz_blocked")).unwrap();
+        std::fs::write(dir.join("zz_blocked/y"), "y").unwrap();
+        let before_with_blocker = contents(&dir);
+        assert!(swap_in_outputs(&dir, &staging, || Ok(())).is_err());
+        assert_eq!(contents(&dir), before_with_blocker);
+        std::fs::remove_dir_all(dir.join("zz_blocked")).unwrap();
+        assert_eq!(contents(&dir), before);
+
+        // Writing video.json fails after everything moved: same.
+        std::fs::remove_dir_all(staging.join("zz_blocked")).unwrap();
+        assert!(swap_in_outputs(&dir, &staging, || Err("disk full".into())).is_err());
+        assert_eq!(contents(&dir), before);
+        assert!(staging.join("trimmed.mp4").exists(), "the new outputs are back in staging");
+    }
+
+    #[test]
+    fn interrupted_commit_is_finished_or_undone_on_open() {
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        // Crashed after moving the old outputs aside and one new one in.
+        let backup = dir.join(COMMIT_BACKUP);
+        std::fs::create_dir(&backup).unwrap();
+        for f in ["trimmed.mp4", "thumbnail_option_1.jpg", "thumbnail_option_9.jpg"] {
+            std::fs::rename(dir.join(f), backup.join(f)).unwrap();
+        }
+        std::fs::rename(staging.join("trimmed.mp4"), dir.join("trimmed.mp4")).unwrap();
+        recover_commit(&dir);
+        assert_eq!(contents(&dir), before);
+
+        // Crashed after it finished, during the clean-up: kept.
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("thumbnail_option_9.jpg"), "old 9").unwrap();
+        std::fs::write(backup.join(COMMIT_DONE), "").unwrap();
+        std::fs::remove_file(dir.join("thumbnail_option_9.jpg")).unwrap();
+        recover_commit(&dir);
+        assert!(!backup.exists());
+        assert!(!dir.join("thumbnail_option_9.jpg").exists());
     }
 
     #[test]

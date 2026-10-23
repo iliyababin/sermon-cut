@@ -388,7 +388,7 @@ impl VideoData {
     /// Make the data consistent: renders out of the options (v0.4.0 stacked
     /// them there on every reopen), one render per existing source, a
     /// selection that names a source, and `selected_thumbnail` derived.
-    /// In memory only; `save_video_data` deletes the files dropped here.
+    /// In memory only; `prune_renders` deletes the files dropped here.
     pub fn fix_up(&mut self, dir: &Path) {
         let mut seen = HashSet::new();
         self.thumbnail_options
@@ -462,22 +462,44 @@ pub fn load_video_data(dir: &Path) -> VideoData {
     data
 }
 
-/// Save video.json, then delete rendered thumbnails it no longer refers to
-/// (replaced renders, and the ones v0.4.0 stacked up).
+/// Save video.json. Only writes: a render being written, or one renamed
+/// into place but not yet recorded, must survive a save that holds an older
+/// list. Files the data no longer refers to are removed by `prune_renders`.
 pub fn save_video_data(dir: &Path, data: &VideoData) -> Result<(), String> {
     let mut data = data.clone();
     data.fix_up(dir);
-    fsutil::write_json_atomic(&dir.join("video.json"), &data)?;
+    fsutil::write_json_atomic(&dir.join("video.json"), &data)
+}
+
+/// Where a render is written before it's recorded: hidden, so no video.json
+/// can name it and `prune_renders` never sees it; swept on the next open.
+pub const RENDER_TMP_PREFIX: &str = ".render-tmp-";
+
+/// A finished render's file name (see `render_file_name`; v0.4.0's
+/// `thumbnail_rendered_<n>_<time>.jpg` too).
+pub fn is_render_file(name: &str) -> bool {
+    name.starts_with(RENDERED_PREFIX) && name.ends_with(".jpg") && is_valid_file_name(name) && !name.contains(fsutil::TMP_MARKER)
+}
+
+/// Delete rendered thumbnails `data` doesn't record (replaced renders,
+/// renders of removed sources, the ones v0.4.0 stacked up). Run it under
+/// the video's lock, with the data just loaded or saved there, so a render
+/// recorded meanwhile can't be taken. Returns what it deleted.
+pub fn prune_renders(dir: &Path, data: &VideoData) -> Vec<String> {
+    let mut data = data.clone();
+    data.fix_up(dir);
     let keep: HashSet<&str> = data.renders.iter().map(|r| r.file.as_str()).collect();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with(RENDERED_PREFIX) && !keep.contains(name.as_str()) && e.path().is_file() {
-                let _ = std::fs::remove_file(e.path());
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return removed };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if is_render_file(&name) && !keep.contains(name.as_str()) && e.file_type().is_ok_and(|t| t.is_file()) {
+            if std::fs::remove_file(e.path()).is_ok() {
+                removed.push(name);
             }
         }
     }
-    Ok(())
+    removed
 }
 
 /// videos/<id>/transcript.json. Tied to the file's hash so a replaced file
@@ -776,8 +798,11 @@ mod tests {
         assert_eq!(d.selected_thumbnail.as_deref(), Some("thumbnail_option_1.jpg"));
         assert_eq!(d.review.title.as_deref(), Some("T"));
 
-        // Saving deletes the stacked files, and the next load is stable.
+        // Saving keeps every file; pruning deletes the stacked ones, and the
+        // next load is stable.
         save_video_data(dir, &d).unwrap();
+        assert!(dir.join(stacked[0]).exists());
+        prune_renders(dir, &d);
         for f in &stacked[..3] {
             assert!(!dir.join(f).exists(), "{f}");
         }
@@ -818,6 +843,7 @@ mod tests {
         assert_eq!(d.render_for("thumbnail_option_2.jpg").map(|r| r.file.as_str()), Some(render.as_str()));
         assert_eq!(d.selected_thumbnail.as_deref(), Some(render.as_str()));
         save_video_data(dir, &d).unwrap();
+        prune_renders(dir, &d);
         assert!(dir.join(&render).exists(), "the selected render is kept");
         let again = load_video_data(dir);
         assert_eq!(again.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
@@ -835,6 +861,41 @@ mod tests {
             std::fs::write(dir.join("video.json"), json.to_string()).unwrap();
             assert_eq!(load_video_data(dir).selected_source.as_deref(), Some("thumbnail_option_1.jpg"), "{name}");
         }
+    }
+
+    #[test]
+    fn a_save_never_deletes_a_render_in_progress_or_not_yet_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.jpg"), b"x").unwrap();
+        let older = VideoData { thumbnail_options: vec!["a.jpg".into()], ..Default::default() };
+        save_video_data(dir, &older).unwrap();
+
+        // A render being written, and one just renamed into place whose
+        // record is still to come, while a save holding the older list runs.
+        let tmp_name = format!("{}{}", RENDER_TMP_PREFIX, render_file_name("a.jpg"));
+        std::fs::write(dir.join(&tmp_name), b"half").unwrap();
+        let fresh = render_file_name("a.jpg");
+        std::fs::write(dir.join(&fresh), b"r").unwrap();
+        save_video_data(dir, &older).unwrap();
+        assert!(dir.join(&tmp_name).exists());
+        assert!(dir.join(&fresh).exists());
+
+        // Recorded, then pruned with the current data: kept. The temp file
+        // is never a render to prune.
+        let mut now = load_video_data(dir);
+        now.renders.push(Render { source: "a.jpg".into(), file: fresh.clone(), render_key: "k".into() });
+        save_video_data(dir, &now).unwrap();
+        assert!(prune_renders(dir, &load_video_data(dir)).is_empty());
+        assert!(dir.join(&fresh).exists() && dir.join(&tmp_name).exists());
+
+        // Replaced: the old one goes.
+        let newer = render_file_name("a.jpg");
+        std::fs::write(dir.join(&newer), b"r2").unwrap();
+        now.renders = vec![Render { source: "a.jpg".into(), file: newer.clone(), render_key: "k2".into() }];
+        save_video_data(dir, &now).unwrap();
+        assert_eq!(prune_renders(dir, &load_video_data(dir)), vec![fresh.clone()]);
+        assert!(dir.join(&newer).exists());
     }
 
     #[test]

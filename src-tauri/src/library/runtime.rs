@@ -73,6 +73,9 @@ struct Inner {
     running: Option<Running>,
     /// Entries with an upload, trash or thumbnail operation in flight.
     busy: HashSet<String>,
+    /// Template renders being written (see `save_rendered_thumbnail`); the
+    /// open-time sweep would delete their temp files.
+    rendering: usize,
     /// YouTube uploads in flight.
     uploads: std::collections::HashMap<String, ActiveUpload>,
     downloads: Vec<DownloadItem>,
@@ -93,6 +96,10 @@ struct Inner {
 pub struct Library {
     inner: Mutex<Inner>,
     scan_lock: tokio::sync::Mutex<()>,
+    /// One lock per video folder, held around a read-modify-write of its
+    /// video.json and any pruning of its files. Taken before `inner`, never
+    /// across an `.await` (see docs/INVARIANTS.md). Use `video_lock`.
+    video_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     wake: tokio::sync::Notify,
     /// The pre-0.4 migration ran this launch.
     migration_tried: std::sync::atomic::AtomicBool,
@@ -221,6 +228,10 @@ struct ProcessingProgressEvent {
     stage: ProcessingStage,
     progress: f32,
     message: String,
+}
+
+fn hold(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl std::future::Future<Output = Result<T, String>> {
@@ -567,9 +578,11 @@ impl Inner {
     }
 }
 
-/// Delete stale temp files from a crashed run: everything in tmp/, and
-/// half-written JSON (`*.tmp-*`) next to the real files.
-fn sweep(paths: &LibraryPaths) {
+/// Delete stale temp files from a crashed run: everything in tmp/,
+/// half-written JSON (`*.tmp-*`) next to the real files and unfinished
+/// renders (`.render-tmp-*`); and, under each video's lock, renders its
+/// video.json doesn't record.
+fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
     let _ = std::fs::remove_dir_all(paths.tmp_dir()); // removes a symlink itself, never its target
     let mut dirs = vec![paths.data_dir()];
     let videos_dir = paths.videos_dir();
@@ -587,9 +600,16 @@ fn sweep(paths: &LibraryPaths) {
         recover_commit(&dir);
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for e in entries.flatten() {
-            if e.file_name().to_string_lossy().contains(TMP_MARKER) {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.contains(TMP_MARKER) || name.starts_with(manifest::RENDER_TMP_PREFIX) {
                 let _ = std::fs::remove_file(e.path());
             }
+        }
+        let id = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if super::is_valid_id(&id) && dir.parent() == Some(videos_dir.as_path()) {
+            let lock = video_lock(&id);
+            let _v = hold(&lock);
+            manifest::prune_renders(&dir, &manifest::load_video_data(&dir));
         }
     }
 }
@@ -623,7 +643,10 @@ struct CommitJournal {
 /// Generated files in a video folder: everything but the transcript and
 /// the review data.
 fn is_output(name: &str) -> bool {
-    name != "transcript.json" && name != "video.json" && !name.contains(TMP_MARKER)
+    name != "transcript.json"
+        && name != "video.json"
+        && !name.contains(TMP_MARKER)
+        && !name.starts_with(manifest::RENDER_TMP_PREFIX)
 }
 
 /// Plain files directly in `dir` (sorted, so a commit is repeatable).
@@ -868,6 +891,7 @@ impl Library {
                 queue: VecDeque::new(),
                 running: None,
                 busy: HashSet::new(),
+                rendering: 0,
                 uploads: std::collections::HashMap::new(),
                 downloads: Vec::new(),
                 session: super::new_id(),
@@ -877,6 +901,7 @@ impl Library {
                 baseline_scan: false,
             }),
             scan_lock: tokio::sync::Mutex::new(()),
+            video_locks: Mutex::new(std::collections::HashMap::new()),
             wake: tokio::sync::Notify::new(),
             migration_tried: std::sync::atomic::AtomicBool::new(false),
         });
@@ -886,6 +911,14 @@ impl Library {
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The lock for one video's folder. Lock it with `hold`, before `inner`.
+    fn video_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.video_locks.lock().unwrap_or_else(|p| p.into_inner());
+        // Forget the ones nobody holds, so the map stays small.
+        locks.retain(|_, l| Arc::strong_count(l) > 1);
+        locks.entry(id.to_string()).or_default().clone()
     }
 
     /// (Re)open the configured folder. Blocking: call from a blocking thread.
@@ -953,7 +986,7 @@ impl Library {
         let (session, running, idle, queue_idle) = {
             let g = self.inner();
             let running = g.running.as_ref().map(|r| r.id.clone());
-            let idle = running.is_none() && g.downloads.is_empty() && g.busy.is_empty();
+            let idle = running.is_none() && g.downloads.is_empty() && g.busy.is_empty() && g.rendering == 0;
             (g.session.clone(), running, idle, g.running.is_none() && g.queue.is_empty())
         };
         if mode == Mode::Writable {
@@ -968,7 +1001,7 @@ impl Library {
         let mut orphans = std::collections::HashMap::new();
         if mode == Mode::Writable {
             if idle {
-                sweep(&paths);
+                sweep(&paths, &|id| self.video_lock(id));
             }
             let has_results = |e: &Entry| paths.video_dir(&e.id).is_ok_and(|dir| manifest::has_results(&dir));
             if manifest::mark_interrupted(&mut manifest, running.as_deref(), has_results) || recovered {
@@ -1806,6 +1839,8 @@ impl Library {
     /// video.json edit (the review screen saves while a trim runs). Returns
     /// the cut it replaced, to delete.
     fn record_trim(&self, id: &str, dir: &Path, name: &str, start: f64, end: f64) -> Result<Option<String>, String> {
+        let lock = self.video_lock(id);
+        let _v = hold(&lock);
         let mut g = self.inner();
         let mut data = manifest::load_video_data(dir);
         let old = data.trimmed_file.replace(name.to_string()).filter(|old| old != name);
@@ -1940,6 +1975,8 @@ impl Library {
     /// source id; one that's no longer an option (e.g. regenerated meanwhile)
     /// is ignored rather than losing the text edits.
     pub fn save_review(&self, id: &str, review: Review, selected_source: Option<String>) -> Result<(), String> {
+        let lock = self.video_lock(id);
+        let _v = hold(&lock);
         self.with_entry(id, |g, paths| {
             // Processing replaces video.json, so edits made now would be lost.
             if g.queue.iter().any(|q| q == id) || g.running.as_ref().is_some_and(|r| r.id == id) {
@@ -2011,6 +2048,8 @@ impl Library {
                 }
             };
 
+            let lock = self.video_lock(id);
+            let _v = hold(&lock);
             let _g = self.inner();
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for f in entries.flatten() {
@@ -2032,6 +2071,7 @@ impl Library {
             data.selected_source = names.first().cloned();
             data.renders.clear();
             manifest::save_video_data(&dir, &data)?;
+            manifest::prune_renders(&dir, &data);
             Ok(names.iter().map(|n| path_string(&dir.join(n))).collect())
         }
         .await
@@ -2049,6 +2089,8 @@ impl Library {
             let dir = paths.ensure_video_dir(id)?;
             let path = crate::thumbnail::process_custom_thumbnail(&source, &dir, &crop, grading).await?;
             let name = file_in_dir(&dir, &path)?;
+            let lock = self.video_lock(id);
+            let _v = hold(&lock);
             let pruned = {
                 let _g = self.inner();
                 let mut data = manifest::load_video_data(&dir);
@@ -2064,6 +2106,8 @@ impl Library {
             for old in pruned {
                 let _ = std::fs::remove_file(dir.join(old));
             }
+            // Renders of the dropped sources.
+            manifest::prune_renders(&dir, &manifest::load_video_data(&dir));
             Ok(path_string(&dir.join(name)))
         }
         .await
@@ -2093,14 +2137,22 @@ impl Library {
             Ok(dir)
         })?;
 
-        // Named here, never by the webview. Written under a temp name (swept
-        // on the next open if we crash) so cleanup can't take it before it's
-        // recorded.
+        // Named here, never by the webview. Written under a hidden temp name
+        // (swept on the next open if we crash) that no save or prune touches.
         let name = manifest::render_file_name(&source);
-        let tmp = dir.join(format!("{}{}", name, fsutil::TMP_MARKER));
+        let tmp = dir.join(format!("{}{}", manifest::RENDER_TMP_PREFIX, name));
         let out = tmp.clone();
-        blocking(move || crate::thumbnail::save_for_youtube(&image_bytes, &out)).await??;
+        let rendering = RenderingGuard::new(self);
+        let written = blocking(move || crate::thumbnail::save_for_youtube(&image_bytes, &out)).await.and_then(|r| r);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
 
+        // Moved into place and recorded together, under the video's lock, so
+        // no prune can see the file unrecorded; then the replaced render goes.
+        let lock = self.video_lock(id);
+        let _v = hold(&lock);
         let committed = self.with_entry(id, |g, _| {
             // Processing may have started (or the options changed) meanwhile.
             g.require_render_allowed(id)?;
@@ -2115,12 +2167,21 @@ impl Library {
                 file: name.clone(),
                 render_key: render_key.to_string(),
             });
-            // The replaced render's file is deleted by the save.
-            manifest::save_video_data(&dir, &data)
+            if let Err(e) = manifest::save_video_data(&dir, &data) {
+                let _ = std::fs::remove_file(dir.join(&name));
+                return Err(e);
+            }
+            Ok(data)
         });
-        if let Err(e) = committed {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+        drop(rendering);
+        match committed {
+            Ok(data) => {
+                manifest::prune_renders(&dir, &data);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
         }
         Ok(path_string(&dir.join(name)))
     }
@@ -2522,6 +2583,24 @@ impl Drop for BusyGuard<'_> {
         let mut g = self.lib.inner();
         g.busy.remove(&self.id);
         g.uploads.remove(&self.id);
+    }
+}
+
+/// Counts a render being written, so a reopen doesn't sweep its temp file.
+struct RenderingGuard<'a> {
+    lib: &'a Library,
+}
+
+impl<'a> RenderingGuard<'a> {
+    fn new(lib: &'a Library) -> Self {
+        lib.inner().rendering += 1;
+        RenderingGuard { lib }
+    }
+}
+
+impl Drop for RenderingGuard<'_> {
+    fn drop(&mut self) {
+        self.lib.inner().rendering -= 1;
     }
 }
 
@@ -3007,6 +3086,27 @@ mod tests {
         let again = lib.detail(&id).unwrap();
         assert_eq!(again.thumbnail_options.len(), 2);
         assert_eq!(again.renders.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn saves_keep_unrecorded_renders_until_the_next_open_sweeps_them() {
+        let (_t, lib, id, dir) = processed_library();
+        let kept = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k1", png()).await.unwrap();
+        // A render being written, and one renamed into place but not yet
+        // recorded, while the review screen saves.
+        let writing = format!("{}{}", manifest::RENDER_TMP_PREFIX, manifest::render_file_name("thumbnail_option_2.jpg"));
+        std::fs::write(dir.join(&writing), b"half").unwrap();
+        let unrecorded = manifest::render_file_name("thumbnail_option_2.jpg");
+        std::fs::write(dir.join(&unrecorded), b"r").unwrap();
+        lib.save_review(&id, Review::default(), Some("thumbnail_option_1.jpg".into())).unwrap();
+        assert!(dir.join(&writing).exists());
+        assert!(dir.join(&unrecorded).exists());
+
+        // Reopened after a crash: both are left over, and go.
+        lib.open_blocking(false);
+        assert!(!dir.join(&writing).exists());
+        assert!(!dir.join(&unrecorded).exists());
+        assert!(Path::new(&kept).exists());
     }
 
     #[tokio::test]

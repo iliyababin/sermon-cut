@@ -875,11 +875,11 @@ impl Library {
 
         // A reopen (lock regained, take over) can happen while this session
         // still has work going; that work's files and status are left alone.
-        let (session, running, idle) = {
+        let (session, running, idle, queue_idle) = {
             let g = self.inner();
             let running = g.running.as_ref().map(|r| r.id.clone());
             let idle = running.is_none() && g.downloads.is_empty() && g.busy.is_empty();
-            (g.session.clone(), running, idle)
+            (g.session.clone(), running, idle, g.running.is_none() && g.queue.is_empty())
         };
         if mode == Mode::Writable {
             match lock::acquire(&paths, &session, force_lock) {
@@ -905,6 +905,22 @@ impl Library {
             // library.json was lost or restored from an older backup.
             orphans = manifest::find_orphans(&paths, &manifest);
         }
+        // The queue of the last session, minus what can't or needn't run.
+        let restored: Vec<String> = if mode == Mode::Writable && queue_idle {
+            manifest
+                .queue
+                .iter()
+                .filter(|id| {
+                    manifest.get(id).is_some_and(|e| {
+                        !matches!(e.status, EntryStatus::Done | EntryStatus::ReadyForReview)
+                            && paths.original(&e.file_name).is_ok_and(|p| p.is_file())
+                    })
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut g = self.inner();
         // Queue, running job, uploads and downloads are this session's and
@@ -919,6 +935,24 @@ impl Library {
         g.scanned = false;
         if rebuilt {
             g.baseline_scan = true;
+        }
+        let saved_queue = g.manifest.queue.clone();
+        if g.mode == Mode::Writable && g.queue.is_empty() && g.running.is_none() {
+            g.queue = restored.iter().cloned().collect();
+            g.manifest.queue = restored;
+        } else {
+            // This session's queue carries on (see above).
+            let mut current: Vec<String> = g.running.iter().map(|r| r.id.clone()).collect();
+            current.extend(g.queue.iter().cloned());
+            g.manifest.queue = current;
+        }
+        if g.manifest.queue != saved_queue {
+            g.save_logged();
+        }
+        let wake = !g.queue.is_empty();
+        drop(g);
+        if wake {
+            self.wake.notify_one();
         }
     }
 
@@ -1332,6 +1366,10 @@ impl Library {
             return Err("This video is already queued or processing".into());
         }
         g.queue.push_back(id.to_string());
+        if !g.manifest.queue.iter().any(|q| q == id) {
+            g.manifest.queue.push(id.to_string());
+        }
+        g.save_logged();
         drop(g);
         self.wake.notify_one();
         Ok(())
@@ -1341,7 +1379,11 @@ impl Library {
         let mut g = self.inner();
         g.queue.retain(|q| q != id);
         if let Some(r) = g.running.as_ref().filter(|r| r.id == id) {
+            // Leaves the saved queue when the job has stopped (finish_job).
             r.cancel.cancel();
+        } else if g.manifest.queue.iter().any(|q| q == id) {
+            g.manifest.queue.retain(|q| q != id);
+            g.save_logged();
         }
         Ok(())
     }
@@ -1370,7 +1412,10 @@ impl Library {
     fn start_next(&self) -> Option<(String, CancellationToken)> {
         let mut g = self.inner();
         while let Some(id) = g.queue.pop_front() {
-            let Ok(e) = g.entry_mut(&id) else { continue };
+            let Ok(e) = g.entry_mut(&id) else {
+                g.manifest.queue.retain(|q| *q != id);
+                continue;
+            };
             let previous = e.status;
             e.status = EntryStatus::Processing;
             let token = CancellationToken::new();
@@ -1398,6 +1443,7 @@ impl Library {
             let running = g.running.take();
             let previous = running.map(|r| r.previous).unwrap_or(EntryStatus::New);
             let staging = g.paths.as_ref().map(|p| p.tmp_dir().join(format!("job-{}", id)));
+            g.manifest.queue.retain(|q| q != id);
             if let Ok(e) = g.entry_mut(id) {
                 match result {
                     Some(Ok(())) => {}
@@ -3078,6 +3124,85 @@ mod tests {
         std::fs::write(root.join("new.mp4"), b"three").unwrap();
         lib.inner().apply_scan(&[seen(&root, "old 1.mp4"), seen(&root, "old 2.mp4"), seen(&root, "new.mp4")]);
         assert_eq!(lib.auto_process(since).await.len(), 1);
+    }
+
+    fn saved_queue(lib: &Library) -> Vec<String> {
+        let paths = lib.inner().paths.clone().unwrap();
+        match manifest::load(&paths).unwrap() {
+            manifest::Loaded::Ok(m) => m.queue,
+            _ => panic!("library.json unreadable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_queue_is_saved_until_each_job_ends() {
+        let (_t, lib, id, _dir) = processed_library();
+        let root = lib.root().unwrap();
+        std::fs::write(root.join("b.mp4"), b"second").unwrap();
+        lib.inner().apply_scan(&[seen(&root, "a.mp4"), seen(&root, "b.mp4")]);
+        let b = lib.inner().manifest.entries.iter().find(|e| e.file_name == "b.mp4").unwrap().id.clone();
+
+        lib.enqueue(&id).await.unwrap();
+        lib.enqueue(&b).await.unwrap();
+        assert_eq!(saved_queue(&lib), vec![id.clone(), b.clone()]);
+        // Starting a job keeps it there; finishing removes it.
+        let (started, _token) = lib.start_next().unwrap();
+        assert_eq!(started, id);
+        assert_eq!(saved_queue(&lib), vec![id.clone(), b.clone()]);
+        lib.finish_job(&id, &Some(Ok(())));
+        assert_eq!(saved_queue(&lib), vec![b.clone()]);
+        // Cancelling a waiting one removes it.
+        lib.cancel(&b).unwrap();
+        assert!(saved_queue(&lib).is_empty());
+
+        // A cancelled running job leaves when it has stopped.
+        lib.enqueue(&b).await.unwrap();
+        lib.start_next().unwrap();
+        lib.cancel(&b).unwrap();
+        assert_eq!(saved_queue(&lib), vec![b.clone()]);
+        lib.finish_job(&b, &None);
+        assert!(saved_queue(&lib).is_empty());
+    }
+
+    #[test]
+    fn the_saved_queue_is_restored_on_open() {
+        let (_t, lib, done, _dir) = processed_library();
+        let root = lib.root().unwrap();
+        for f in ["waiting.mp4", "running.mp4", "gone.mp4", "ready.mp4"] {
+            std::fs::write(root.join(f), f.as_bytes()).unwrap();
+        }
+        let ids: Vec<String> = {
+            let mut g = lib.inner();
+            g.entry_mut(&done).unwrap().status = EntryStatus::Done;
+            let mut ids = Vec::new();
+            for (name, status) in [
+                ("waiting.mp4", EntryStatus::New),
+                ("running.mp4", EntryStatus::Processing),
+                ("gone.mp4", EntryStatus::New),
+                ("ready.mp4", EntryStatus::ReadyForReview),
+            ] {
+                let mut e = Entry::new(name.into(), fsutil::fingerprint(&root.join(name)).unwrap(), Some(60.0));
+                e.status = status;
+                ids.push(e.id.clone());
+                g.manifest.entries.push(e);
+            }
+            let unknown = crate::library::new_id();
+            g.manifest.queue = vec![ids[1].clone(), done.clone(), ids[0].clone(), unknown, ids[2].clone(), ids[3].clone()];
+            g.save().unwrap();
+            ids
+        };
+        std::fs::remove_file(root.join("gone.mp4")).unwrap();
+
+        let reopened = Library::new(root.to_string_lossy().to_string());
+        reopened.open_blocking(true);
+        // The interrupted job first, then the one that was waiting; not the
+        // done or ready ones, an unknown id, or a file that's gone.
+        let g = reopened.inner();
+        assert_eq!(g.queue.iter().cloned().collect::<Vec<_>>(), vec![ids[1].clone(), ids[0].clone()]);
+        assert_eq!(g.manifest.queue, vec![ids[1].clone(), ids[0].clone()]);
+        assert_eq!(g.status_of(g.manifest.get(&ids[1]).unwrap()), ViewStatus::Queued);
+        drop(g);
+        assert_eq!(saved_queue(&reopened), vec![ids[1].clone(), ids[0].clone()]);
     }
 
     #[test]

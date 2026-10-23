@@ -22,6 +22,10 @@ pub struct Manifest {
     pub min_app_version: Option<String>,
     #[serde(default)]
     pub entries: Vec<Entry>,
+    /// Ids waiting to be processed and the one being processed, in order,
+    /// so the queue survives a restart. An id leaves when its job ends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<String>,
 }
 
 fn schema_v1() -> u32 {
@@ -35,6 +39,7 @@ impl Default for Manifest {
             schema_version: SCHEMA_VERSION,
             min_app_version: Some(MIN_APP_VERSION.to_string()),
             entries: Vec::new(),
+            queue: Vec::new(),
         }
     }
 }
@@ -100,6 +105,8 @@ fn sanitize(manifest: &mut Manifest) {
         }
         ok
     });
+    let mut queued = HashSet::new();
+    manifest.queue.retain(|id| is_valid_id(id) && queued.insert(id.clone()));
     for e in &mut manifest.entries {
         truncate(&mut e.title);
         truncate(&mut e.source_url);

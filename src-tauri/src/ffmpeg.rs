@@ -166,7 +166,8 @@ fn parse_times(out: &str) -> Vec<f64> {
 }
 
 /// The last keyframe at or before `t` (relative; 0 if none is found).
-pub async fn keyframe_at_or_before(video_path: &Path, t: f64) -> Result<f64, String> {
+#[cfg(test)]
+async fn keyframe_at_or_before(video_path: &Path, t: f64) -> Result<f64, String> {
     let st = file_start(video_path).await?;
     keyframe_before(video_path, st, t).await
 }

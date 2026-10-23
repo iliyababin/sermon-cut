@@ -24,6 +24,9 @@ this file in the same commit and say why.
    outputs is an explicit step taken under the per-video mutex.
 6. Outputs are replaced through the commit journal (`begin_commit` /
    `swap_in_outputs` / `recover_commit`), never by delete-then-rename.
+   A commit, once begun, runs to the end: a cancel then only says it came
+   too late (`Running::committing`). A job's work folder is its own
+   (`StagingDir`, unique per run) and goes when the job ends.
 
 ## Thumbnails
 

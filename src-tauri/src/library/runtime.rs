@@ -45,6 +45,33 @@ struct Running {
     message: String,
     cancel: CancellationToken,
     previous: EntryStatus,
+    /// Its outputs are being swapped in. A commit always runs to the end:
+    /// a cancel now only sets `late_cancel`.
+    committing: bool,
+    late_cancel: bool,
+}
+
+/// What a cancel that came during the commit says.
+pub const LATE_CANCEL: &str = "Cancel came too late — processing finished; your earlier review edits were kept.";
+
+/// A job's work folder, unique to one run (so nothing left running by a
+/// cancelled run can write into the next one's), deleted when the job ends
+/// however it ends.
+struct StagingDir(PathBuf);
+
+impl StagingDir {
+    fn create(paths: &LibraryPaths, id: &str) -> Result<Self, String> {
+        paths.ensure_dir(&paths.tmp_dir())?;
+        let dir = paths.tmp_dir().join(format!("job-{}-{}", id, &super::new_id()[..8]));
+        std::fs::create_dir(&dir).map_err(|e| format!("Failed to create work folder: {}", e))?;
+        Ok(StagingDir(dir))
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -600,6 +627,15 @@ fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
             manifest::prune_renders(&dir, &manifest::load_video_data(&dir));
         }
     }
+}
+
+/// What a processing job made, for `commit_job`.
+struct JobOutputs {
+    trimmed_name: String,
+    start: f64,
+    end: f64,
+    thumb_names: Vec<String>,
+    duration: f64,
 }
 
 /// Where a commit keeps a video's previous outputs (and video.json) until
@@ -1482,9 +1518,13 @@ impl Library {
     pub fn cancel(&self, id: &str) -> Result<(), String> {
         let mut g = self.inner();
         g.queue.retain(|q| q != id);
-        if let Some(r) = g.running.as_ref().filter(|r| r.id == id) {
+        if let Some(r) = g.running.as_mut().filter(|r| r.id == id) {
             // Leaves the saved queue when the job has stopped (finish_job).
-            r.cancel.cancel();
+            if r.committing {
+                r.late_cancel = true;
+            } else {
+                r.cancel.cancel();
+            }
         } else if g.manifest.queue.iter().any(|q| q == id) {
             g.manifest.queue.retain(|q| q != id);
             g.save_logged();
@@ -1530,6 +1570,8 @@ impl Library {
                 message: "Starting...".into(),
                 cancel: token.clone(),
                 previous,
+                committing: false,
+                late_cancel: false,
             });
             g.save_logged();
             return Some((id, token));
@@ -1540,13 +1582,15 @@ impl Library {
     /// Record how the running job ended (None: cancelled). A failed
     /// re-process of a video that already had results keeps them (run_job
     /// only replaces them when it succeeds) and its status, with the error
-    /// shown on its card.
-    fn finish_job(&self, id: &str, result: &Option<Result<(), String>>) {
-        let staging = {
+    /// shown on its card. Returns a notice for a cancel that came during
+    /// the commit, too late to stop it. The job's work folder is already
+    /// gone (`StagingDir`).
+    fn finish_job(&self, id: &str, result: &Option<Result<(), String>>) -> Option<&'static str> {
+        {
             let mut g = self.inner();
             let running = g.running.take();
+            let late = running.as_ref().is_some_and(|r| r.late_cancel) && matches!(result, Some(Ok(())));
             let previous = running.map(|r| r.previous).unwrap_or(EntryStatus::New);
-            let staging = g.paths.as_ref().map(|p| p.tmp_dir().join(format!("job-{}", id)));
             g.manifest.queue.retain(|q| q != id);
             if let Ok(e) = g.entry_mut(id) {
                 match result {
@@ -1569,10 +1613,7 @@ impl Library {
                 }
             }
             g.save_logged();
-            staging
-        };
-        if let Some(staging) = staging {
-            let _ = std::fs::remove_dir_all(staging);
+            late.then_some(LATE_CANCEL)
         }
     }
 
@@ -1589,7 +1630,11 @@ impl Library {
                 r = self.run_job(&app, &app_state, &id) => Some(r),
                 _ = token.cancelled() => None,
             };
-            self.finish_job(&id, &result);
+            // A job that saw the cancel itself (just before its commit).
+            let result = if token.is_cancelled() && !matches!(result, Some(Ok(()))) { None } else { result };
+            if let Some(notice) = self.finish_job(&id, &result) {
+                app_state.lock().await.notices.push(notice.to_string());
+            }
 
             if let Some(Ok(())) = &result {
                 let title = self.title_of(&id);
@@ -1633,10 +1678,8 @@ impl Library {
             return Err(FILE_CHANGED.into());
         }
 
-        paths.ensure_dir(&paths.tmp_dir())?;
-        let staging = paths.tmp_dir().join(format!("job-{}", id));
-        let _ = std::fs::remove_dir_all(&staging);
-        std::fs::create_dir(&staging).map_err(|e| format!("Failed to create work folder: {}", e))?;
+        let staging_dir = StagingDir::create(&paths, id)?;
+        let staging = staging_dir.0.clone();
         let video_dir = paths.ensure_video_dir(id)?;
 
         let cached = manifest::load_transcript(&video_dir).filter(|t| t.file_hash == expected.hash);
@@ -1718,18 +1761,44 @@ impl Library {
             return Err("The file changed while it was being processed, so the results were thrown away. Try again once it has finished copying.".into());
         }
 
-        // Commit: swap the new outputs in and mark the video ready. Nothing
-        // else writes this folder while the video is processing (reviews,
-        // renders and thumbnail edits are refused), so the swap runs
-        // without the library lock.
+        let outputs = JobOutputs { trimmed_name, start, end, thumb_names, duration };
+        self.commit_job(id, &video_dir, &staging, &expected.hash, outputs, || {}).await?;
+        drop(staging_dir);
+        self.set_progress(app, id, ProcessingStage::Complete, 100.0, "Processing complete!");
+        Ok(())
+    }
+
+    /// Swap a job's outputs in and mark the video ready. Nothing else
+    /// writes this folder while the video is processing (reviews, renders
+    /// and thumbnail edits are refused), so the swap runs without the
+    /// library lock. Once it has begun it runs to the end: a cancel then
+    /// only says it came too late (see `cancel`). The review typed so far
+    /// is kept. `before_swap` runs once the commit can no longer be
+    /// cancelled (tests cancel there).
+    async fn commit_job(
+        &self,
+        id: &str,
+        video_dir: &Path,
+        staging: &Path,
+        hash: &str,
+        outputs: JobOutputs,
+        before_swap: impl FnOnce(),
+    ) -> Result<(), String> {
         {
-            let g = self.inner();
+            let mut g = self.inner();
             g.writable()?;
-            if g.entry(id)?.fingerprint.hash != expected.hash {
+            if g.entry(id)?.fingerprint.hash != hash {
                 return Err(FILE_CHANGED.into());
             }
+            let running = g.running.as_mut().filter(|r| r.id == id).ok_or("Cancelled")?;
+            if running.cancel.is_cancelled() {
+                return Err("Cancelled".into());
+            }
+            running.committing = true;
         }
-        let dir = video_dir.clone();
+        before_swap();
+        let JobOutputs { trimmed_name, start, end, thumb_names, duration } = outputs;
+        let (dir, staging) = (video_dir.to_path_buf(), staging.to_path_buf());
         blocking(move || {
             let old = manifest::load_video_data(&dir);
             let data = VideoData {
@@ -1738,27 +1807,18 @@ impl Library {
                 trim_end: Some(end),
                 selected_source: thumb_names.first().cloned(),
                 thumbnail_options: thumb_names,
-                review: Review {
-                    title: None,
-                    description: None,
-                    preacher: old.review.preacher,
-                    single_line: old.review.single_line,
-                },
+                review: old.review,
                 ..Default::default()
             };
             swap_in_outputs(&dir, &staging, || manifest::save_video_data(&dir, &data))
         })
         .await??;
-        {
-            let mut g = self.inner();
-            let e = g.entry_mut(id)?;
-            e.status = EntryStatus::ReadyForReview;
-            e.error = None;
-            e.duration = Some(duration);
-            g.save()?;
-        }
-        self.set_progress(app, id, ProcessingStage::Complete, 100.0, "Processing complete!");
-        Ok(())
+        let mut g = self.inner();
+        let e = g.entry_mut(id)?;
+        e.status = EntryStatus::ReadyForReview;
+        e.error = None;
+        e.duration = Some(duration);
+        g.save()
     }
 
     // -----------------------------------------------------------------------
@@ -3307,6 +3367,8 @@ mod tests {
                 message: String::new(),
                 cancel: CancellationToken::new(),
                 previous: EntryStatus::New,
+                committing: false,
+                late_cancel: false,
             });
             g.queue.push_back("ahead".into());
             g.queue.push_back(id.clone());
@@ -3594,6 +3656,66 @@ mod tests {
         assert_eq!(saved_queue(&lib), vec![b.clone()]);
         lib.finish_job(&b, &None);
         assert!(saved_queue(&lib).is_empty());
+    }
+
+    /// A processing job of `id` at its commit, with a new cut and one
+    /// thumbnail staged.
+    async fn job_at_commit(lib: &Arc<Library>, id: &str) -> (StagingDir, JobOutputs, String) {
+        lib.enqueue(id).await.unwrap();
+        let (started, _token) = lib.start_next().unwrap();
+        assert_eq!(started, id);
+        let paths = lib.inner().paths.clone().unwrap();
+        let staging = StagingDir::create(&paths, id).unwrap();
+        std::fs::write(staging.0.join("trimmed.mp4"), b"new cut").unwrap();
+        std::fs::write(staging.0.join("thumbnail_option_9.jpg"), b"new").unwrap();
+        let hash = lib.inner().entry(id).unwrap().fingerprint.hash.clone();
+        let outputs = JobOutputs {
+            trimmed_name: "trimmed.mp4".into(),
+            start: 1.5,
+            end: 9.0,
+            thumb_names: vec!["thumbnail_option_9.jpg".into()],
+            duration: 60.0,
+        };
+        (staging, outputs, hash)
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_commit_comes_too_late() {
+        let (_t, lib, id, dir) = processed_library();
+        let mut data = manifest::load_video_data(&dir);
+        data.review.title = Some("Typed earlier".into());
+        manifest::save_video_data(&dir, &data).unwrap();
+        let (staging, outputs, hash) = job_at_commit(&lib, &id).await;
+
+        lib.commit_job(&id, &dir, &staging.0, &hash, outputs, || lib.cancel(&id).unwrap()).await.unwrap();
+        let token = lib.inner().running.as_ref().unwrap().cancel.clone();
+        assert!(!token.is_cancelled(), "the commit isn't interrupted");
+        let staged = staging.0.clone();
+        drop(staging);
+        assert!(!staged.exists(), "the work folder goes with the job");
+        assert_eq!(lib.finish_job(&id, &Some(Ok(()))), Some(LATE_CANCEL));
+
+        let d = lib.detail(&id).unwrap();
+        assert_eq!(d.video.status, ViewStatus::ReadyForReview);
+        assert_eq!((d.trim_start, d.trim_end), (Some(1.5), Some(9.0)));
+        assert_eq!(std::fs::read(dir.join("trimmed.mp4")).unwrap(), b"new cut");
+        assert_eq!(d.review.title.as_deref(), Some("Typed earlier"), "review edits are kept");
+        assert!(!dir.join(COMMIT_BACKUP).exists());
+        assert!(lib.inner().manifest.queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_before_the_commit_changes_nothing() {
+        let (_t, lib, id, dir) = processed_library();
+        let (staging, outputs, hash) = job_at_commit(&lib, &id).await;
+        lib.cancel(&id).unwrap();
+        assert!(lib.commit_job(&id, &dir, &staging.0, &hash, outputs, || panic!("not committed")).await.is_err());
+        drop(staging);
+        assert_eq!(lib.finish_job(&id, &None), None);
+        let d = lib.detail(&id).unwrap();
+        assert_eq!(d.video.status, ViewStatus::ReadyForReview);
+        assert!(!dir.join("trimmed.mp4").exists());
+        assert_eq!(d.trim_start, None);
     }
 
     #[test]

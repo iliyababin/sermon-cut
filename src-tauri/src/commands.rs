@@ -110,12 +110,17 @@ pub fn path_allowed(path: &Path, roots: &[PathBuf], picked: bool, access: Access
 /// were given (docs/INVARIANTS.md #11).
 pub fn check_path(app_handle: &AppHandle, lib: &LibraryHandle, path: &str, access: Access) -> Result<PathBuf, String> {
     use tauri_plugin_fs::FsExt;
-    let p = Path::new(path);
     let picked = app_handle
         .try_fs_scope()
-        .is_some_and(|scope| scope.is_allowed(p));
-    let roots = allowed_roots(lib.root(), app_handle.path().app_data_dir().ok(), access);
-    allowed_path(p, &roots, picked, access)
+        .is_some_and(|scope| scope.is_allowed(Path::new(path)));
+    check_path_in(lib.root(), app_handle.path().app_data_dir().ok(), picked, path, access)
+}
+
+/// `check_path` given the library's folder, the app's data folder and
+/// whether the user picked `path`.
+pub fn check_path_in(library_root: Option<PathBuf>, app_data: Option<PathBuf>, picked: bool, path: &str, access: Access) -> Result<PathBuf, String> {
+    let roots = allowed_roots(library_root, app_data, access);
+    allowed_path(Path::new(path), &roots, picked, access)
         .ok_or_else(|| format!("Sermon Cut can only use files in its own folders or ones you chose: {}", path))
 }
 
@@ -636,15 +641,25 @@ pub async fn crop_standalone_thumbnail(
     crop_rect: crate::thumbnail::CropRect,
 ) -> Result<String, String> {
     // Usually a picked image; the dialog adds picks to the fs scope.
-    let source = check_path(&app_handle, &lib, &source_image_path, Access::Data)?;
-    let dir = standalone_dir(&app_handle)?;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    let check = |p: &str| check_path(&app_handle, &lib, p, Access::Data);
+    crop_standalone_with(check, &standalone_dir(&app_handle)?, &source_image_path, &crop_rect).await
+}
+
+/// `crop_standalone_thumbnail` into `dir`, with `check` deciding whether
+/// the source may be read (and where it really is).
+async fn crop_standalone_with(
+    check: impl FnOnce(&str) -> Result<PathBuf, String>,
+    dir: &Path,
+    source_image_path: &str,
+    crop_rect: &crate::thumbnail::CropRect,
+) -> Result<String, String> {
+    let source = check(source_image_path)?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let _ = std::fs::remove_file(e.path());
         }
     }
-    crate::thumbnail::process_custom_thumbnail(&source, &dir, &crop_rect, false)
-        .await
+    crate::thumbnail::process_custom_thumbnail(&source, dir, crop_rect, false).await
 }
 
 /// Save a thumbnail rendered in the Thumbnail tab, as a JPEG within
@@ -936,6 +951,37 @@ mod tests {
             std::os::unix::fs::symlink(lib.join("state.json"), lib.join("logo.png")).unwrap();
             assert!(!path_allowed(&lib.join("logo.png"), &data, false, Access::Data));
         }
+    }
+
+    fn png_at(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbImage::new(8, 8).save(path).unwrap();
+    }
+
+    /// Regression (55e4d3b): the standalone crop reads only the app's files
+    /// or a picked image, and a refused one changes nothing.
+    #[tokio::test]
+    async fn the_standalone_crop_reads_only_allowed_images() {
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let (lib, data, out) = (tmp.path().join("lib"), tmp.path().join("data"), tmp.path().join("data").join(STANDALONE_DIR));
+        let photo = tmp.path().join("Pictures/pastor.png");
+        png_at(&photo);
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("earlier.jpg"), b"kept").unwrap();
+        let rect = crate::thumbnail::CropRect { x: 0, y: 0, width: 8, height: 8 };
+        let check = |picked: bool| {
+            let (lib, data) = (lib.clone(), data.clone());
+            move |p: &str| check_path_in(Some(lib), Some(data), picked, p, Access::Data)
+        };
+        let photo_str = photo.to_string_lossy().to_string();
+
+        let err = crop_standalone_with(check(false), &out, &photo_str, &rect).await.unwrap_err();
+        assert!(err.contains("only use files in its own folders"), "{err}");
+        assert!(out.join("earlier.jpg").exists(), "refused before anything was cleared");
+
+        let made = crop_standalone_with(check(true), &out, &photo_str, &rect).await.unwrap();
+        assert!(Path::new(&made).starts_with(&out));
+        assert!(!out.join("earlier.jpg").exists());
     }
 
     #[test]

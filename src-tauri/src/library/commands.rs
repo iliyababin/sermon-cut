@@ -146,10 +146,24 @@ pub async fn process_custom_thumbnail(
 ) -> Result<String, String> {
     // A picked image (the dialog adds picks to the fs scope) or one of the
     // video's own.
-    let source = crate::commands::check_path(&app_handle, &lib, &source_image_path, crate::commands::Access::Data)?;
-    let result = lib.custom_thumbnail(&video_id, source, crop_rect, apply_color_grading).await;
+    let check = |p: &str| crate::commands::check_path(&app_handle, &lib, p, crate::commands::Access::Data);
+    let result = custom_thumbnail_checked(&lib, check, &video_id, &source_image_path, crop_rect, apply_color_grading).await;
     changed(&app_handle);
     result
+}
+
+/// `process_custom_thumbnail`, with `check` deciding whether the source may
+/// be read (and where it really is).
+pub(crate) async fn custom_thumbnail_checked(
+    lib: &Arc<Library>,
+    check: impl FnOnce(&str) -> Result<PathBuf, String>,
+    video_id: &str,
+    source_image_path: &str,
+    crop_rect: CropRect,
+    apply_color_grading: bool,
+) -> Result<String, String> {
+    let source = check(source_image_path)?;
+    lib.custom_thumbnail(video_id, source, crop_rect, apply_color_grading).await
 }
 
 /// Cut the video again at new points; resolves with where the cut really

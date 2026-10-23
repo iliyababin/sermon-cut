@@ -3235,6 +3235,89 @@ mod tests {
         assert_eq!(v.uploads[0].video_id.as_deref(), Some("abc"));
     }
 
+    /// Regression (55e4d3b): a custom thumbnail is cut only from the video's
+    /// own images or a picked one.
+    #[tokio::test]
+    async fn a_custom_thumbnail_reads_only_allowed_images() {
+        let (_t, lib, id, dir) = processed_library();
+        // Not under the temp folder, which the app may use.
+        let elsewhere = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = elsewhere.path().join("Pictures/pastor.png");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, png()).unwrap();
+        std::fs::write(dir.join("thumbnail_option_1_raw.jpg"), png()).unwrap();
+        let rect = crate::thumbnail::CropRect { x: 0, y: 0, width: 4, height: 4 };
+        let root = lib.root();
+        let check = |picked: bool| {
+            let root = root.clone();
+            move |p: &str| crate::commands::check_path_in(root, None, picked, p, crate::commands::Access::Data)
+        };
+        let custom = super::super::commands::custom_thumbnail_checked;
+        let options = || manifest::load_video_data(&dir).thumbnail_options;
+        let before = options();
+
+        let err = custom(&lib, check(false), &id, &outside.to_string_lossy(), rect.clone(), false).await.unwrap_err();
+        assert!(err.contains("only use files in its own folders"), "{err}");
+        assert_eq!(options(), before, "nothing added");
+        assert!(lib.inner().busy.is_empty());
+
+        // The video's own option, cropped again: allowed.
+        let own = dir.join("thumbnail_option_1_raw.jpg");
+        let made = custom(&lib, check(false), &id, &own.to_string_lossy(), rect.clone(), false).await.unwrap();
+        assert_eq!(options()[0], Path::new(&made).file_name().unwrap().to_string_lossy());
+        // A picked image: allowed.
+        custom(&lib, check(true), &id, &outside.to_string_lossy(), rect, false).await.unwrap();
+    }
+
+    struct OneToken;
+    impl crate::upload::TokenSource for OneToken {
+        fn token(&self) -> futures::future::BoxFuture<'_, Result<String, crate::upload::UploadError>> {
+            Box::pin(async { Ok("tok1".to_string()) })
+        }
+        fn refresh(&self) -> futures::future::BoxFuture<'_, Result<String, crate::upload::UploadError>> {
+            Box::pin(async { Ok("tok1".to_string()) })
+        }
+    }
+
+    /// Regression (adaa7fc): the app quits while the captions go up, after
+    /// the video itself is on YouTube. library.json must already have the
+    /// upload and no session, so the next Upload can't send it again. Runs
+    /// the real uploader against the mock YouTube.
+    #[tokio::test]
+    async fn quitting_during_the_post_upload_steps_keeps_the_upload_recorded() {
+        let (_t, lib, id, _dir) = processed_library();
+        let server = crate::upload::test_server::MockServer::start().await;
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        let options = public();
+        let store = EntrySession { lib: &lib, id: &id, options: &options };
+        let cfg = crate::upload::UploadConfig { endpoints: crate::upload::Endpoints::at(&server.base), ..Default::default() };
+        let video = crate::upload::client::VideoUpload {
+            path: &job.video_path,
+            file_hash: &job.file_hash,
+            metadata: serde_json::json!({"snippet": {"title": "Sermon"}, "status": {"privacyStatus": "public"}}),
+        };
+        let after = crate::upload::AfterUpload {
+            captions: Some("1\n00:00:00,000 --> 00:00:01,000\nhi\n".into()),
+            ..Default::default()
+        };
+        let http = crate::upload::http_client();
+        let run = crate::upload::run(&http, &cfg, &OneToken, &store, &job.cancel, &video, &after, &|_, _| {});
+        tokio::select! {
+            r = run => panic!("the upload should be stopped during its captions: {:?}", r.map(|o| o.video_id)),
+            // The quit: the upload's future is dropped, nothing else runs.
+            _ = server.wait_until(|s| s.captions >= 1) => {}
+        }
+        drop(job);
+
+        let root = lib.root().unwrap();
+        let reopened = Library::new(root.to_string_lossy().to_string());
+        reopened.open_blocking(true);
+        assert_eq!(reopened.upload_session(&id), None);
+        let v = reopened.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.uploads.iter().filter_map(|u| u.video_id.as_deref()).collect::<Vec<_>>(), ["vid1"]);
+        assert_eq!(server.with(|s| s.creates), 1);
+    }
+
     #[test]
     fn a_finished_upload_is_recorded_before_the_post_upload_steps() {
         let (_t, lib, id, _dir) = processed_library();

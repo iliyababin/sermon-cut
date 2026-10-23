@@ -121,7 +121,7 @@ fn main() {
     let app_state = AppState::load();
     let settings = app_state.settings.clone();
     let app_state = Arc::new(Mutex::new(app_state));
-    let library = Library::new(settings.library_folder());
+    let library = Library::new(settings.library_folder_or_default());
 
     let app = tauri::Builder::default()
         // First: a second copy would write the same library.json.

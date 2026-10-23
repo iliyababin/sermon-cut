@@ -101,8 +101,10 @@ pub struct YouTubeAuth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub download_quality: String,
-    /// The library folder (named before the library existed).
-    pub output_folder: String,
+    /// The library folder. Saved as "output_folder" (its name before the
+    /// library existed), so v0.4.0 and the webview read it as before.
+    #[serde(rename = "output_folder")]
+    pub library_folder: String,
     pub modal_api_url: String,
     pub modal_api_key: Option<String>,
     #[serde(default)]
@@ -165,7 +167,8 @@ pub const UPLOAD_PRIVACIES: [&str; 3] = ["public", "unlisted", "private"];
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsView {
     pub download_quality: String,
-    pub output_folder: String,
+    #[serde(rename = "output_folder")]
+    pub library_folder: String,
     pub modal_api_url: String,
     pub modal_api_key: Option<String>,
     pub logo_path: Option<String>,
@@ -186,8 +189,8 @@ pub struct SettingsView {
 pub struct SettingsPatch {
     #[serde(default)]
     pub download_quality: Option<String>,
-    #[serde(default)]
-    pub output_folder: Option<String>,
+    #[serde(default, rename = "output_folder")]
+    pub library_folder: Option<String>,
     #[serde(default)]
     pub modal_api_url: Option<String>,
     #[serde(default)]
@@ -213,7 +216,7 @@ impl SettingsPatch {
         // listed in `fields!` too.
         let SettingsPatch {
             download_quality: _,
-            output_folder: _,
+            library_folder: _,
             modal_api_url: _,
             modal_api_key: _,
             logo_path: _,
@@ -234,7 +237,7 @@ impl SettingsPatch {
                 }
             )*};
         }
-        fields!(download_quality, output_folder, modal_api_url, modal_api_key, logo_path, youtube_playlist_id, auto_process);
+        fields!(download_quality, library_folder, modal_api_url, modal_api_key, logo_path, youtube_playlist_id, auto_process);
         left
     }
 }
@@ -266,7 +269,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             download_quality: "best".to_string(),
-            output_folder: default_library_dir(),
+            library_folder: default_library_dir(),
             modal_api_url: DEFAULT_MODAL_API_URL.to_string(),
             modal_api_key: None,
             logo_path: None,
@@ -285,7 +288,7 @@ impl Settings {
         let auth = self.youtube_auth.as_ref();
         SettingsView {
             download_quality: self.download_quality.clone(),
-            output_folder: self.output_folder.clone(),
+            library_folder: self.library_folder.clone(),
             modal_api_url: self.modal_api_url.clone(),
             modal_api_key: self.modal_api_key.clone(),
             logo_path: self.logo_path.clone(),
@@ -332,11 +335,12 @@ impl Settings {
         }
     }
 
-    pub fn library_folder(&self) -> String {
-        if self.output_folder.trim().is_empty() {
+    /// The library folder, or the default one when none is set.
+    pub fn library_folder_or_default(&self) -> String {
+        if self.library_folder.trim().is_empty() {
             default_library_dir()
         } else {
-            self.output_folder.clone()
+            self.library_folder.clone()
         }
     }
 }
@@ -818,6 +822,21 @@ mod tests {
     #[should_panic(expected = "AppState::for_test")]
     fn a_test_state_without_a_file_never_reaches_the_real_one() {
         let _ = AppState::default().save();
+    }
+
+    #[test]
+    fn the_library_folder_keeps_its_old_name_on_disk_and_in_the_webview() {
+        let mut settings = Settings::default();
+        settings.library_folder = "/Volumes/Media/Sermons".into();
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["output_folder"], "/Volumes/Media/Sermons");
+        assert!(json.get("library_folder").is_none());
+        assert_eq!(serde_json::to_value(settings.view()).unwrap()["output_folder"], "/Volumes/Media/Sermons");
+        // As v0.4.0 wrote it.
+        let back: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.library_folder, "/Volumes/Media/Sermons");
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({"output_folder": "/x"})).unwrap();
+        assert_eq!(patch.library_folder.as_deref(), Some("/x"));
     }
 
     #[test]

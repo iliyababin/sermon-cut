@@ -195,29 +195,29 @@ where
         let mut next = s.settings.clone();
         next.apply(&patch);
         let new_folder = patch
-            .output_folder
+            .library_folder
             .as_ref()
             .map(|f| f.trim().to_string())
-            .filter(|f| *f != s.settings.output_folder);
+            .filter(|f| *f != s.settings.library_folder);
         if let Some(folder) = &new_folder {
-            next.output_folder = folder.clone();
+            next.library_folder = folder.clone();
             // Only a newly chosen folder is checked: one already in use
             // keeps opening whatever the rules say now.
-            crate::library::commands::check_new_library_folder(&next.library_folder())?;
-            check_switch(&next.library_folder())?;
+            crate::library::commands::check_new_library_folder(&next.library_folder_or_default())?;
+            check_switch(&next.library_folder_or_default())?;
         }
         let previous = std::mem::replace(&mut s.settings, next);
         if let Err(e) = s.save() {
             s.settings = previous;
             return Err(e);
         }
-        (previous.output_folder, new_folder.map(|_| s.settings.library_folder()))
+        (previous.library_folder, new_folder.map(|_| s.settings.library_folder_or_default()))
     };
 
     if let Some(target) = new_folder {
         if let Err(e) = switch(target).await {
             let mut s = state.lock().await;
-            s.settings.output_folder = old_folder;
+            s.settings.library_folder = old_folder;
             if let Err(save_err) = s.save() {
                 eprintln!("[settings] Failed to restore the library folder: {}", save_err);
             }
@@ -236,7 +236,7 @@ pub async fn reset_state(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let settings = Settings::default();
-    lib.switch(settings.library_folder()).await?;
+    lib.switch(settings.library_folder_or_default()).await?;
     allow_user_paths(&app_handle, lib.root().as_deref(), &settings);
     let mut state = state.lock().await;
     state.settings = settings;
@@ -643,7 +643,7 @@ mod tests {
 
     fn state_with_auth() -> AppStateHandle {
         let mut s = AppState::for_test();
-        s.settings.output_folder = "/old".into();
+        s.settings.library_folder = "/old".into();
         s.settings.upload_privacy = "private".into();
         s.settings.youtube_auth = Some(YouTubeAuth {
             refresh_token: Some("r".into()),
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(err, "busy");
         assert_eq!(seen.lock().unwrap().as_deref(), Some("/new"));
         let s = state.lock().await;
-        assert_eq!(s.settings.output_folder, "/old");
+        assert_eq!(s.settings.library_folder, "/old");
         // Other edits in the same save still apply.
         assert_eq!(s.settings.download_quality, "480p");
     }
@@ -1039,7 +1039,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, "wait");
         let s = state.lock().await;
-        assert_eq!(s.settings.output_folder, "/old");
+        assert_eq!(s.settings.library_folder, "/old");
         assert_eq!(s.settings.download_quality, "best");
     }
 
@@ -1057,14 +1057,14 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("can't be the library folder"), "{err}");
-        assert_eq!(state.lock().await.settings.output_folder, "/old");
+        assert_eq!(state.lock().await.settings.library_folder, "/old");
 
         // Already set to a folder the rules now refuse: other edits still save.
-        state.lock().await.settings.output_folder = "/".into();
+        state.lock().await.settings.library_folder = "/".into();
         let view = apply_settings_patch(&state, patch(serde_json::json!({"output_folder": "/", "download_quality": "720p"})), "e", 2, |_| Ok(()), |_| async { panic!("must not switch") })
             .await
             .unwrap();
         assert_eq!(view.download_quality, "720p");
-        assert_eq!(state.lock().await.settings.output_folder, "/");
+        assert_eq!(state.lock().await.settings.library_folder, "/");
     }
 }

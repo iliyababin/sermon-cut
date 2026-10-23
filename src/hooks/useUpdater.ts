@@ -1,6 +1,7 @@
-import { useState, useCallback } from "react";
+import { createContext, useCallback, useContext, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { beginUpdate, endUpdate, errorMessage } from "@/lib/tauri";
 
 interface UpdaterState {
   checked: boolean;
@@ -12,7 +13,19 @@ interface UpdaterState {
   error: string | null;
 }
 
-export function useUpdater() {
+export type Updater = ReturnType<typeof useUpdaterState>;
+
+/** The one updater App creates, shared by the sidebar and Settings. */
+export const UpdaterContext = createContext<Updater | null>(null);
+
+export function useUpdater(): Updater {
+  const updater = useContext(UpdaterContext);
+  if (!updater) throw new Error("useUpdater needs an UpdaterContext provider");
+  return updater;
+}
+
+/** The updater's state; App creates it once and shares it via context. */
+export function useUpdaterState() {
   const [state, setState] = useState<UpdaterState>({
     checked: false,
     checking: false,
@@ -60,6 +73,14 @@ export function useUpdater() {
   const downloadAndInstall = useCallback(async () => {
     if (!update) return;
     setState((s) => ({ ...s, downloading: true, progress: 0, error: null }));
+    // Refused while something is processing, uploading or downloading;
+    // otherwise nothing new can start until the relaunch.
+    try {
+      await beginUpdate();
+    } catch (err) {
+      setState((s) => ({ ...s, downloading: false, error: errorMessage(err) }));
+      return;
+    }
     try {
       let totalBytes = 0;
       let downloadedBytes = 0;
@@ -78,6 +99,7 @@ export function useUpdater() {
       });
       await relaunch();
     } catch (err) {
+      await endUpdate().catch(() => {});
       setState((s) => ({
         ...s,
         downloading: false,

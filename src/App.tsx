@@ -8,7 +8,7 @@ import { ThumbnailGenerator } from "./components/ThumbnailGenerator";
 import { getVideo, errorMessage } from "./lib/tauri";
 import type { LibraryVideo, VideoDetail } from "./lib/types";
 import { Download, Film, Settings as SettingsIcon, Clapperboard, ArrowUpCircle, Image } from "lucide-react";
-import { useUpdater } from "./hooks/useUpdater";
+import { UpdaterContext, useUpdaterState } from "./hooks/useUpdater";
 
 type View = "library" | "download" | "review" | "settings" | "thumbnail";
 
@@ -18,7 +18,7 @@ export default function App() {
   // Bumped on every open so the review screen starts fresh from saved data.
   const [reviewKey, setReviewKey] = useState(0);
   const [appVersion, setAppVersion] = useState("");
-  const updater = useUpdater();
+  const updater = useUpdaterState();
 
   useEffect(() => {
     getVersion().then(setAppVersion);
@@ -42,6 +42,7 @@ export default function App() {
   };
 
   return (
+    <UpdaterContext.Provider value={updater}>
     <div className="flex h-screen bg-background">
       {/* Sidebar */}
       <aside className="w-64 border-r border-border bg-card flex flex-col">
@@ -120,6 +121,7 @@ export default function App() {
         </div>
       </main>
     </div>
+    </UpdaterContext.Provider>
   );
 }
 

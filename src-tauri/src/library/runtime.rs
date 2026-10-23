@@ -22,6 +22,8 @@ pub type AppStateHandle = Arc<tokio::sync::Mutex<AppState>>;
 const SWITCH_BUSY: &str = "Wait for processing, downloads and uploads to finish before changing the library folder.";
 
 const UPDATING_LIBRARY: &str = "Updating library…";
+/// While an app update installs.
+const UPDATING: &str = "Sermon Cut is updating… It will restart in a moment.";
 
 const FILE_CHANGED: &str =
     "The file changed since it was added. If it's still copying, wait for it to finish, then try again.";
@@ -79,6 +81,9 @@ struct Inner {
     /// Video folders whose entries were lost, by file hash; a scan that
     /// finds their video gives the new entry the folder back.
     orphans: std::collections::HashMap<String, Orphan>,
+    /// An app update is being installed: no new work may start, since the
+    /// app relaunches when it's done.
+    updating: bool,
 }
 
 pub struct Library {
@@ -287,6 +292,31 @@ impl Inner {
                 eprintln!("[library] Failed to save library.json: {}", e);
             }
         }
+    }
+
+    fn require_not_updating(&self) -> Result<(), String> {
+        if self.updating {
+            return Err(UPDATING.into());
+        }
+        Ok(())
+    }
+
+    /// What would be lost by quitting now, for the quit warning.
+    fn work_in_progress(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.uploads.is_empty() {
+            parts.push(match self.uploads.len() {
+                1 => "a YouTube upload".to_string(),
+                n => format!("{} YouTube uploads", n),
+            });
+        }
+        if self.running.is_some() || !self.queue.is_empty() {
+            parts.push("video processing".to_string());
+        }
+        if !self.downloads.is_empty() {
+            parts.push("a download".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join(" and "))
     }
 
     fn is_busy(&self, id: &str) -> bool {
@@ -707,6 +737,7 @@ impl Library {
                 session: super::new_id(),
                 notice: None,
                 orphans: std::collections::HashMap::new(),
+                updating: false,
             }),
             scan_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
@@ -1144,6 +1175,7 @@ impl Library {
     pub async fn enqueue(self: &Arc<Self>, id: &str) -> Result<(), String> {
         let (path, expected) = {
             let g = self.inner();
+            g.require_not_updating()?;
             let paths = g.writable()?;
             let e = g.entry(id)?;
             if g.is_busy(id) {
@@ -1172,6 +1204,7 @@ impl Library {
         }
 
         let mut g = self.inner();
+        g.require_not_updating()?;
         if g.is_busy(id) {
             return Err("This video is already queued or processing".into());
         }
@@ -1550,6 +1583,7 @@ impl Library {
     /// the returned guard is dropped.
     fn begin_op(&self, id: &str) -> Result<(BusyGuard<'_>, LibraryPaths, Entry, VideoData), String> {
         let (paths, e, data) = self.with_entry(id, |g, paths| {
+            g.require_not_updating()?;
             g.require_idle(id)?;
             let e = g.entry(id)?.clone();
             let data = manifest::load_video_data(&paths.video_dir(id)?);
@@ -1854,21 +1888,27 @@ impl Library {
 
     /// What would be lost by quitting now, for the quit warning.
     pub fn work_in_progress(&self) -> Option<String> {
-        let g = self.inner();
-        let mut parts = Vec::new();
-        if !g.uploads.is_empty() {
-            parts.push(match g.uploads.len() {
-                1 => "a YouTube upload".to_string(),
-                n => format!("{} YouTube uploads", n),
-            });
+        self.inner().work_in_progress()
+    }
+
+    /// Before installing an app update: refused while anything is running,
+    /// otherwise no new processing, upload or download starts until
+    /// `end_update` (or the relaunch).
+    pub fn begin_update(&self) -> Result<(), String> {
+        let mut g = self.inner();
+        if let Some(work) = g.work_in_progress() {
+            return Err(format!(
+                "Sermon Cut is still working on {}. Update when it has finished (or cancel it first).",
+                work
+            ));
         }
-        if g.running.is_some() || !g.queue.is_empty() {
-            parts.push("video processing".to_string());
-        }
-        if !g.downloads.is_empty() {
-            parts.push("a download".to_string());
-        }
-        (!parts.is_empty()).then(|| parts.join(" and "))
+        g.updating = true;
+        Ok(())
+    }
+
+    /// The update failed: work may start again.
+    pub fn end_update(&self) {
+        self.inner().updating = false;
     }
 
     pub fn reveal_path(&self, id: &str) -> Result<PathBuf, String> {
@@ -1921,6 +1961,7 @@ impl Library {
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let paths = {
             let mut g = self.inner();
+            g.require_not_updating()?;
             let paths = g.writable()?.clone();
             g.downloads.push(DownloadItem {
                 job_id: job_id.clone(),
@@ -2303,6 +2344,26 @@ mod tests {
         assert_eq!(v.status, ViewStatus::Done);
         assert_eq!(v.uploads.len(), 1);
         assert!(!v.busy);
+    }
+
+    #[tokio::test]
+    async fn update_is_refused_while_busy_and_blocks_new_work() {
+        let (_t, lib, id, _dir) = processed_library();
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        let err = lib.begin_update().unwrap_err();
+        assert!(err.contains("a YouTube upload"), "{err}");
+        lib.finish_upload(&id, job, None, &public());
+
+        lib.begin_update().unwrap();
+        assert_eq!(lib.begin_upload(&id, None, None).err().as_deref(), Some(UPDATING));
+        assert_eq!(lib.enqueue(&id).await.unwrap_err(), UPDATING);
+        assert!(lib.inner().queue.is_empty());
+        assert!(lib.work_in_progress().is_none());
+
+        // A failed install lets work start again.
+        lib.end_update();
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        lib.finish_upload(&id, job, None, &public());
     }
 
     fn outcome(video_id: &str, warnings: Vec<UploadWarning>) -> UploadOutcome {

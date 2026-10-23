@@ -246,6 +246,20 @@ pub async fn download_video(
     Ok(id)
 }
 
+/// Called before an app update installs. Refused while anything is running;
+/// otherwise nothing new starts until the relaunch (or `end_update`).
+#[tauri::command]
+pub async fn begin_update(lib: State<'_, LibraryHandle>) -> Result<(), String> {
+    lib.begin_update()
+}
+
+/// The update didn't install: allow work again.
+#[tauri::command]
+pub async fn end_update(lib: State<'_, LibraryHandle>) -> Result<(), String> {
+    lib.end_update();
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn cancel_download(lib: State<'_, LibraryHandle>, video_id: String) -> Result<(), String> {
     lib.cancel_download(&video_id);

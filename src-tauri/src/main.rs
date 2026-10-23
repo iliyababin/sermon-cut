@@ -21,6 +21,9 @@ use tokio::sync::Mutex;
 
 /// Set once the user chose "Quit Anyway", so the exit that follows isn't asked about again.
 static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
+/// The quit dialog is showing: another ⌘Q or close waits for it instead of
+/// opening a second one.
+static ASKING: AtomicBool = AtomicBool::new(false);
 
 /// Before quitting mid-upload (or mid-processing/download), ask first.
 /// Returns true if quitting should wait for the user's answer.
@@ -31,6 +34,10 @@ fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
     let Some(work) = library.work_in_progress() else {
         return false;
     };
+    if ASKING.swap(true, Ordering::SeqCst) {
+        // Already asking; that answer decides.
+        return true;
+    }
     let app = app.clone();
     app.dialog()
         .message(format!(
@@ -43,6 +50,7 @@ fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
         .show({
             let app = app.clone();
             move |quit| {
+                ASKING.store(false, Ordering::SeqCst);
                 if quit {
                     QUIT_CONFIRMED.store(true, Ordering::SeqCst);
                     app.exit(0);
@@ -190,6 +198,8 @@ fn main() {
             library::commands::clear_library_data,
             library::commands::download_video,
             library::commands::cancel_download,
+            library::commands::begin_update,
+            library::commands::end_update,
             library::commands::youtube_upload_video,
             library::commands::cancel_upload,
             library::commands::retry_thumbnail,
@@ -200,6 +210,9 @@ fn main() {
 
     app.run(move |app, event| match event {
         // Anything else that asks the app to exit (e.g. closing the last window).
+        // A relaunch (after installing an update) goes through: no work can
+        // be running, since begin_update refused to start otherwise.
+        tauri::RunEvent::ExitRequested { code, .. } if code == Some(tauri::RESTART_EXIT_CODE) => {}
         tauri::RunEvent::ExitRequested { api, .. } => {
             if ask_before_quitting(app, &library) {
                 api.prevent_exit();

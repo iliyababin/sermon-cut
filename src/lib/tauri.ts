@@ -97,6 +97,16 @@ export async function downloadVideo(
   return invoke("download_video", { url, quality, process });
 }
 
+/** Before installing an app update; rejects while work is running. */
+export async function beginUpdate(): Promise<void> {
+  return invoke("begin_update");
+}
+
+/** The update didn't install: let work start again. */
+export async function endUpdate(): Promise<void> {
+  return invoke("end_update");
+}
+
 export async function cancelDownload(videoId: string): Promise<void> {
   return invoke("cancel_download", { videoId });
 }

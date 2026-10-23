@@ -166,8 +166,13 @@ impl Library {
     }
 
     /// Take the next queued video and mark it processing.
+    /// None while a reopen sweeps the folder: the worker waits, and the
+    /// sweep's end wakes it.
     pub(super) fn start_next(&self) -> Option<(String, CancellationToken)> {
         let mut g = self.inner();
+        if g.sweeping {
+            return None;
+        }
         while let Some(id) = g.queue.pop_front() {
             let Ok(e) = g.entry_mut(&id) else {
                 g.manifest.queue.retain(|q| *q != id);

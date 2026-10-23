@@ -19,6 +19,7 @@ impl Library {
         let paths = {
             let mut g = self.inner();
             g.require_not_updating()?;
+            g.require_not_sweeping()?;
             let paths = g.writable()?.clone();
             g.downloads.push(DownloadItem {
                 job_id: job_id.clone(),

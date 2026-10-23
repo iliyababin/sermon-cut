@@ -15,6 +15,14 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Marker in temp file names, so leftovers from a crash can be swept.
 pub const TMP_MARKER: &str = ".tmp-";
 
+/// A temp file (`write_atomic`, `move_file`) of this run of the app: one
+/// still being written, never a crash's leftover.
+pub fn is_own_tmp(name: &str) -> bool {
+    name.rsplit_once(TMP_MARKER)
+        .and_then(|(_, rest)| rest.split('-').next())
+        .is_some_and(|pid| pid == std::process::id().to_string())
+}
+
 /// Write a file so that a crash leaves either the old or the new contents,
 /// never half of one: write a temp file, flush it, rename it over the target.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {

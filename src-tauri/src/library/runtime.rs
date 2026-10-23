@@ -100,6 +100,9 @@ struct Running {
     late_cancel: bool,
 }
 
+/// Refused while a reopen sweeps the folder.
+pub const SWEEPING: &str = "The library is being reopened. Try again in a moment.";
+
 /// What a cancel that came during the commit says.
 pub const LATE_CANCEL: &str = "Cancel came too late — processing finished; your earlier review edits were kept.";
 
@@ -132,6 +135,9 @@ struct Inner {
     /// Busy entries whose folder is being deleted (a replaced file, a
     /// reset, forget or trash): a review saved now would bring it back.
     removing: HashSet<String>,
+    /// A reopen is sweeping the folder's temp files (see `open_blocking`):
+    /// nothing that makes temp files may start.
+    sweeping: bool,
     /// Template renders being written (see `save_rendered_thumbnail`); the
     /// open-time sweep would delete their temp files.
     rendering: usize,
@@ -320,6 +326,13 @@ impl Inner {
             && self.rendering == 0
     }
 
+    fn require_not_sweeping(&self) -> Result<(), String> {
+        if self.sweeping {
+            return Err(SWEEPING.into());
+        }
+        Ok(())
+    }
+
     fn require_not_updating(&self) -> Result<(), String> {
         if self.updating {
             return Err(UPDATING.into());
@@ -392,6 +405,7 @@ impl Inner {
     /// during an upload, but not while the video is (about to be) processed
     /// or its thumbnails are being regenerated.
     fn require_render_allowed(&self, id: &str) -> Result<(), String> {
+        self.require_not_sweeping()?;
         if self.queue.iter().any(|q| q == id) || self.running.as_ref().is_some_and(|r| r.id == id) {
             return Err("This video is being processed".into());
         }
@@ -424,6 +438,7 @@ impl Library {
                 running: None,
                 busy: HashSet::new(),
                 removing: HashSet::new(),
+                sweeping: false,
                 rendering: 0,
                 uploads: std::collections::HashMap::new(),
                 downloads: Vec::new(),
@@ -795,6 +810,7 @@ impl Library {
     fn mark_busy(&self, id: &str, check: impl FnOnce(&Inner) -> Result<(), String>) -> Result<(BusyGuard<'_>, LibraryPaths), String> {
         let paths = self.with_entry(id, |g, paths| {
             g.require_idle(id)?;
+            g.require_not_sweeping()?;
             check(g)?;
             g.busy.insert(id.to_string());
             Ok(paths.clone())
@@ -949,6 +965,7 @@ impl Library {
         let (paths, e) = self.with_entry(id, |g, paths| {
             g.require_not_updating()?;
             g.require_idle(id)?;
+            g.require_not_sweeping()?;
             let e = g.entry(id)?.clone();
             g.busy.insert(id.to_string());
             Ok((paths.clone(), e))

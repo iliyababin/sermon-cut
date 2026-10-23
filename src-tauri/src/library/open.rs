@@ -23,7 +23,10 @@ fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.contains(TMP_MARKER) || name.starts_with(manifest::RENDER_TMP_PREFIX) {
+            // A temp file of this run is a write in flight (a review or
+            // library.json being saved meanwhile), not a crash's leftover.
+            let leftover = name.contains(TMP_MARKER) && !fsutil::is_own_tmp(&name);
+            if leftover || name.starts_with(manifest::RENDER_TMP_PREFIX) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -33,6 +36,19 @@ fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
             let _v = hold(&lock);
             manifest::prune_renders(&dir, &manifest::load_video_data(&dir));
         }
+    }
+}
+
+/// Ends a reopen's sweep (`Inner::sweeping`), also on a panic, and lets
+/// the worker start a job that waited for it.
+struct SweepGuard<'a> {
+    lib: &'a Library,
+}
+
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        self.lib.inner().sweeping = false;
+        self.lib.wake.notify_one();
     }
 }
 
@@ -208,12 +224,17 @@ impl Library {
 
         // A reopen (lock regained, take over) can happen while this session
         // still has work going; that work's files and status are left alone.
+        // Idle, it's marked sweeping in the same breath, so no job, render,
+        // download or other work that makes temp files starts until the
+        // sweep is done (they refuse, or the worker waits).
         let (session, running, idle, queue_idle) = {
-            let g = self.inner();
+            let mut g = self.inner();
             let running = g.running.as_ref().map(|r| r.id.clone());
-            let idle = g.is_idle();
+            let idle = g.is_idle() && !g.sweeping;
+            g.sweeping |= idle;
             (g.session.clone(), running, idle, g.running.is_none() && g.queue.is_empty())
         };
+        let sweeping = idle.then(|| SweepGuard { lib: self });
         if mode == Mode::Writable {
             match lock::acquire(&paths, &session, force_lock) {
                 Ok(Acquire::Acquired) => {}
@@ -257,6 +278,7 @@ impl Library {
             Vec::new()
         };
 
+        drop(sweeping);
         let mut g = self.inner();
         // Queue, running job, uploads and downloads are this session's and
         // carry on; mark_interrupted skipped the running job's entry.
@@ -295,7 +317,55 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::tests::{processed_library, saved_queue};
+    use super::super::tests::{png, processed_library, saved_queue, test_key, TV};
+
+    /// A reopen's sweep leaves this run's writes in flight (a review or
+    /// library.json being saved meanwhile) and takes a crash's leftovers.
+    #[test]
+    fn a_reopen_sweep_keeps_writes_in_flight() {
+        let (_t, lib, _id, dir) = processed_library();
+        let paths = lib.inner().paths.clone().unwrap();
+        let pid = std::process::id();
+        let ours = [paths.data_dir().join(format!("library.json{}{}-7", TMP_MARKER, pid)), dir.join(format!("video.json{}{}-8", TMP_MARKER, pid))];
+        let crashed = dir.join(format!("video.json{}{}-8", TMP_MARKER, pid + 1));
+        for f in ours.iter().chain([&crashed]) {
+            std::fs::write(f, b"half").unwrap();
+        }
+        lib.open_blocking(false);
+        assert!(ours.iter().all(|f| f.exists()), "writes in flight are kept");
+        assert!(!crashed.exists(), "a crash's leftover goes");
+        assert!(!lib.inner().sweeping);
+    }
+
+    /// While a reopen sweeps, nothing that makes temp files starts: a
+    /// render, a trim or thumbnail job, an upload or a download is refused,
+    /// and a queued job waits; once it's done they go ahead.
+    #[tokio::test]
+    async fn work_waits_for_a_reopen_sweep() {
+        let (_t, lib, id, dir) = processed_library();
+        let review = Review { title: Some("A".into()), preacher: Some("P".into()), ..Default::default() };
+        lib.save_review(&id, review, None).unwrap();
+        let source = "thumbnail_option_1.jpg";
+        let key = test_key(&dir, source, "A");
+        lib.enqueue(&id).await.unwrap();
+        lib.cancel(&id).unwrap();
+
+        lib.inner().sweeping = true;
+        let render = lib.save_rendered_thumbnail(&id, source, &key, TV, "", png()).await;
+        assert_eq!(render.unwrap_err(), SWEEPING);
+        assert_eq!(lib.begin_upload(&id, None, None).await.err().as_deref(), Some(SWEEPING));
+        assert_eq!(lib.reset(&id).unwrap_err(), SWEEPING);
+        lib.enqueue(&id).await.unwrap();
+        assert!(lib.start_next().is_none(), "the job waits");
+        assert!(lib.inner().rendering == 0 && lib.inner().busy.is_empty());
+
+        // The sweep's end (the guard) lets it all go ahead.
+        lib.inner().sweeping = false;
+        let (started, _token) = lib.start_next().unwrap();
+        assert_eq!(started, id);
+        lib.finish_job(&id, &None);
+        lib.save_rendered_thumbnail(&id, source, &key, TV, "", png()).await.unwrap();
+    }
 
     #[test]
     fn the_saved_queue_is_restored_on_open() {

@@ -146,7 +146,7 @@ impl Library {
         let name = manifest::render_file_name(&job.source);
         let tmp = dir.join(format!("{}{}", manifest::RENDER_TMP_PREFIX, name));
         let out = tmp.clone();
-        let rendering = RenderingGuard::new(self);
+        let rendering = RenderingGuard::new(self)?;
         let written = blocking(move || crate::thumbnail::save_for_youtube(&image_bytes, &out)).await.and_then(|r| r);
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
@@ -215,9 +215,13 @@ struct RenderingGuard<'a> {
 }
 
 impl<'a> RenderingGuard<'a> {
-    fn new(lib: &'a Library) -> Self {
-        lib.inner().rendering += 1;
-        RenderingGuard { lib }
+    /// Refused while a reopen sweeps: counted in the same breath as the
+    /// sweep's idle check, so its temp file is never swept.
+    fn new(lib: &'a Library) -> Result<Self, String> {
+        let mut g = lib.inner();
+        g.require_not_sweeping()?;
+        g.rendering += 1;
+        Ok(RenderingGuard { lib })
     }
 }
 

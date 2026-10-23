@@ -562,9 +562,12 @@ fn standalone_dir(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> 
 #[tauri::command]
 pub async fn crop_standalone_thumbnail(
     app_handle: AppHandle,
+    lib: State<'_, LibraryHandle>,
     source_image_path: String,
     crop_rect: crate::thumbnail::CropRect,
 ) -> Result<String, String> {
+    // Usually a picked image; the dialog adds picks to the fs scope.
+    check_path(&app_handle, &lib, &source_image_path, Access::Data)?;
     let dir = standalone_dir(&app_handle)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -720,6 +723,23 @@ mod tests {
             std::os::unix::fs::symlink(lib.join("state.json"), lib.join("logo.png")).unwrap();
             assert!(!path_allowed(&lib.join("logo.png"), &data, false, Access::Data));
         }
+    }
+
+    #[test]
+    fn thumbnail_sources_are_the_apps_files_or_picked_ones() {
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let lib = tmp.path().join("lib");
+        let photos = tmp.path().join("Pictures");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&photos).unwrap();
+        let roots = allowed_roots(Some(lib.clone()), None, Access::Data);
+        let photo = photos.join("pastor.jpg");
+        // Picked in the open dialog: accepted. Not picked: refused.
+        assert!(path_allowed(&photo, &roots, true, Access::Data));
+        assert!(!path_allowed(&photo, &roots, false, Access::Data));
+        assert!(!path_allowed(Path::new("/etc/passwd"), &roots, false, Access::Data));
+        // A generated option to crop again, in the library.
+        assert!(path_allowed(&lib.join(".sermon-cut/videos/x/thumbnail_option_1_raw.jpg"), &roots, false, Access::Data));
     }
 
     #[tokio::test]

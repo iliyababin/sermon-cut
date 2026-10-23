@@ -7,7 +7,8 @@
 //!   308 gives the next offset, 404/410 means the session is gone. It is
 //!   dropped only on such a definite answer (docs/INVARIANTS.md #8, #9).
 //! - Chunks are retried with backoff (honouring `Retry-After`); the count
-//!   of failures resets whenever a chunk makes progress.
+//!   of failures resets whenever the confirmed offset advances, and a 308
+//!   that confirms nothing new counts as a failure.
 //! - A request is abandoned when no bytes moved for the stall timeout,
 //!   not after a fixed total time, so slow uplinks still work.
 //! - A 401 refreshes the token once and carries on.
@@ -198,6 +199,7 @@ impl Uploader<'_> {
             if self.cancel.is_cancelled() {
                 return Err(UploadError::Cancelled);
             }
+            let sending = session.is_some() && offset.is_some();
             let step = match (&session, offset) {
                 (None, _) => self.create(&token, &metadata_json, size, ctype).await.map(|uri| {
                     Step::Created(UploadSession::new(uri, video.file_hash, size, &mhash).with_file_key(&fkey))
@@ -227,6 +229,16 @@ impl Uploader<'_> {
                 }
                 Ok(Step::Resume(n)) if n >= size => {
                     return Err(UploadError::Protocol("YouTube has the whole file but didn't finish the upload".into()));
+                }
+                Ok(Step::Resume(n)) if sending && n <= confirmed => {
+                    // A chunk went and nothing more was kept: a failure,
+                    // or a server that never moves would loop forever.
+                    failures += 1;
+                    if failures >= self.cfg.max_attempts {
+                        return Err(UploadError::Stalled);
+                    }
+                    self.pause(&UploadError::Stalled, failures).await?;
+                    offset = Some(n);
                 }
                 Ok(Step::Resume(n)) => {
                     if n > confirmed {

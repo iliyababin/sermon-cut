@@ -18,6 +18,8 @@ pub enum Fault {
     DropAfterStore,
     /// Store only the first n bytes and say so in a 308.
     PartialStore(usize),
+    /// Read the chunk, keep none of it, and answer 308 with the same Range.
+    NoProgress,
     /// Read the chunk, then never answer.
     Stall,
     /// Store the chunk, then never answer (the reply is lost while a
@@ -229,6 +231,7 @@ impl MockServer {
                         store(n, &mut state.bytes_stored);
                         session_state(sess)
                     }
+                    Some(Fault::NoProgress) => session_state(sess),
                     Some(Fault::Stall) => Reply::Hang,
                     Some(Fault::StoreThenHang) => {
                         store(req.body.len(), &mut state.bytes_stored);

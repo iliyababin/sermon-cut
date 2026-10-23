@@ -556,3 +556,28 @@ async fn videos_update_sets_title_and_description() {
     h.server.with(|s| s.videos_status = 403);
     assert!(post::update_metadata(&h.http, &h.cfg.endpoints, "tok2", "vidA", "t", "d").await.is_err());
 }
+
+#[tokio::test]
+async fn a_308_that_never_moves_gives_up_with_backoff() {
+    let h = Harness::new().await;
+    h.faults(vec![Fault::PartialStore(CHUNK as usize), Fault::NoProgress, Fault::NoProgress, Fault::NoProgress, Fault::NoProgress]);
+    let started = std::time::Instant::now();
+    assert_eq!(h.upload().await, Err(UploadError::Stalled));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // max_attempts 4: three pauses, then it stops; the session is kept.
+    assert_eq!(h.sleeps.lock().unwrap().len(), 3);
+    assert_eq!(h.server.with(|s| s.chunk_puts), 5);
+    assert!(h.store.load().is_some());
+}
+
+#[tokio::test]
+async fn no_progress_failures_reset_when_the_offset_advances() {
+    let mut h = Harness::new().await;
+    h.cfg.max_attempts = 2;
+    let stuck = || Fault::NoProgress;
+    let ok = || Fault::PartialStore(CHUNK as usize);
+    h.faults(vec![ok(), stuck(), ok(), stuck(), ok(), stuck()]);
+    assert_eq!(h.upload().await.unwrap(), "vid1");
+    h.assert_complete_once();
+    assert_eq!(h.sleeps.lock().unwrap().len(), 3);
+}

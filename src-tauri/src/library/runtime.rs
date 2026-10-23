@@ -524,8 +524,55 @@ fn fingerprint_matches(now: &Fingerprint, expected: &Fingerprint) -> bool {
     now.size == expected.size && now.hash == expected.hash
 }
 
+/// What `unmounted_volume` needs to know about a path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VolumeStat {
+    dev: u64,
+    symlink: bool,
+}
+
+#[cfg(unix)]
+fn volume_stat(path: &Path) -> Option<VolumeStat> {
+    use std::os::unix::fs::MetadataExt;
+    let symlink = std::fs::symlink_metadata(path).ok()?.file_type().is_symlink();
+    Some(VolumeStat { dev: std::fs::metadata(path).ok()?.dev(), symlink })
+}
+
+#[cfg(not(unix))]
+fn volume_stat(_: &Path) -> Option<VolumeStat> {
+    None
+}
+
+/// For a path on /Volumes/<X>: X's name if no drive is mounted there.
+/// When a drive is unplugged without being ejected, macOS can leave
+/// /Volumes/<X> behind as a plain folder on the startup disk (or a program
+/// can create one); writing there would quietly start a second, empty
+/// library. A mounted drive has its own device id, different from that of
+/// /Volumes itself. "/Volumes/Macintosh HD" is a symlink to /, not stale.
+fn unmounted_volume(path: &Path, stat: impl Fn(&Path) -> Option<VolumeStat>) -> Option<String> {
+    use std::path::Component;
+    let mut parts = path.components();
+    if parts.next() != Some(Component::RootDir) || parts.next() != Some(Component::Normal("Volumes".as_ref())) {
+        return None;
+    }
+    let Some(Component::Normal(name)) = parts.next() else { return None };
+    let volumes = Path::new("/Volumes");
+    let volume = stat(&volumes.join(name))?;
+    let parent = stat(volumes)?;
+    (!volume.symlink && volume.dev == parent.dev).then(|| name.to_string_lossy().to_string())
+}
+
 fn open_paths(configured: &str) -> Result<LibraryPaths, Mode> {
     let raw = PathBuf::from(configured);
+    if cfg!(target_os = "macos") {
+        if let Some(drive) = unmounted_volume(&raw, volume_stat) {
+            // Nothing is created: the folder would land on the startup disk.
+            return Err(Mode::Unavailable(format!(
+                "The drive \"{}\" is not connected. Plug it in to open the library {}.",
+                drive, configured
+            )));
+        }
+    }
     if !raw.exists() {
         if configured == crate::state::default_library_dir() {
             std::fs::create_dir_all(&raw)
@@ -2462,6 +2509,25 @@ mod tests {
     }
 
     const SCHEMA_NEXT: u32 = crate::library::SCHEMA_VERSION + 1;
+
+    #[test]
+    fn stale_volume_folders_are_unmounted_drives() {
+        let stat = |devs: [(&'static str, u64, bool); 3]| {
+            move |p: &Path| devs.iter().find(|(path, _, _)| Path::new(path) == p).map(|&(_, dev, symlink)| VolumeStat { dev, symlink })
+        };
+        let devs = [("/Volumes", 1, false), ("/Volumes/Church SSD", 1, false), ("/Volumes/Macintosh HD", 1, true)];
+        // A leftover folder on the startup disk: the drive isn't there.
+        assert_eq!(unmounted_volume(Path::new("/Volumes/Church SSD/Sermons"), stat(devs)).as_deref(), Some("Church SSD"));
+        assert_eq!(unmounted_volume(Path::new("/Volumes/Church SSD"), stat(devs)).as_deref(), Some("Church SSD"));
+        // The boot volume's link, a missing volume, and paths elsewhere are left to the usual checks.
+        assert_eq!(unmounted_volume(Path::new("/Volumes/Macintosh HD/Users/a"), stat(devs)), None);
+        assert_eq!(unmounted_volume(Path::new("/Volumes/Gone/Sermons"), stat(devs)), None);
+        assert_eq!(unmounted_volume(Path::new("/Users/a/Movies"), stat(devs)), None);
+        assert_eq!(unmounted_volume(Path::new("/Volumes"), stat(devs)), None);
+        // Mounted: its own device.
+        let mounted = [("/Volumes", 1, false), ("/Volumes/Church SSD", 7, false), ("/x", 0, false)];
+        assert_eq!(unmounted_volume(Path::new("/Volumes/Church SSD/Sermons"), stat(mounted)), None);
+    }
 
     #[test]
     fn raw_variants() {

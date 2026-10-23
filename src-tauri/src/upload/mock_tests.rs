@@ -319,8 +319,10 @@ async fn cancel_stops_and_keeps_the_session() {
     h.faults(vec![Fault::PartialStore(CHUNK as usize), Fault::Stall]);
     let cancel = CancellationToken::new();
     let c = cancel.clone();
+    let server = h.server.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The second chunk has been read and gets no answer.
+        server.wait_until(|s| s.chunk_puts >= 2).await;
         c.cancel();
     });
     let started = std::time::Instant::now();
@@ -491,10 +493,7 @@ async fn cancel_during_last_chunk(h: &Harness) -> Result<Uploaded, UploadError> 
     let c = cancel.clone();
     let server = h.server.clone();
     tokio::spawn(async move {
-        while server.with(|s| s.chunk_puts) < 4 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.wait_until(|s| s.chunk_puts >= 4).await;
         c.cancel();
     });
     h.upload_full(&cancel).await
@@ -650,12 +649,7 @@ async fn a_quit_mid_chunk_only_pauses_the_upload() {
     h.cfg.stall_timeout = Duration::from_secs(30);
     h.faults(vec![Fault::PartialStore(CHUNK as usize), Fault::StallMidBody]);
     let server = h.server.clone();
-    let mid_second_chunk = async move {
-        while server.with(|s| s.chunk_puts) < 2 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let mid_second_chunk = async move { server.wait_until(|s| s.mid_body_stalls >= 1).await };
     tokio::select! {
         r = h.upload() => panic!("the upload should still be running: {:?}", r),
         _ = mid_second_chunk => {} // the upload future is dropped here

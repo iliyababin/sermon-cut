@@ -534,24 +534,18 @@ mod tests {
     }
 
     async fn start(server: &MockServer, timeout: Duration, cancel: CancellationToken) -> Running {
-        let opened: Arc<Mutex<Option<String>>> = Arc::default();
-        let seen = opened.clone();
+        let (seen, mut opened) = tokio::sync::mpsc::unbounded_channel::<String>();
         let flow = OAuthFlow {
             endpoints: OAuthEndpoints { auth: format!("{}/auth", server.base), token: format!("{}/token", server.base) },
             timeout,
             open_browser: Box::new(move |url| {
-                *seen.lock().unwrap() = Some(url.to_string());
+                let _ = seen.send(url.to_string());
                 Ok(())
             }),
             cancel,
         };
         let handle = tokio::spawn(async move { run_oauth_flow(&credentials(), &flow).await });
-        let url = loop {
-            if let Some(url) = opened.lock().unwrap().clone() {
-                break url;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
+        let url = tokio::time::timeout(Duration::from_secs(10), opened.recv()).await.unwrap().unwrap();
         let param = |name: &str| {
             let (_, query) = url.split_once('?').unwrap();
             let value = query.split('&').find_map(|p| p.strip_prefix(&format!("{}=", name))).unwrap();

@@ -570,16 +570,16 @@ mod tests {
     #[tokio::test]
     async fn a_refused_post_is_sent_again() {
         // Nothing listens at first; the server comes up during the wait.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let url = format!("http://127.0.0.1:{}/transcribe", port);
+        // (A free port, checked to refuse; it has to be one this test can
+        // listen on later.)
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        assert_refuses(addr);
+        let url = format!("http://{}/transcribe", addr);
         let hits = Arc::new(AtomicUsize::new(0));
         let counted = hits.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let (mut sock, _) = listener.accept().await.unwrap();
             counted.fetch_add(1, Ordering::SeqCst);
             let mut buf = vec![0u8; 64 * 1024];
@@ -594,14 +594,26 @@ mod tests {
 
     const NO_WAIT: [Duration; 2] = [Duration::ZERO, Duration::ZERO];
 
+    /// Check that nothing answers at `addr`: a connection is refused.
+    fn assert_refuses(addr: std::net::SocketAddr) {
+        let err = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{addr} should refuse: {err}");
+    }
+
+    /// A local address that refuses connections and that no test can take:
+    /// a privileged port (an unprivileged process can't listen there).
+    /// Checked to refuse, so a machine running something there fails loudly
+    /// instead of passing by accident.
+    fn refused_addr() -> std::net::SocketAddr {
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert_refuses(addr);
+        addr
+    }
+
     #[tokio::test]
     async fn retries_only_when_the_server_was_never_reached() {
         // Nothing listening: refused before anything was sent.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let url = format!("http://127.0.0.1:{}/", port);
+        let url = format!("http://{}/", refused_addr());
         let tries = AtomicUsize::new(0);
         let c = client(Duration::from_secs(5));
         let err = send_with_retry(

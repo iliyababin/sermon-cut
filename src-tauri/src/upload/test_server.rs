@@ -78,12 +78,17 @@ pub struct MockState {
     /// Bodies sent to videos.update.
     pub video_updates: Vec<serde_json::Value>,
     pub videos_status: u16,
+    /// Chunks that stalled mid-body (StallMidBody) once their first bytes
+    /// were read.
+    pub mid_body_stalls: u32,
 }
 
 #[derive(Clone)]
 pub struct MockServer {
     pub base: String,
     pub state: Arc<Mutex<MockState>>,
+    /// Woken whenever a request has changed the state (see `wait_until`).
+    changed: Arc<tokio::sync::Notify>,
 }
 
 struct Request {
@@ -119,8 +124,9 @@ impl MockServer {
             token_delay: Duration::ZERO,
             video_updates: Vec::new(),
             videos_status: 200,
+            mid_body_stalls: 0,
         }));
-        let server = MockServer { base, state };
+        let server = MockServer { base, state, changed: Arc::new(tokio::sync::Notify::new()) };
         let s = server.clone();
         tokio::spawn(async move {
             loop {
@@ -134,6 +140,23 @@ impl MockServer {
 
     pub fn with<R>(&self, f: impl FnOnce(&mut MockState) -> R) -> R {
         f(&mut self.state.lock().unwrap())
+    }
+
+    /// Wait until a request has brought the state to `done` (instead of
+    /// sleeping and hoping it has). Panics after 10 s.
+    pub async fn wait_until(&self, done: impl Fn(&MockState) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if done(&self.state.lock().unwrap()) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                panic!("the mock server never reached the state waited for");
+            }
+        }
     }
 
     /// A session made earlier (by another app run), holding the first
@@ -172,6 +195,8 @@ impl MockServer {
         if stall {
             let mut some = vec![0u8; len.min(1000)];
             let _ = reader.read_exact(&mut some).await;
+            self.with(|s| s.mid_body_stalls += 1);
+            self.changed.notify_waiters();
             tokio::time::sleep(Duration::from_secs(3600)).await;
             return;
         }
@@ -181,6 +206,7 @@ impl MockServer {
         }
         let mut stream = reader.into_inner();
         let reply = self.handle(&req);
+        self.changed.notify_waiters();
         if req.path.starts_with("/token") {
             let delay = self.with(|s| s.token_delay);
             tokio::time::sleep(delay).await;

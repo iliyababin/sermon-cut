@@ -751,7 +751,8 @@ mod tests {
         let lock = tokio::sync::Mutex::new(());
         let refresh = access_token_with(&state, true, credentials, &url, &lock);
         let switch = async {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // While the refresh is at the token endpoint.
+            server.wait_until(|s| !s.token_requests.is_empty()).await;
             state.lock().await.settings.youtube_auth = Some(YouTubeAuth {
                 access_token: Some("other-access".into()),
                 refresh_token: Some("r2".into()),

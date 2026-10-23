@@ -3601,7 +3601,12 @@ mod tests {
             let (lib, id) = (lib.clone(), id.clone());
             async move { lib.trash_with(&id, |p| std::fs::remove_file(p).map_err(|e| e.to_string())).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // One thread: yielding runs the trash until it waits on the scan
+        // lock (no sleep needed to get it there).
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!trash.is_finished());
         assert!(root.join("a.mp4").exists(), "the trash waits for the scan");
         lib.inner().apply_scan(&obs);
         drop(scanning);
@@ -3629,7 +3634,12 @@ mod tests {
                 .await
             }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Wait for the trash to mark the video busy and get stuck on its lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !lib.inner().busy.contains(&id) {
+            assert!(std::time::Instant::now() < deadline, "the trash never started");
+            tokio::task::yield_now().await;
+        }
         let started = std::time::Instant::now();
         let view = lib.view(vec![]);
         assert!(started.elapsed() < std::time::Duration::from_millis(100));

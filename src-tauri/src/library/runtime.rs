@@ -1833,18 +1833,13 @@ impl Library {
     fn record_trim(&self, id: &str, dir: &Path, name: &str, start: f64, end: f64) -> Result<Option<String>, String> {
         let lock = self.video_lock(id);
         let _v = hold(&lock);
-        let mut g = self.inner();
         let mut data = manifest::load_video_data(dir);
         let old = data.trimmed_file.replace(name.to_string()).filter(|old| old != name);
         data.trim_start = Some(start);
         data.trim_end = Some(end);
         manifest::save_video_data(dir, &data)?;
-        // A half-finished upload was of the old cut.
-        if let Ok(e) = g.entry_mut(id) {
-            if e.upload_session.take().is_some() {
-                g.save_logged();
-            }
-        }
+        // An upload session of the old cut is kept: the next upload asks
+        // YouTube about it first (it may have finished; INVARIANTS #8, #9).
         Ok(old)
     }
 
@@ -2293,6 +2288,12 @@ impl Library {
         drop(job);
     }
 
+    /// Whether `youtube_id` is one of the entry's recorded uploads.
+    pub fn has_upload(&self, id: &str, youtube_id: &str) -> bool {
+        let g = self.inner();
+        g.manifest.get(id).is_some_and(|e| e.uploads.iter().any(|u| u.video_id.as_deref() == Some(youtube_id)))
+    }
+
     /// For "Set thumbnail again": the last upload's YouTube id and the
     /// thumbnail to send (the selected one), with the video marked busy.
     /// Finish with `finish_thumbnail_retry`.
@@ -2591,7 +2592,6 @@ pub struct EntrySession<'a> {
     pub lib: &'a Library,
     pub id: &'a str,
     /// What the finished upload is recorded with.
-    pub file_hash: &'a str,
     pub options: &'a UploadOptions,
 }
 
@@ -2602,8 +2602,8 @@ impl SessionStore for EntrySession<'_> {
     fn save(&self, session: Option<&UploadSession>) {
         self.lib.set_upload_session(self.id, session);
     }
-    fn complete(&self, video_id: &str) {
-        self.lib.record_upload(self.id, self.file_hash, self.options, video_id);
+    fn complete(&self, video_id: &str, file_hash: &str) {
+        self.lib.record_upload(self.id, file_hash, self.options, video_id);
     }
 }
 
@@ -2957,7 +2957,7 @@ mod tests {
     }
 
     fn outcome(video_id: &str, warnings: Vec<UploadWarning>) -> UploadOutcome {
-        UploadOutcome { url: crate::upload::watch_url(video_id), video_id: video_id.into(), warnings }
+        UploadOutcome { url: crate::upload::watch_url(video_id), video_id: video_id.into(), warnings, earlier: None, before_cancel: false }
     }
 
     #[test]
@@ -2965,7 +2965,7 @@ mod tests {
         let (_t, lib, id, _dir) = processed_library();
         let job = lib.begin_upload(&id, None, None).unwrap();
         let options = public();
-        let store = EntrySession { lib: &lib, id: &id, file_hash: &job.file_hash, options: &options };
+        let store = EntrySession { lib: &lib, id: &id, options: &options };
         let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
         store.save(Some(&session));
         lib.finish_upload(&id, job, None, &public());
@@ -2988,10 +2988,10 @@ mod tests {
         let (_t, lib, id, _dir) = processed_library();
         let job = lib.begin_upload(&id, None, None).unwrap();
         let options = UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PL1".into()) };
-        let store = EntrySession { lib: &lib, id: &id, file_hash: &job.file_hash, options: &options };
+        let store = EntrySession { lib: &lib, id: &id, options: &options };
         let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
         store.save(Some(&session));
-        store.complete("vid7");
+        store.complete("vid7", &job.file_hash);
 
         // A crash now: library.json already has the video and no session,
         // so the next Upload can't send it again.
@@ -3477,7 +3477,7 @@ mod tests {
         assert_eq!((d.trim_start, d.trim_end), (Some(4.0), Some(20.0)));
         let trimmed = d.trimmed_path.unwrap();
         assert!((crate::ffmpeg::probe_duration_blocking(Path::new(&trimmed)).unwrap() - 16.0).abs() < 0.2);
-        assert_eq!(lib.upload_session(&id), None, "an upload of the old cut isn't continued");
+        assert!(lib.upload_session(&id).is_some(), "the old cut's session is kept, for the next upload to settle");
         assert!(!lib.inner().busy.contains(&id));
         assert!(dir.join("thumbnail_option_1.jpg").exists(), "thumbnails are kept");
         assert!(lib.set_trim_with(&id, 9.5, 10.0, &none).await.is_err(), "at least a second");
@@ -3487,12 +3487,13 @@ mod tests {
     fn a_trim_keeps_review_edits_saved_meanwhile() {
         let (_t, lib, id, dir) = processed_library();
         std::fs::write(dir.join("trimmed_new.mp4"), b"cut").unwrap();
-        let guard = lib.inner();
+        let lock = lib.video_lock(&id);
+        let guard = hold(&lock);
         std::thread::scope(|s| {
             let trim = s.spawn(|| lib.record_trim(&id, &dir, "trimmed_new.mp4", 4.0, 20.0));
             std::thread::sleep(std::time::Duration::from_millis(100));
             assert!(!trim.is_finished(), "waits for the lock");
-            // save_review, which holds the lock, runs meanwhile.
+            // save_review, which holds the video's lock, runs meanwhile.
             let mut data = manifest::load_video_data(&dir);
             data.review.title = Some("Edited".into());
             manifest::save_video_data(&dir, &data).unwrap();

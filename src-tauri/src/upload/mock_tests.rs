@@ -1,8 +1,8 @@
 //! The upload against the local mock server, one injected fault at a time.
 
-use super::client::{Uploader, VideoUpload};
+use super::client::{EarlierUpload, Uploaded, Uploader, VideoUpload};
 use super::session::MemoryStore;
-use super::test_server::{Fault, MockServer};
+use super::test_server::{Fault, MockServer, QueryFault};
 use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -65,6 +65,7 @@ impl Harness {
                 recorded.lock().unwrap().push(d);
                 Box::pin(async {})
             }),
+            cancel_check: Duration::from_millis(300),
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trimmed.mp4");
@@ -96,13 +97,35 @@ impl Harness {
         }
     }
 
-    async fn upload_with(&self, cancel: &CancellationToken) -> Result<String, UploadError> {
+    async fn upload_full(&self, cancel: &CancellationToken) -> Result<Uploaded, UploadError> {
         let uploader = Uploader { http: &self.http, cfg: &self.cfg, tokens: &self.tokens, cancel };
         uploader.upload(&self.store, &self.video(), &|_, _| {}).await
     }
 
+    async fn upload_with(&self, cancel: &CancellationToken) -> Result<String, UploadError> {
+        self.upload_full(cancel).await.map(|u| {
+            assert_eq!((u.earlier.as_ref(), u.before_cancel), (None, false), "a plain upload");
+            u.video_id
+        })
+    }
+
+    /// A stored session at `uri` for exactly this upload.
+    fn matching_session(&self, uri: String) -> UploadSession {
+        let mtime = std::fs::metadata(&self.path).unwrap().modified().unwrap();
+        let mtime_ms = mtime.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let json = self.video().metadata.to_string();
+        let mhash = session::metadata_hash(&json, "video/mp4", "trimmed.mp4", mtime_ms);
+        let key = session::file_key("video/mp4", "trimmed.mp4", mtime_ms);
+        UploadSession::new(uri, "hash1", self.data.len() as u64, &mhash).with_file_key(&key)
+    }
+
     async fn upload(&self) -> Result<String, UploadError> {
         self.upload_with(&CancellationToken::new()).await
+    }
+
+    /// Session `id` holds the whole file.
+    fn assert_complete_once_in(&self, id: &str) {
+        assert_eq!(self.server.with(|s| s.sessions[id].data.clone()), self.data);
     }
 
     /// The whole file arrived once, with nothing sent twice.
@@ -117,7 +140,7 @@ async fn uploads_in_chunks() {
     let h = Harness::new().await;
     let progress = Mutex::new(Vec::new());
     let uploader = Uploader { http: &h.http, cfg: &h.cfg, tokens: &h.tokens, cancel: &CancellationToken::new() };
-    let id = uploader.upload(&h.store, &h.video(), &|sent, total| progress.lock().unwrap().push((sent, total))).await.unwrap();
+    let id = uploader.upload(&h.store, &h.video(), &|sent, total| progress.lock().unwrap().push((sent, total))).await.unwrap().video_id;
     assert_eq!(id, "vid1");
     h.assert_complete_once();
     assert_eq!(h.server.with(|s| (s.creates, s.chunk_puts, s.queries)), (1, 4, 0));
@@ -263,14 +286,15 @@ async fn changed_metadata_or_old_session_starts_fresh() {
     let h = Harness::new().await;
     h.store.save(Some(&UploadSession::new(format!("{}/session/nope", h.server.base), "hash1", h.data.len() as u64, "other")));
     assert_eq!(h.upload().await.unwrap(), "vid1");
-    assert_eq!(h.server.with(|s| (s.creates, s.queries)), (1, 0));
+    // Asked first; the 404 is a definite answer.
+    assert_eq!(h.server.with(|s| (s.creates, s.queries)), (1, 1));
 
     let h = Harness::new().await;
     let mut old = UploadSession::new(format!("{}/session/nope", h.server.base), "hash1", h.data.len() as u64, "x");
     old.created = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
     h.store.save(Some(&old));
     assert_eq!(h.upload().await.unwrap(), "vid1");
-    assert_eq!(h.server.with(|s| s.queries), 0);
+    assert_eq!(h.server.with(|s| (s.creates, s.queries)), (1, 1));
 }
 
 #[tokio::test]
@@ -349,4 +373,186 @@ async fn post_upload_steps_refresh_an_expired_token() {
     let warnings = post::after_upload(&h.http, &h.cfg.endpoints, &h.tokens, &id, &after).await;
     assert!(warnings.is_empty(), "{:?}", warnings);
     assert_eq!(h.tokens.refreshes.load(Ordering::SeqCst), 1);
+}
+
+// Settling a stored session (docs/INVARIANTS.md #8, #9): every answer.
+
+#[tokio::test]
+async fn a_finished_session_for_this_upload_completes_it() {
+    let h = Harness::new().await;
+    let uri = h.server.add_session(&h.data, h.data.len(), "vidA");
+    h.store.save(Some(&h.matching_session(uri)));
+    assert_eq!(h.upload().await.unwrap(), "vidA");
+    assert_eq!(h.server.with(|s| (s.creates, s.queries, s.chunk_puts)), (1, 1, 0));
+    assert!(h.store.load().is_none());
+}
+
+#[tokio::test]
+async fn a_finished_session_with_other_metadata_is_offered_not_reuploaded() {
+    let h = Harness::new().await;
+    let uri = h.server.add_session(&h.data, h.data.len(), "vidA");
+    let s = h.matching_session(uri);
+    h.store.save(Some(&UploadSession { metadata_hash: "old title".into(), ..s }));
+    let after = AfterUpload { captions: Some("1\n00:00:00,000 --> 00:00:01,000\nhi\n".into()), ..Default::default() };
+    let outcome = run(&h.http, &h.cfg, &h.tokens, &h.store, &CancellationToken::new(), &h.video(), &after, &|_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.video_id, "vidA");
+    assert_eq!(outcome.earlier, Some(EarlierUpload { new_cut: false, metadata_changed: true }));
+    // Nothing sent; the same file's video gets its captions.
+    assert_eq!(h.server.with(|s| (s.creates, s.chunk_puts, s.captions)), (1, 0, 1));
+    assert!(h.store.load().is_none());
+}
+
+#[tokio::test]
+async fn a_finished_session_of_an_earlier_cut_is_a_new_cut() {
+    let h = Harness::new().await;
+    let old_cut = vec![7u8; 5000];
+    let uri = h.server.add_session(&old_cut, old_cut.len(), "vidOld");
+    h.store.save(Some(&UploadSession::new(uri, "hash1", old_cut.len() as u64, "m").with_file_key("trimmed_1.mp4")));
+    let after = AfterUpload { captions: Some("1\n00:00:00,000 --> 00:00:01,000\nhi\n".into()), ..Default::default() };
+    let outcome = run(&h.http, &h.cfg, &h.tokens, &h.store, &CancellationToken::new(), &h.video(), &after, &|_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.video_id, "vidOld");
+    assert_eq!(outcome.earlier, Some(EarlierUpload { new_cut: true, metadata_changed: false }));
+    // The old cut gets nothing of the new one, and the new cut isn't sent.
+    assert_eq!(h.server.with(|s| (s.creates, s.chunk_puts, s.captions)), (1, 0, 0));
+    assert!(h.store.load().is_none());
+}
+
+#[tokio::test]
+async fn an_unfinished_session_for_this_upload_resumes_from_its_range() {
+    let h = Harness::new().await;
+    let uri = h.server.add_session(&h.data, CHUNK as usize, "vidA");
+    h.store.save(Some(&h.matching_session(uri)));
+    assert_eq!(h.upload().await.unwrap(), "vidA");
+    assert_eq!(h.server.stored(), h.data);
+    assert_eq!(h.server.with(|s| s.bytes_stored), h.data.len() as u64 - CHUNK, "only the rest was sent");
+    assert_eq!(h.server.with(|s| (s.creates, s.chunk_puts)), (1, 3));
+}
+
+#[tokio::test]
+async fn an_unfinished_session_for_something_else_is_dropped() {
+    let h = Harness::new().await;
+    let uri = h.server.add_session(&h.data, CHUNK as usize, "vidA");
+    let s = h.matching_session(uri);
+    h.store.save(Some(&UploadSession { metadata_hash: "old title".into(), ..s }));
+    assert_eq!(h.upload().await.unwrap(), "vid2");
+    assert_eq!(h.server.with(|s| (s.creates, s.queries)), (2, 1));
+}
+
+#[tokio::test]
+async fn a_gone_session_is_dropped() {
+    for code in [404, 410] {
+        let h = Harness::new().await;
+        let uri = h.server.add_session(&h.data, CHUNK as usize, "vidA");
+        h.store.save(Some(&h.matching_session(uri)));
+        h.server.with(|s| s.query_faults = vec![QueryFault::Status(code)].into());
+        assert_eq!(h.upload().await.unwrap(), "vid2");
+        h.assert_complete_once_in("s2");
+    }
+}
+
+#[tokio::test]
+async fn an_unanswered_check_keeps_the_session_and_sends_nothing() {
+    // Server errors, then a 401 that a refresh doesn't fix.
+    for faults in [vec![QueryFault::Status(503); 4], vec![QueryFault::Status(401); 2]] {
+        let h = Harness::new().await;
+        let uri = h.server.add_session(&h.data, h.data.len(), "vidA");
+        let stored = h.matching_session(uri);
+        h.store.save(Some(&stored));
+        h.server.with(|s| s.query_faults = faults.into());
+        let err = h.upload().await.unwrap_err();
+        assert!(matches!(err, UploadError::CheckFailed(_)), "{:?}", err);
+        assert_eq!(err.user_message(), error::CHECK_FAILED);
+        assert_eq!(h.store.load(), Some(stored), "kept");
+        assert_eq!(h.server.with(|s| (s.creates, s.chunk_puts)), (1, 0));
+    }
+}
+
+#[tokio::test]
+async fn an_offline_retrim_keeps_the_old_cuts_session() {
+    let h = Harness::new().await;
+    // Nothing listens there: offline.
+    let stored = UploadSession::new("http://127.0.0.1:1/session/s1".into(), "hash1", 5000, "m").with_file_key("old cut");
+    h.store.save(Some(&stored));
+    let err = h.upload().await.unwrap_err();
+    assert!(matches!(err, UploadError::CheckFailed(_)), "{:?}", err);
+    assert_eq!(h.store.load(), Some(stored));
+    assert_eq!(h.server.with(|s| s.creates), 0);
+}
+
+/// Cancel once the last chunk has reached the server.
+async fn cancel_during_last_chunk(h: &Harness) -> Result<Uploaded, UploadError> {
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let server = h.server.clone();
+    tokio::spawn(async move {
+        while server.with(|s| s.chunk_puts) < 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.cancel();
+    });
+    h.upload_full(&cancel).await
+}
+
+#[tokio::test]
+async fn cancel_during_the_last_chunk_that_arrived_reports_it_finished() {
+    let mut h = Harness::new().await;
+    h.cfg.stall_timeout = Duration::from_secs(30);
+    let ok = || Fault::PartialStore(CHUNK as usize);
+    h.faults(vec![ok(), ok(), ok(), Fault::StoreThenHang]);
+    let up = cancel_during_last_chunk(&h).await.unwrap();
+    assert_eq!((up.video_id.as_str(), up.before_cancel), ("vid1", true));
+    assert!(h.store.load().is_none(), "recorded");
+}
+
+#[tokio::test]
+async fn cancel_during_the_last_chunk_that_didnt_arrive_is_a_cancel() {
+    let mut h = Harness::new().await;
+    h.cfg.stall_timeout = Duration::from_secs(30);
+    let ok = || Fault::PartialStore(CHUNK as usize);
+    h.faults(vec![ok(), ok(), ok(), Fault::Stall]);
+    assert_eq!(cancel_during_last_chunk(&h).await, Err(UploadError::Cancelled));
+    assert!(h.store.load().is_some());
+}
+
+#[tokio::test]
+async fn cancel_that_cant_check_keeps_the_session_as_maybe_finished() {
+    let mut h = Harness::new().await;
+    h.cfg.stall_timeout = Duration::from_secs(30);
+    let ok = || Fault::PartialStore(CHUNK as usize);
+    h.faults(vec![ok(), ok(), ok(), Fault::StoreThenHang]);
+    h.server.with(|s| s.query_faults = vec![QueryFault::Hang].into());
+    let started = std::time::Instant::now();
+    let err = cancel_during_last_chunk(&h).await.unwrap_err();
+    assert_eq!(err, UploadError::CancelledMaybeFinished);
+    assert_eq!(err.user_message(), error::CANCELLED_MAYBE_FINISHED);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(h.store.load().is_some(), "kept");
+
+    // The next upload settles it: finished, so nothing is sent again.
+    assert_eq!(h.upload().await.unwrap(), "vid1");
+    h.assert_complete_once();
+    assert_eq!(h.server.with(|s| (s.creates, s.chunk_puts)), (1, 4));
+}
+
+#[tokio::test]
+async fn videos_update_sets_title_and_description() {
+    let h = Harness::new().await;
+    h.server.with(|s| s.token = "tok2".into());
+    post::update_metadata_authed(&h.http, &h.cfg.endpoints, &h.tokens, "vidA", "New title", "New description")
+        .await
+        .unwrap();
+    assert_eq!(h.tokens.refreshes.load(Ordering::SeqCst), 1, "refreshed after a 401");
+    let body = h.server.with(|s| s.video_updates.clone()).pop().unwrap();
+    assert_eq!(body["id"], "vidA");
+    assert_eq!(body["snippet"]["title"], "New title");
+    assert_eq!(body["snippet"]["description"], "New description");
+    assert_eq!(body["snippet"]["categoryId"], "22");
+
+    h.server.with(|s| s.videos_status = 403);
+    assert!(post::update_metadata(&h.http, &h.cfg.endpoints, "tok2", "vidA", "t", "d").await.is_err());
 }

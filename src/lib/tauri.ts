@@ -211,6 +211,20 @@ export async function youtubeUploadVideo(
 
 /** What a cancelled upload rejects with (UploadError::Cancelled). */
 export const UPLOAD_CANCELLED = "Upload cancelled.";
+/** A cancel during the last chunk that couldn't tell whether it arrived
+ * (UploadError::CancelledMaybeFinished). */
+export const UPLOAD_CANCELLED_MAYBE_FINISHED =
+  "Upload cancelled, but it may have finished just before. Uploading again checks with YouTube first.";
+
+/** Give a finished upload of this video the current title and description. */
+export async function youtubeUpdateMetadata(
+  videoId: string,
+  youtubeId: string,
+  title: string,
+  description: string
+): Promise<void> {
+  return invoke("youtube_update_metadata", { videoId, youtubeId, title, description });
+}
 
 /** Stop a running upload; uploading again continues where it stopped. */
 export async function cancelUpload(videoId: string): Promise<void> {

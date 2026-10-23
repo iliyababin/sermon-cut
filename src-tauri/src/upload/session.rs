@@ -20,6 +20,11 @@ pub struct UploadSession {
     pub metadata_hash: String,
     /// RFC 3339.
     pub created: String,
+    /// Which file was sent (name, type, modification time), apart from the
+    /// metadata: tells a new cut from an edited title when an earlier
+    /// session turns out finished. None for sessions from before 0.6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_key: Option<String>,
 }
 
 impl UploadSession {
@@ -30,7 +35,20 @@ impl UploadSession {
             size,
             metadata_hash: metadata_hash.to_string(),
             created: chrono::Utc::now().to_rfc3339(),
+            file_key: None,
         }
+    }
+
+    pub fn with_file_key(mut self, key: &str) -> Self {
+        self.file_key = Some(key.to_string());
+        self
+    }
+
+    /// Whether this session sent a different file (another source, or a
+    /// new cut) than the one described. Sessions without a file key are
+    /// judged by size alone.
+    pub fn other_file(&self, file_hash: &str, size: u64, file_key: &str) -> bool {
+        self.file_hash != file_hash || self.size != size || self.file_key.as_deref().is_some_and(|k| k != file_key)
     }
 
     /// A session URI from library.json (a synced, editable file) is only
@@ -58,16 +76,22 @@ pub fn metadata_hash(metadata_json: &str, content_type: &str, file_name: &str, m
     format!("{:x}", md5::compute(input.as_bytes()))
 }
 
+/// Hash of which file is sent, apart from the metadata.
+pub fn file_key(content_type: &str, file_name: &str, mtime_ms: i64) -> String {
+    let input = format!("{}\n{}\n{}", content_type, file_name, mtime_ms);
+    format!("{:x}", md5::compute(input.as_bytes()))
+}
+
 /// Where the session is kept between attempts.
 pub trait SessionStore: Send + Sync {
     fn load(&self) -> Option<UploadSession>;
     fn save(&self, session: Option<&UploadSession>);
-    /// YouTube has the whole video, as `video_id`: drop the session and
-    /// record the upload in one step, so a crash afterwards (during the
-    /// thumbnail, captions or playlist) neither loses the video nor sends
-    /// it again.
-    fn complete(&self, video_id: &str) {
-        let _ = video_id;
+    /// YouTube has the whole video, as `video_id`, made from the file whose
+    /// fingerprint is `file_hash`: drop the session and record the upload in
+    /// one step, so a crash afterwards (during the thumbnail, captions or
+    /// playlist) neither loses the video nor sends it again.
+    fn complete(&self, video_id: &str, file_hash: &str) {
+        let _ = (video_id, file_hash);
         self.save(None);
     }
 }
@@ -103,6 +127,18 @@ mod tests {
         assert!(!s.reusable_for("h", 10, "m", now + chrono::Duration::days(6)));
         let bad = UploadSession { created: "yesterday".into(), ..s };
         assert!(!bad.reusable_for("h", 10, "m", now));
+    }
+
+    #[test]
+    fn tells_another_file_from_changed_metadata() {
+        let s = UploadSession::new("u".into(), "h", 10, "m").with_file_key("k");
+        assert!(!s.other_file("h", 10, "k"));
+        assert!(s.other_file("h", 10, "k2"), "a new cut");
+        assert!(s.other_file("h", 11, "k"));
+        assert!(s.other_file("h2", 10, "k"), "another source");
+        // An old session without a key: only the size tells.
+        let old = UploadSession { file_key: None, ..s };
+        assert!(!old.other_file("h", 10, "anything"));
     }
 
     #[test]

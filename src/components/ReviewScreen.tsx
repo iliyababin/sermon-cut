@@ -12,7 +12,9 @@ import {
   saveReview,
   cancelUpload,
   errorMessage,
+  youtubeUpdateMetadata,
   UPLOAD_CANCELLED,
+  UPLOAD_CANCELLED_MAYBE_FINISHED,
 } from "@/lib/tauri";
 import { UploadWarnings } from "./UploadWarnings";
 import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
@@ -33,6 +35,7 @@ import type {
   PlaylistInfo,
   UploadPrivacy,
   UploadWarning,
+  EarlierUpload,
 } from "@/lib/types";
 import { LocalImage } from "./LocalImage";
 import { ThumbnailEditor } from "./ThumbnailEditor";
@@ -295,15 +298,25 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       progress: number;
       status: string;
       url: string | null;
+      youtube_id?: string | null;
       error: string | null;
       warnings?: UploadWarning[] | null;
+      earlier?: EarlierUpload | null;
+      before_cancel?: boolean;
     }>("youtube-upload-progress", (event) => {
       const e = event.payload;
       if (e.video_id !== video.id) return;
       if (e.status === "done" && e.url) {
-        dispatch({ type: "succeeded", url: e.url, warnings: e.warnings ?? [] });
+        dispatch({
+          type: "succeeded",
+          url: e.url,
+          youtubeId: e.youtube_id ?? null,
+          warnings: e.warnings ?? [],
+          earlier: e.earlier ?? null,
+          beforeCancel: e.before_cancel ?? false,
+        });
       } else if (e.status === "cancelled") {
-        dispatch({ type: "cancelled" });
+        dispatch({ type: "cancelled", maybeFinished: e.error === UPLOAD_CANCELLED_MAYBE_FINISHED });
       } else if (e.status === "error") {
         dispatch({ type: "failed", message: e.error || "Upload failed" });
       } else {
@@ -420,6 +433,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   useEffect(() => {
     if (uploadRequest === null || startedRequest.current === uploadRequest) return;
     startedRequest.current = uploadRequest;
+    setMetadataNotice(null);
 
     (async () => {
       try {
@@ -438,11 +452,18 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
           playlistId
         );
         // The "done" event reports this too; the machine counts it once.
-        dispatch({ type: "succeeded", url: outcome.url, warnings: outcome.warnings });
+        dispatch({
+          type: "succeeded",
+          url: outcome.url,
+          youtubeId: outcome.video_id,
+          warnings: outcome.warnings,
+          earlier: outcome.earlier ?? null,
+          beforeCancel: outcome.before_cancel ?? false,
+        });
       } catch (err) {
         const message = errorMessage(err);
-        if (message === UPLOAD_CANCELLED) {
-          dispatch({ type: "cancelled" });
+        if (message === UPLOAD_CANCELLED || message === UPLOAD_CANCELLED_MAYBE_FINISHED) {
+          dispatch({ type: "cancelled", maybeFinished: message === UPLOAD_CANCELLED_MAYBE_FINISHED });
           return;
         }
         console.error("Upload failed:", err);
@@ -452,6 +473,26 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   }, [uploadRequest]);
 
   const handleUpload = () => dispatch({ type: "upload", ready: uploadReady });
+
+  // An earlier upload had finished: give that video the current title and
+  // description (videos.update).
+  const [updatingMetadata, setUpdatingMetadata] = useState(false);
+  const [metadataNotice, setMetadataNotice] = useState<string | null>(null);
+  const handleUpdateMetadata = async () => {
+    if (phase.kind !== "done" || !phase.youtubeId) return;
+    setUpdatingMetadata(true);
+    setMetadataNotice(null);
+    try {
+      await flush();
+      await youtubeUpdateMetadata(video.id, phase.youtubeId, youtubeTitle(title), youtubeDescription);
+      setMetadataNotice("The title and description on YouTube are updated.");
+      dispatch({ type: "dismissEarlier" });
+    } catch (err) {
+      setMetadataNotice(`Couldn't update the title and description: ${errorMessage(err)}`);
+    } finally {
+      setUpdatingMetadata(false);
+    }
+  };
 
   // ⌘Enter uploads, Esc goes back or leaves a field (see reviewShortcut).
   const shortcutState = useRef({ blocked: false, canUpload: false, handleBack, handleUpload });
@@ -611,17 +652,25 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
               <div className="flex items-center gap-2">
                 <CheckCircle className="w-5 h-5 text-green-600" />
                 <span className="font-medium text-green-800 dark:text-green-400">
-                  Uploaded to YouTube
+                  {phase.earlier?.new_cut
+                    ? "The previous cut is already on YouTube"
+                    : phase.earlier
+                      ? "Already on YouTube"
+                      : phase.beforeCancel
+                        ? "Uploaded to YouTube: it finished before it could be cancelled"
+                        : "Uploaded to YouTube"}
                 </span>
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <button
-                onClick={() => dispatch({ type: "uploadAgain" })}
-                className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
-              >
-                Upload Again
-              </button>
+              {!phase.earlier && (
+                <button
+                  onClick={() => dispatch({ type: "uploadAgain" })}
+                  className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+                >
+                  Upload Again
+                </button>
+              )}
               <button
                 onClick={() => openUrl(phase.url)}
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
@@ -631,6 +680,45 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
               </button>
             </div>
           </div>
+          {phase.earlier && (
+            <div role="status" className="mt-3 text-sm text-green-900 dark:text-green-300 flex flex-col gap-2">
+              <p>
+                {phase.earlier.new_cut
+                  ? "An upload of the cut before your last trim had already finished, so that is the video on YouTube. The new cut hasn't been uploaded."
+                  : "An earlier upload of this video had already finished, with the title and description it had then. Nothing was uploaded again."}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                {!phase.earlier.new_cut && phase.youtubeId && (
+                  <button
+                    onClick={handleUpdateMetadata}
+                    disabled={updatingMetadata}
+                    className="px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition-colors"
+                  >
+                    {updatingMetadata ? "Updating…" : "Update title & description on that video"}
+                  </button>
+                )}
+                <button
+                  onClick={() => dispatch({ type: "uploadNewCopy", ready: uploadReady })}
+                  disabled={!uploadReady || updatingMetadata}
+                  className="px-3 py-1.5 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 transition-colors"
+                >
+                  {phase.earlier.new_cut ? "Upload the new cut as a new video" : "Upload a new copy"}
+                </button>
+                <button
+                  onClick={() => dispatch({ type: "dismissEarlier" })}
+                  disabled={updatingMetadata}
+                  className="px-3 py-1.5 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          )}
+          {metadataNotice && (
+            <p role="status" className="mt-3 text-sm text-green-900 dark:text-green-300">
+              {metadataNotice}
+            </p>
+          )}
           {phase.warnings.length > 0 && (
             <div className="mt-3">
               <UploadWarnings
@@ -645,7 +733,9 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
       {phase.kind === "cancelled" && (
         <div className="mx-4 mt-4 p-3 bg-muted rounded-lg text-sm text-muted-foreground">
-          Upload cancelled. Upload again to continue where it stopped.
+          {phase.maybeFinished
+            ? "Upload cancelled, but it may have finished just before. Uploading again checks with YouTube first."
+            : "Upload cancelled. Upload again to continue where it stopped."}
         </div>
       )}
 

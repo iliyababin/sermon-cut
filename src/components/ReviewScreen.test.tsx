@@ -377,4 +377,79 @@ describe("ReviewScreen", () => {
     expect(screen.getByText("The video wasn't added to the playlist.")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /set thumbnail again/i })).toBeNull();
   });
+
+  it("offers to update an earlier finished upload's title, or to upload a new copy after confirming", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "youtube_upload_video"
+        ? Promise.resolve({
+            url: "https://youtube.com/watch?v=old1",
+            video_id: "old1",
+            warnings: [],
+            earlier: { new_cut: false, metadata_changed: true },
+            before_cancel: false,
+          })
+        : base(cmd, args)
+    );
+    vi.mocked(ask).mockClear();
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    await screen.findByText("Already on YouTube");
+    expect(screen.getByRole("button", { name: /open on youtube/i })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Update title & description on that video" }));
+    await screen.findByText("The title and description on YouTube are updated.");
+    expect(calls("youtube_update_metadata")).toEqual([
+      ["youtube_update_metadata", { videoId: "vid1", youtubeId: "old1", title: TITLE, description: expect.any(String) }],
+    ]);
+    // The notice is closed; the link stays.
+    expect(screen.queryByRole("button", { name: "Upload a new copy" })).toBeNull();
+    expect(screen.getByRole("button", { name: /open on youtube/i })).toBeTruthy();
+    expect(calls("youtube_upload_video")).toHaveLength(1);
+  });
+
+  it("after a re-trim, says the old cut is on YouTube and uploads the new cut only when confirmed", async () => {
+    const base = invoke.getMockImplementation()!;
+    let first = true;
+    invoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "youtube_upload_video" && first) {
+        first = false;
+        return Promise.resolve({
+          url: "https://youtube.com/watch?v=old1",
+          video_id: "old1",
+          warnings: [],
+          earlier: { new_cut: true, metadata_changed: false },
+        });
+      }
+      return base(cmd, args);
+    });
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    await screen.findByText("The previous cut is already on YouTube");
+    expect(screen.queryByRole("button", { name: /update title/i })).toBeNull();
+
+    vi.mocked(ask).mockClear();
+    vi.mocked(ask).mockResolvedValueOnce(false);
+    fireEvent.click(screen.getByRole("button", { name: "Upload the new cut as a new video" }));
+    await waitFor(() => expect(vi.mocked(ask)).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(ask).mock.calls[0][0]).toContain("new, separate YouTube video");
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(calls("youtube_upload_video")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload the new cut as a new video" }));
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(2));
+  });
+
+  it("says when a cancel may have come too late", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "youtube_upload_video"
+        ? Promise.reject("Upload cancelled, but it may have finished just before. Uploading again checks with YouTube first.")
+        : base(cmd, args)
+    );
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    await screen.findByText(/may have finished just before/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
 });

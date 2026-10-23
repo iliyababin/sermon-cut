@@ -376,13 +376,13 @@ pub async fn youtube_upload_video(
             }),
             playlist_id: options.playlist_id.clone(),
         };
-        let store = EntrySession { lib: library, id: &video_id, file_hash: &job.file_hash, options: &options };
+        let store = EntrySession { lib: library, id: &video_id, options: &options };
         let last_percent = AtomicU32::new(u32::MAX);
         let on_progress = |sent: u64, total: u64| {
             let percent = (sent.saturating_mul(95) / total.max(1)) as u32;
             if last_percent.swap(percent, Ordering::SeqCst) != percent {
                 library.set_upload_progress(&video_id, percent);
-                emit_upload(&app_handle, &video_id, percent, "uploading", None, None, None);
+                emit_upload(&app_handle, &video_id, percent, "uploading", None, None);
             }
         };
         let cfg = UploadConfig::default();
@@ -394,7 +394,7 @@ pub async fn youtube_upload_video(
     let shown_title = library.title_of(&video_id);
     match &result {
         Ok(_) => crate::notify::notify(&app_handle, crate::notify::Event::Uploaded { title: &shown_title }),
-        Err(UploadError::Cancelled) => {}
+        Err(UploadError::Cancelled | UploadError::CancelledMaybeFinished) => {}
         Err(e) => crate::notify::notify(
             &app_handle,
             crate::notify::Event::UploadFailed { title: &shown_title, error: &e.user_message() },
@@ -403,11 +403,13 @@ pub async fn youtube_upload_video(
     // Final word for any screen showing this upload, including a review
     // screen reopened after the one that started it went away.
     match &result {
-        Ok(o) => emit_upload(&app_handle, &video_id, 100, "done", Some(o.url.as_str()), None, Some(&o.warnings)),
-        Err(UploadError::Cancelled) => emit_upload(&app_handle, &video_id, 0, "cancelled", None, None, None),
+        Ok(o) => emit_upload(&app_handle, &video_id, 100, "done", Some(o), None),
+        Err(e @ (UploadError::Cancelled | UploadError::CancelledMaybeFinished)) => {
+            emit_upload(&app_handle, &video_id, 0, "cancelled", None, Some(e.user_message().as_str()))
+        }
         Err(e) => {
             eprintln!("[upload] Failed: {}", e);
-            emit_upload(&app_handle, &video_id, 0, "error", None, Some(e.user_message().as_str()), None)
+            emit_upload(&app_handle, &video_id, 0, "error", None, Some(e.user_message().as_str()))
         }
     }
     changed(&app_handle);
@@ -418,6 +420,30 @@ pub async fn youtube_upload_video(
 #[tauri::command]
 pub async fn cancel_upload(lib: State<'_, LibraryHandle>, video_id: String) -> Result<(), String> {
     lib.cancel_upload(&video_id)
+}
+
+/// Give a finished upload of this video (an earlier one, found when a new
+/// upload began) the current title and description, via `videos.update`.
+#[tauri::command]
+pub async fn youtube_update_metadata(
+    lib: State<'_, LibraryHandle>,
+    state: State<'_, AppStateHandle>,
+    app_handle: AppHandle,
+    video_id: String,
+    youtube_id: String,
+    title: String,
+    description: String,
+) -> Result<(), String> {
+    if title.trim().is_empty() {
+        return Err("Add a title first.".into());
+    }
+    if !lib.has_upload(&video_id, &youtube_id) {
+        return Err("That YouTube video isn't one of this video's uploads.".into());
+    }
+    let tokens = crate::commands::AppTokens { state: &state, app: &app_handle };
+    upload::post::update_metadata_authed(&upload::http_client(), &upload::Endpoints::youtube(), &tokens, &youtube_id, &title, &description)
+        .await
+        .map_err(|e| e.user_message())
 }
 
 /// "Set thumbnail again" for the last upload, by its stored YouTube id.
@@ -459,9 +485,8 @@ fn emit_upload(
     video_id: &str,
     progress: u32,
     status: &str,
-    url: Option<&str>,
+    outcome: Option<&UploadOutcome>,
     error: Option<&str>,
-    warnings: Option<&[UploadWarning]>,
 ) {
     let _ = app.emit(
         "youtube-upload-progress",
@@ -469,9 +494,12 @@ fn emit_upload(
             "video_id": video_id,
             "progress": progress,
             "status": status,
-            "url": url,
+            "url": outcome.map(|o| &o.url),
+            "youtube_id": outcome.map(|o| &o.video_id),
             "error": error,
-            "warnings": warnings,
+            "warnings": outcome.map(|o| &o.warnings),
+            "earlier": outcome.and_then(|o| o.earlier.as_ref()),
+            "before_cancel": outcome.is_some_and(|o| o.before_cancel),
         }),
     );
 }

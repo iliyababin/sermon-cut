@@ -20,11 +20,21 @@ pub enum Fault {
     PartialStore(usize),
     /// Read the chunk, then never answer.
     Stall,
+    /// Store the chunk, then never answer (the reply is lost while a
+    /// cancel comes in).
+    StoreThenHang,
     /// The access token stops being valid (the server now wants this one),
     /// so this request gets a 401.
     ExpireToken(String),
     /// The session disappears; reply with this status (404 or 410).
     Gone(u16),
+}
+
+/// What the next status query (`bytes */N`) runs into.
+#[derive(Debug, Clone)]
+pub enum QueryFault {
+    Status(u16),
+    Hang,
 }
 
 pub struct Session {
@@ -39,6 +49,7 @@ pub struct MockState {
     pub token: String,
     pub sessions: HashMap<String, Session>,
     pub faults: VecDeque<Fault>,
+    pub query_faults: VecDeque<QueryFault>,
     pub creates: u32,
     pub chunk_puts: u32,
     pub queries: u32,
@@ -54,6 +65,9 @@ pub struct MockState {
     /// Form bodies sent to /token.
     pub token_requests: Vec<String>,
     pub token_reply: (u16, String),
+    /// Bodies sent to videos.update.
+    pub video_updates: Vec<serde_json::Value>,
+    pub videos_status: u16,
 }
 
 #[derive(Clone)]
@@ -78,6 +92,7 @@ impl MockServer {
             token: "tok1".into(),
             sessions: HashMap::new(),
             faults: VecDeque::new(),
+            query_faults: VecDeque::new(),
             creates: 0,
             chunk_puts: 0,
             queries: 0,
@@ -91,6 +106,8 @@ impl MockServer {
             playlist_adds: 0,
             token_requests: Vec::new(),
             token_reply: (200, r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#.into()),
+            video_updates: Vec::new(),
+            videos_status: 200,
         }));
         let server = MockServer { base, state };
         let s = server.clone();
@@ -106,6 +123,21 @@ impl MockServer {
 
     pub fn with<R>(&self, f: impl FnOnce(&mut MockState) -> R) -> R {
         f(&mut self.state.lock().unwrap())
+    }
+
+    /// A session made earlier (by another app run), holding the first
+    /// `stored` bytes of `data`; complete when that's all of it. Returns its
+    /// URI.
+    pub fn add_session(&self, data: &[u8], stored: usize, video_id: &str) -> String {
+        self.with(|s| {
+            s.creates += 1;
+            let id = format!("s{}", s.creates);
+            s.sessions.insert(
+                id.clone(),
+                Session { size: data.len() as u64, data: data[..stored].to_vec(), video_id: video_id.into() },
+            );
+            format!("{}/session/{}", s.base, id)
+        })
     }
 
     /// The single session's stored bytes.
@@ -163,6 +195,13 @@ impl MockServer {
                 let id = p.trim_start_matches("/session/").to_string();
                 if is_query(req) {
                     s.queries += 1;
+                    match s.query_faults.pop_front() {
+                        Some(QueryFault::Status(code)) => {
+                            return json(code, r#"{"error":{"code":0,"message":"Injected"}}"#);
+                        }
+                        Some(QueryFault::Hang) => return Reply::Hang,
+                        None => {}
+                    }
                     let Some(sess) = s.sessions.get(&id) else { return json(404, "{}") };
                     return session_state(sess);
                 }
@@ -191,6 +230,10 @@ impl MockServer {
                         session_state(sess)
                     }
                     Some(Fault::Stall) => Reply::Hang,
+                    Some(Fault::StoreThenHang) => {
+                        store(req.body.len(), &mut state.bytes_stored);
+                        Reply::Hang
+                    }
                     Some(Fault::Gone(code)) => {
                         state.sessions.remove(&id);
                         json(code, "{}")
@@ -201,6 +244,10 @@ impl MockServer {
                         session_state(sess)
                     }
                 }
+            }
+            ("PUT", "/videos") => {
+                s.video_updates.push(serde_json::from_slice(&req.body).unwrap_or_default());
+                json(s.videos_status, "{}")
             }
             ("POST", "/thumbnails") => {
                 s.thumbnails += 1;

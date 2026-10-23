@@ -19,7 +19,14 @@ describe("reviewMachine", () => {
       request: null,
     });
     const done = initialReviewState({ status: "done", uploadProgress: null, uploads: [{ url: "https://y/1" }] });
-    expect(done.phase).toEqual({ kind: "done", url: "https://y/1", warnings: [] });
+    expect(done.phase).toEqual({
+      kind: "done",
+      url: "https://y/1",
+      youtubeId: null,
+      warnings: [],
+      earlier: null,
+      beforeCancel: false,
+    });
     expect(done.uploadCount).toBe(1);
   });
 
@@ -53,7 +60,7 @@ describe("reviewMachine", () => {
 
   it("counts a success once even when reported twice", () => {
     const s = run(fresh, UPLOAD, { type: "succeeded", url: "u" }, { type: "succeeded", url: "u" });
-    expect(s.phase).toEqual({ kind: "done", url: "u", warnings: [] });
+    expect(s.phase).toMatchObject({ kind: "done", url: "u", warnings: [], earlier: null });
     expect(s.uploadCount).toBe(1);
   });
 
@@ -69,7 +76,7 @@ describe("reviewMachine", () => {
     expect(failed.phase).toEqual({ kind: "error", message: "boom" });
     expect(run(failed, UPLOAD).phase).toMatchObject({ kind: "uploading", request: 2 });
     const cancelled = run(fresh, UPLOAD, { type: "cancelled" });
-    expect(cancelled.phase).toEqual({ kind: "cancelled" });
+    expect(cancelled.phase).toEqual({ kind: "cancelled", maybeFinished: false });
     expect(run(cancelled, UPLOAD).phase).toMatchObject({ kind: "uploading" });
   });
 
@@ -79,7 +86,7 @@ describe("reviewMachine", () => {
     expect(asked.cancelling).toBe(true);
     expect(run(asked, { type: "cancelRequested" })).toBe(asked);
     const stopped = run(asked, { type: "cancelled" });
-    expect(stopped.phase).toEqual({ kind: "cancelled" });
+    expect(stopped.phase).toEqual({ kind: "cancelled", maybeFinished: false });
     expect(stopped.cancelling).toBe(false);
     // Upload again continues (the backend resumes the session).
     expect(run(stopped, UPLOAD).phase).toMatchObject({ kind: "uploading", request: 2 });
@@ -95,15 +102,39 @@ describe("reviewMachine", () => {
       UPLOAD,
       { type: "succeeded", url: "u", warnings: [thumb, playlist] }
     );
-    expect(done.phase).toEqual({ kind: "done", url: "u", warnings: [thumb, playlist] });
-    expect(run(done, { type: "warnings", warnings: [playlist] }).phase).toEqual({
+    expect(done.phase).toMatchObject({ kind: "done", url: "u", warnings: [thumb, playlist] });
+    expect(run(done, { type: "warnings", warnings: [playlist] }).phase).toMatchObject({
       kind: "done",
       url: "u",
       warnings: [playlist],
     });
     expect(run(fresh, { type: "warnings", warnings: [] })).toBe(fresh);
     const reopened = initialReviewState({ status: "done", uploadProgress: null, uploads: [{ url: "u", warnings: [thumb] }] });
-    expect(reopened.phase).toEqual({ kind: "done", url: "u", warnings: [thumb] });
+    expect(reopened.phase).toMatchObject({ kind: "done", url: "u", warnings: [thumb] });
+  });
+
+  it("shows an earlier finished upload, and offers a new copy only through the confirm", () => {
+    const earlier = { new_cut: false, metadata_changed: true };
+    const done = run(fresh, UPLOAD, { type: "succeeded", url: "u", youtubeId: "abc", earlier });
+    expect(done.phase).toMatchObject({ kind: "done", youtubeId: "abc", earlier });
+    expect(done.uploadCount).toBe(1);
+    // Close keeps the link.
+    expect(run(done, { type: "dismissEarlier" }).phase).toMatchObject({ kind: "done", url: "u", earlier: null });
+    // A new copy is asked about first, and not while the thumbnails update.
+    expect(run(done, { type: "uploadNewCopy", ready: false })).toBe(done);
+    const asking = run(done, { type: "uploadNewCopy", ready: true });
+    expect(asking.phase).toMatchObject({ kind: "confirming" });
+    // "No" goes back to the notice.
+    expect(run(asking, { type: "cancelConfirm" }).phase).toBe(done.phase);
+    expect(run(asking, { type: "confirm" }).phase).toMatchObject({ kind: "uploading", request: 2 });
+    expect(run(fresh, { type: "uploadNewCopy", ready: true })).toBe(fresh);
+  });
+
+  it("remembers a cancel that may have come too late", () => {
+    const s = run(fresh, UPLOAD, { type: "cancelled", maybeFinished: true });
+    expect(s.phase).toEqual({ kind: "cancelled", maybeFinished: true });
+    const late = run(fresh, UPLOAD, { type: "succeeded", url: "u", beforeCancel: true });
+    expect(late.phase).toMatchObject({ kind: "done", beforeCancel: true });
   });
 
   it("ignores results that don't belong to the current phase", () => {

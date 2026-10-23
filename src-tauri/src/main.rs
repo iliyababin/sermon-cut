@@ -232,6 +232,7 @@ fn main() {
             library::commands::end_update,
             library::commands::youtube_upload_video,
             library::commands::cancel_upload,
+            library::commands::youtube_update_metadata,
             library::commands::retry_thumbnail,
             library::commands::check_library_folder,
         ])

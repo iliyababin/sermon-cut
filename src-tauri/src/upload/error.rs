@@ -25,6 +25,13 @@ pub enum UploadError {
         retry_after: Option<Duration>,
     },
     Cancelled,
+    /// Cancelled while the last chunk was on its way, and YouTube couldn't
+    /// be asked whether it arrived. The session is kept; the next upload
+    /// checks first.
+    CancelledMaybeFinished,
+    /// A stored session couldn't be checked with YouTube (offline, a server
+    /// error, a 401 after a refresh). It is kept and nothing was sent.
+    CheckFailed(String),
     /// Reading the video or thumbnail failed.
     File(String),
     /// YouTube answered something the app doesn't understand.
@@ -43,6 +50,8 @@ impl std::fmt::Display for UploadError {
             UploadError::SessionGone => write!(f, "upload session gone"),
             UploadError::Http { status, body, .. } => write!(f, "HTTP {}: {}", status, body),
             UploadError::Cancelled => write!(f, "cancelled"),
+            UploadError::CancelledMaybeFinished => write!(f, "cancelled; it may have finished"),
+            UploadError::CheckFailed(e) => write!(f, "couldn't check the earlier upload: {}", e),
             UploadError::File(e) => write!(f, "file: {}", e),
             UploadError::Protocol(e) => write!(f, "protocol: {}", e),
             UploadError::Other(e) => write!(f, "{}", e),
@@ -51,6 +60,10 @@ impl std::fmt::Display for UploadError {
 }
 
 pub const CANCELLED_MESSAGE: &str = "Upload cancelled.";
+pub const CANCELLED_MAYBE_FINISHED: &str =
+    "Upload cancelled, but it may have finished just before. Uploading again checks with YouTube first.";
+pub const CHECK_FAILED: &str =
+    "Couldn't check the earlier upload with YouTube, so nothing was sent. Check the internet connection and try again.";
 pub const SIGN_IN_AGAIN: &str = "Please sign in to YouTube again (Settings → YouTube).";
 
 /// The `reason` of the first error in a Google API error body, or the
@@ -140,6 +153,8 @@ impl UploadError {
                 None => format!("YouTube returned an error ({}).", status),
             },
             UploadError::Cancelled => CANCELLED_MESSAGE.into(),
+            UploadError::CancelledMaybeFinished => CANCELLED_MAYBE_FINISHED.into(),
+            UploadError::CheckFailed(_) => CHECK_FAILED.into(),
             UploadError::File(e) => format!("Couldn't read the file: {}", e),
             UploadError::Protocol(e) => format!("Unexpected reply from YouTube: {}", e),
             UploadError::Other(e) => e.clone(),

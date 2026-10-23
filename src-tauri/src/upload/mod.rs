@@ -30,6 +30,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub upload: String,
+    /// `videos.update`, for changing a finished upload's title.
+    pub videos: String,
     pub thumbnails: String,
     pub captions: String,
     pub playlist_items: String,
@@ -39,6 +41,7 @@ impl Endpoints {
     pub fn youtube() -> Self {
         Endpoints {
             upload: "https://www.googleapis.com/upload/youtube/v3/videos".into(),
+            videos: "https://www.googleapis.com/youtube/v3/videos".into(),
             thumbnails: "https://www.googleapis.com/upload/youtube/v3/thumbnails/set".into(),
             captions: "https://www.googleapis.com/upload/youtube/v3/captions".into(),
             playlist_items: "https://www.googleapis.com/youtube/v3/playlistItems".into(),
@@ -50,6 +53,7 @@ impl Endpoints {
     pub fn at(base: &str) -> Self {
         Endpoints {
             upload: format!("{}/upload", base),
+            videos: format!("{}/videos", base),
             thumbnails: format!("{}/thumbnails", base),
             captions: format!("{}/captions", base),
             playlist_items: format!("{}/playlistItems", base),
@@ -98,6 +102,8 @@ pub struct UploadConfig {
     pub max_attempts: u32,
     /// How retries wait; tests make it instant and record the delays.
     pub sleep: SleepFn,
+    /// How long a cancel waits to ask whether the last chunk arrived.
+    pub cancel_check: Duration,
 }
 
 impl Default for UploadConfig {
@@ -113,6 +119,7 @@ impl Default for UploadConfig {
             },
             max_attempts: 8,
             sleep: Arc::new(|d| Box::pin(tokio::time::sleep(d))),
+            cancel_check: Duration::from_secs(10),
         }
     }
 }
@@ -145,6 +152,11 @@ pub struct UploadOutcome {
     pub url: String,
     pub video_id: String,
     pub warnings: Vec<UploadWarning>,
+    /// The video is an earlier upload that had finished (see
+    /// `client::Uploaded`); this one wasn't made.
+    pub earlier: Option<client::EarlierUpload>,
+    /// It finished before a cancel could stop it.
+    pub before_cancel: bool,
 }
 
 /// YouTube video ids are short and URL-safe.
@@ -157,7 +169,8 @@ pub fn watch_url(video_id: &str) -> String {
 }
 
 /// Upload the video, then set its thumbnail, captions and playlist with a
-/// fresh token.
+/// fresh token. A stored session that turns out finished gives that video
+/// instead (`UploadOutcome::earlier`).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     http: &reqwest::Client,
@@ -170,10 +183,14 @@ pub async fn run(
     on_progress: client::Progress<'_>,
 ) -> Result<UploadOutcome, UploadError> {
     let uploader = client::Uploader { http, cfg, tokens, cancel };
-    let video_id = uploader.upload(store, video, on_progress).await?;
-    println!("[upload] Video uploaded: {}", video_id);
-    let warnings = post::after_upload(http, &cfg.endpoints, tokens, &video_id, after).await;
-    Ok(UploadOutcome { url: watch_url(&video_id), video_id, warnings })
+    let up = uploader.upload(store, video, on_progress).await?;
+    println!("[upload] Video uploaded: {}", up.video_id);
+    // An earlier cut isn't given this cut's thumbnail, captions or playlist.
+    let warnings = match &up.earlier {
+        Some(e) if e.new_cut => Vec::new(),
+        _ => post::after_upload(http, &cfg.endpoints, tokens, &up.video_id, after).await,
+    };
+    Ok(UploadOutcome { url: watch_url(&up.video_id), video_id: up.video_id, warnings, earlier: up.earlier, before_cancel: up.before_cancel })
 }
 
 /// MIME type YouTube is told about, from the file's extension.

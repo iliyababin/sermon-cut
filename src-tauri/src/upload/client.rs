@@ -2,9 +2,10 @@
 //!
 //! - A session is created once and kept in a `SessionStore`, so a later
 //!   attempt (even after a restart) continues it.
-//! - Before resuming, the server is asked how much it has
+//! - A stored session is settled with the server before anything else
 //!   (`Content-Range: bytes */N`): 200/201 means it's already complete,
-//!   308 gives the next offset, 404/410 means the session is gone.
+//!   308 gives the next offset, 404/410 means the session is gone. It is
+//!   dropped only on such a definite answer (docs/INVARIANTS.md #8, #9).
 //! - Chunks are retried with backoff (honouring `Retry-After`); the count
 //!   of failures resets whenever a chunk makes progress.
 //! - A request is abandoned when no bytes moved for the stall timeout,
@@ -12,10 +13,11 @@
 //! - A 401 refreshes the token once and carries on.
 
 use super::error::{parse_retry_after, UploadError};
-use super::session::{metadata_hash, SessionStore, UploadSession};
+use super::session::{file_key, metadata_hash, SessionStore, UploadSession};
 use super::{content_type, TokenSource, UploadConfig};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE, RETRY_AFTER};
 use reqwest::Client;
+use serde::Serialize;
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,11 +105,50 @@ pub struct Uploader<'a> {
     pub cancel: &'a CancellationToken,
 }
 
+/// A video YouTube has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Uploaded {
+    pub video_id: String,
+    /// Set when a stored session for something else (an earlier cut, or the
+    /// video with other metadata) turned out finished: that video is what
+    /// YouTube has, and this upload didn't happen.
+    pub earlier: Option<EarlierUpload>,
+    /// Cancel came while the last chunk was on its way, and it arrived.
+    pub before_cancel: bool,
+}
+
+/// How a finished earlier upload differs from the one asked for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EarlierUpload {
+    /// It was another file: the cut before a re-trim, or a replaced source.
+    pub new_cut: bool,
+    /// Same file; the title, description or privacy have changed since.
+    pub metadata_changed: bool,
+}
+
+/// What the upload is, for matching it against a stored session.
+struct Current<'a> {
+    file_hash: &'a str,
+    size: u64,
+    metadata_hash: &'a str,
+    file_key: &'a str,
+}
+
+/// A stored session, settled with YouTube.
+enum Settled {
+    /// Nothing to continue: start a new session.
+    Fresh,
+    /// Continue this session from this byte.
+    Resume(UploadSession, u64),
+    /// YouTube has the whole video already.
+    Finished(Uploaded),
+}
+
 impl Uploader<'_> {
     /// Upload the video, continuing a stored session when it still fits.
-    /// Returns the new video's id. The session is kept on failure or
-    /// cancel, and completed on success, cleared when YouTube dropped it.
-    pub async fn upload(&self, store: &dyn SessionStore, video: &VideoUpload<'_>, on_progress: Progress<'_>) -> Result<String, UploadError> {
+    /// The session is kept on failure or cancel, completed on success, and
+    /// dropped only on a definite answer from YouTube (see `settle`).
+    pub async fn upload(&self, store: &dyn SessionStore, video: &VideoUpload<'_>, on_progress: Progress<'_>) -> Result<Uploaded, UploadError> {
         let meta = std::fs::metadata(video.path).map_err(|e| UploadError::File(e.to_string()))?;
         let size = meta.len();
         if size == 0 {
@@ -123,38 +164,53 @@ impl Uploader<'_> {
         let metadata_json = video.metadata.to_string();
         let file_name = video.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let mhash = metadata_hash(&metadata_json, ctype, &file_name, mtime_ms);
+        let fkey = file_key(ctype, &file_name, mtime_ms);
+        let current = Current { file_hash: video.file_hash, size, metadata_hash: &mhash, file_key: &fkey };
 
-        let mut session = match store.load() {
-            Some(s) if s.reusable_for(video.file_hash, size, &mhash, chrono::Utc::now()) => {
-                println!("[upload] Continuing the upload session from {}", s.created);
-                Some(s)
-            }
-            Some(_) => {
-                store.save(None);
-                None
-            }
-            None => None,
-        };
         let mut file = tokio::fs::File::open(video.path).await.map_err(|e| UploadError::File(e.to_string()))?;
         let mut token = self.tokens.token().await?;
-        // None: ask the server where to continue.
-        let mut offset: Option<u64> = None;
-        let mut confirmed: u64 = 0;
-        let mut failures = 0u32;
-        let mut refreshed = false;
         on_progress(0, size);
 
+        // Every stored session is settled first, whatever it was for.
+        let mut session = None;
+        let mut offset = None;
+        let mut confirmed: u64 = 0;
+        if let Some(stored) = store.load() {
+            match self.settle(store, &mut token, stored, &current).await? {
+                Settled::Fresh => {}
+                Settled::Resume(s, n) => {
+                    println!("[upload] Continuing the upload session from {} at byte {}", s.created, n);
+                    session = Some(s);
+                    offset = Some(n);
+                    confirmed = n;
+                    on_progress(n, size);
+                }
+                Settled::Finished(done) => {
+                    on_progress(size, size);
+                    return Ok(done);
+                }
+            }
+        }
+
+        let mut failures = 0u32;
+        let mut refreshed = false;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(UploadError::Cancelled);
             }
             let step = match (&session, offset) {
                 (None, _) => self.create(&token, &metadata_json, size, ctype).await.map(|uri| {
-                    Step::Created(UploadSession::new(uri, video.file_hash, size, &mhash))
+                    Step::Created(UploadSession::new(uri, video.file_hash, size, &mhash).with_file_key(&fkey))
                 }),
                 (Some(s), None) => self.query(&token, &s.uri, size).await,
                 (Some(s), Some(off)) => {
-                    self.put_chunk(&token, &s.uri, &mut file, off, size, &|sent| on_progress(off + sent, size)).await
+                    let sent = self.put_chunk(&token, &s.uri, &mut file, off, size, &|sent| on_progress(off + sent, size)).await;
+                    let last = off + self.cfg.chunk_size >= size;
+                    if last && matches!(sent, Err(UploadError::Cancelled)) {
+                        // The last chunk may have arrived just before.
+                        return self.check_after_cancel(store, &token, s, size).await;
+                    }
+                    sent
                 }
             };
             match step {
@@ -165,9 +221,9 @@ impl Uploader<'_> {
                     confirmed = 0;
                 }
                 Ok(Step::Done(id)) => {
-                    store.complete(&id);
+                    store.complete(&id, video.file_hash);
                     on_progress(size, size);
-                    return Ok(id);
+                    return Ok(Uploaded { video_id: id, earlier: None, before_cancel: false });
                 }
                 Ok(Step::Resume(n)) if n >= size => {
                     return Err(UploadError::Protocol("YouTube has the whole file but didn't finish the upload".into()));
@@ -204,16 +260,116 @@ impl Uploader<'_> {
                     if failures >= self.cfg.max_attempts {
                         return Err(e);
                     }
-                    let delay = self.cfg.backoff.delay(failures, e.retry_after());
-                    println!("[upload] {} (try {}); retrying in {:?}", e, failures, delay);
+                    self.pause(&e, failures).await?;
                     offset = None;
-                    tokio::select! {
-                        _ = (self.cfg.sleep)(delay) => {}
-                        _ = self.cancel.cancelled() => return Err(UploadError::Cancelled),
-                    }
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// Wait before retry number `failures`, unless cancelled.
+    async fn pause(&self, e: &UploadError, failures: u32) -> Result<(), UploadError> {
+        let delay = self.cfg.backoff.delay(failures, e.retry_after());
+        println!("[upload] {} (try {}); retrying in {:?}", e, failures, delay);
+        tokio::select! {
+            _ = (self.cfg.sleep)(delay) => Ok(()),
+            _ = self.cancel.cancelled() => Err(UploadError::Cancelled),
+        }
+    }
+
+    /// Ask YouTube about a stored session, and act only on a definite
+    /// answer:
+    /// - finished (200/201): record it; if it was for another file or other
+    ///   metadata, say so instead of uploading;
+    /// - 308: continue it if it's for this upload, otherwise drop it;
+    /// - gone (404/410): drop it.
+    ///
+    /// Anything else (offline, server errors, a 401 after a refresh) keeps
+    /// the session and fails with `CheckFailed`.
+    async fn settle(
+        &self,
+        store: &dyn SessionStore,
+        token: &mut String,
+        stored: UploadSession,
+        current: &Current<'_>,
+    ) -> Result<Settled, UploadError> {
+        let matches = stored.reusable_for(current.file_hash, current.size, current.metadata_hash, chrono::Utc::now());
+        let mut failures = 0u32;
+        let mut refreshed = false;
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(UploadError::Cancelled);
+            }
+            match self.query(token, &stored.uri, stored.size).await {
+                Ok(Step::Done(id)) => {
+                    store.complete(&id, &stored.file_hash);
+                    let new_cut = stored.other_file(current.file_hash, current.size, current.file_key);
+                    let metadata_changed = !new_cut && stored.metadata_hash != current.metadata_hash;
+                    let earlier = (new_cut || metadata_changed).then_some(EarlierUpload { new_cut, metadata_changed });
+                    if earlier.is_some() {
+                        println!("[upload] An earlier upload had finished: {}", id);
+                    }
+                    return Ok(Settled::Finished(Uploaded { video_id: id, earlier, before_cancel: false }));
+                }
+                Ok(Step::Resume(n)) if matches => return Ok(Settled::Resume(stored, n)),
+                Ok(Step::Resume(_)) => {
+                    println!("[upload] Dropping an unfinished session for another file or metadata");
+                    store.save(None);
+                    return Ok(Settled::Fresh);
+                }
+                Ok(Step::Created(_)) => unreachable!("a query never creates"),
+                Err(UploadError::SessionGone) => {
+                    println!("[upload] The stored upload session is gone");
+                    store.save(None);
+                    return Ok(Settled::Fresh);
+                }
+                Err(UploadError::Cancelled) => return Err(UploadError::Cancelled),
+                Err(UploadError::Auth(_)) if !refreshed => {
+                    refreshed = true;
+                    *token = self.tokens.refresh().await?;
+                }
+                Err(e) if e.is_retryable() && failures + 1 < self.cfg.max_attempts => {
+                    failures += 1;
+                    self.pause(&e, failures).await?;
+                }
+                Err(e) => {
+                    println!("[upload] Couldn't check the stored session: {}", e);
+                    return Err(UploadError::CheckFailed(e.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Cancelled during the last chunk: ask (briefly, not cancellable)
+    /// whether it arrived.
+    async fn check_after_cancel(
+        &self,
+        store: &dyn SessionStore,
+        token: &str,
+        session: &UploadSession,
+        size: u64,
+    ) -> Result<Uploaded, UploadError> {
+        let ask = async {
+            let resp = self
+                .http
+                .put(&session.uri)
+                .bearer_auth(token)
+                .header(CONTENT_RANGE, format!("bytes */{}", size))
+                .header(CONTENT_LENGTH, "0")
+                .send()
+                .await
+                .map_err(UploadError::from_reqwest)?;
+            interpret(resp).await
+        };
+        match tokio::time::timeout(self.cfg.cancel_check, ask).await {
+            Ok(Ok(Step::Done(id))) => {
+                println!("[upload] The upload finished before it could be cancelled: {}", id);
+                store.complete(&id, &session.file_hash);
+                Ok(Uploaded { video_id: id, earlier: None, before_cancel: true })
+            }
+            Ok(Ok(Step::Resume(_))) => Err(UploadError::Cancelled),
+            _ => Err(UploadError::CancelledMaybeFinished),
         }
     }
 

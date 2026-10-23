@@ -63,11 +63,23 @@ export interface UploadWarning {
   message: string;
 }
 
+/** A stored upload session that turned out finished when the next upload
+ * began: that video is what YouTube has, and the new upload didn't happen. */
+export interface EarlierUpload {
+  /** It was another file (the cut before a re-trim). */
+  new_cut: boolean;
+  /** Same file; the title, description or privacy changed since. */
+  metadata_changed: boolean;
+}
+
 /** What youtube_upload_video resolves with. */
 export interface UploadOutcome {
   url: string;
   video_id: string;
   warnings: UploadWarning[];
+  earlier?: EarlierUpload | null;
+  /** It finished before a cancel could stop it. */
+  before_cancel?: boolean;
 }
 
 /** A video in the library folder. */

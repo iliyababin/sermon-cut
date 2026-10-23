@@ -201,6 +201,42 @@ pub async fn upload_captions(
     check(resp).await
 }
 
+/// `videos.update`: give a video on YouTube this title and description
+/// (the rest of its snippet as Sermon Cut uploads it). Its privacy, file and
+/// everything else stay.
+pub async fn update_metadata(
+    http: &Client,
+    endpoints: &Endpoints,
+    token: &str,
+    video_id: &str,
+    title: &str,
+    description: &str,
+) -> Result<(), UploadError> {
+    let mut snippet = super::client::video_metadata(title, description, "private")["snippet"].clone();
+    let body = serde_json::json!({ "id": video_id, "snippet": snippet.take() });
+    let resp = http
+        .put(format!("{}?part=snippet", endpoints.videos))
+        .bearer_auth(token)
+        .timeout(REQUEST_TIMEOUT)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await;
+    check(resp).await
+}
+
+/// `update_metadata` with a fresh token, refreshed once after a 401.
+pub async fn update_metadata_authed(
+    http: &Client,
+    endpoints: &Endpoints,
+    tokens: &dyn TokenSource,
+    video_id: &str,
+    title: &str,
+    description: &str,
+) -> Result<(), UploadError> {
+    authed(tokens, |t| async move { update_metadata(http, endpoints, &t, video_id, title, description).await }).await
+}
+
 pub async fn add_to_playlist(
     http: &Client,
     endpoints: &Endpoints,

@@ -173,6 +173,9 @@ pub struct VideoDetail {
     /// The selected render, or its source (absolute path).
     pub selected_thumbnail: Option<String>,
     pub review: Review,
+    /// The YouTube URL of another library entry with the same file (same
+    /// content hash) that was already uploaded, for the confirm dialog.
+    pub duplicate_upload: Option<String>,
 }
 
 /// A thumbnail source on the review screen.
@@ -321,6 +324,20 @@ impl Inner {
             parts.push("a download".to_string());
         }
         (!parts.is_empty()).then(|| parts.join(" and "))
+    }
+
+    /// The newest upload of another entry for the same file content.
+    fn duplicate_upload(&self, id: &str, hash: &str) -> Option<String> {
+        if hash.is_empty() {
+            return None;
+        }
+        self.manifest
+            .entries
+            .iter()
+            .filter(|o| o.id != id && o.fingerprint.hash == hash)
+            .flat_map(|o| o.uploads.iter())
+            .max_by(|a, b| a.uploaded_at.cmp(&b.uploaded_at))
+            .map(|u| u.url.clone())
     }
 
     fn is_busy(&self, id: &str) -> bool {
@@ -1130,6 +1147,7 @@ impl Library {
         let video = g.video_view(e);
         let paths = g.paths.clone().ok_or("The library isn't open")?;
         let hash = e.fingerprint.hash.clone();
+        let duplicate_upload = g.duplicate_upload(id, &hash);
         drop(g);
 
         let dir = paths.video_dir(id)?;
@@ -1176,6 +1194,7 @@ impl Library {
             selected_source: data.selected_or_first().cloned(),
             selected_thumbnail: data.selected_thumbnail.as_ref().map(abs),
             review: data.review,
+            duplicate_upload,
         })
     }
 
@@ -2592,6 +2611,28 @@ mod tests {
         assert!(lib.save_rendered_thumbnail(&id, "../../x.jpg", "k", png()).await.is_err());
         assert!(lib.save_rendered_thumbnail(&id, "other.jpg", "k", png()).await.is_err());
         assert!(lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k/../", png()).await.is_err());
+    }
+
+    #[test]
+    fn detail_mentions_an_upload_of_the_same_file_under_another_entry() {
+        let (_t, lib, id, _dir) = processed_library();
+        assert_eq!(lib.detail(&id).unwrap().duplicate_upload, None);
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        lib.finish_upload(&id, job, Some(&outcome("abc", vec![])), &public());
+        // Its own upload isn't a duplicate.
+        assert_eq!(lib.detail(&id).unwrap().duplicate_upload, None);
+
+        let copy = {
+            let mut g = lib.inner();
+            let fp = g.entry(&id).unwrap().fingerprint.clone();
+            let e = Entry::new("a copy.mp4".into(), fp, Some(60.0));
+            let copy = e.id.clone();
+            g.manifest.entries.push(e);
+            let other = Entry::new("b.mp4".into(), Fingerprint { hash: "different".into(), ..g.entry(&id).unwrap().fingerprint.clone() }, None);
+            g.manifest.entries.push(other);
+            copy
+        };
+        assert_eq!(lib.detail(&copy).unwrap().duplicate_upload.as_deref(), Some(crate::upload::watch_url("abc").as_str()));
     }
 
     #[test]

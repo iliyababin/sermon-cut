@@ -379,15 +379,21 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     if (phase.kind !== "confirming") return;
     let current = true;
     const again = review.uploadCount > 0;
+    const warn = again || !!video.duplicate_upload;
     const lines = [
       `Upload "${title.trim()}" by ${preacher.trim()} as ${PRIVACY_LABELS[privacy]}?`,
     ];
     if (again) {
       lines.push("This video has already been uploaded to YouTube. This makes a new, separate YouTube video.");
     }
+    if (video.duplicate_upload) {
+      lines.push(
+        `The same video file is in the library under another name and was already uploaded: ${video.duplicate_upload}`
+      );
+    }
     ask(lines.join("\n\n"), {
       title: again ? "Upload again" : "Upload to YouTube",
-      kind: again ? "warning" : "info",
+      kind: warn ? "warning" : "info",
       okLabel: again ? "Upload Again" : "Upload",
       cancelLabel: "Cancel",
     })

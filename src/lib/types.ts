@@ -136,6 +136,9 @@ export interface VideoDetail extends LibraryVideo {
   selected_source: string | null;
   selected_thumbnail: string | null;
   review: Review;
+  /** YouTube URL of another library entry with the same file that was
+   * already uploaded. */
+  duplicate_upload: string | null;
 }
 
 /** A thumbnail source: a generated crop or a custom one. */

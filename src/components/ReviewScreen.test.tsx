@@ -63,6 +63,7 @@ function video(overrides: Partial<VideoDetail> = {}): VideoDetail {
     selected_source: options[0].id,
     selected_thumbnail: null,
     review: { title: TITLE, description: "", preacher: PREACHER },
+    duplicate_upload: null,
     ...overrides,
   };
 }
@@ -208,6 +209,14 @@ describe("ReviewScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: /^upload$/i }));
     await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
     expect(vi.mocked(ask).mock.calls[0][0]).toBe(`Upload "${TITLE}" by ${PREACHER} as Unlisted?`);
+  });
+
+  it("warns when the same file was uploaded under another name", async () => {
+    vi.mocked(ask).mockClear();
+    render(<ReviewScreen video={video({ duplicate_upload: "https://youtu.be/dup" })} onBack={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
+    expect(vi.mocked(ask).mock.calls[0][0]).toContain("https://youtu.be/dup");
   });
 
   it("starts a video with no speaker from the most recent one", async () => {

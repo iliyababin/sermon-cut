@@ -17,7 +17,9 @@ That's it. It takes about a minute and opens Sermon Cut when it's done. It insta
 
 No Homebrew or admin password needed. The app updates itself, and keeps yt-dlp up to date in the background. If something ever breaks, run the same line again to reinstall everything.
 
-If Sermon Cut is open, the installer asks it to quit and waits up to a minute. If it's still open (for example, in the middle of an upload), the installer stops without changing anything; quit Sermon Cut when it's done and run the line again.
+If Sermon Cut is open, the installer stops without changing anything and asks you to quit it first. Check that no upload or processing is running, quit Sermon Cut (⌘Q), then run the line again.
+
+Quitting from the Dock or logging out closes Sermon Cut straight away, even mid-upload; macOS doesn't let the app ask first. Nothing is lost for good: an interrupted upload picks up where it left off the next time you open the app, while processing and YouTube downloads start again from the beginning.
 
 Requires an Apple Silicon Mac (M1 or newer).
 

@@ -1,5 +1,6 @@
 mod color;
 mod crop;
+mod decode;
 mod fit;
 mod frames;
 mod grading;
@@ -43,11 +44,10 @@ fn find_model_path() -> Result<PathBuf, String> {
     Err("Could not find yolov8n-pose.onnx model file".to_string())
 }
 
-/// Load an image from disk as an `RgbImage`.
+/// Load a video frame from disk as an upright sRGB `RgbImage`.
 fn load_image(path: &Path) -> Result<RgbImage, String> {
-    image::open(path)
-        .map(|i| i.to_rgb8())
-        .map_err(|e| format!("Failed to load image {}: {}", path.display(), e))
+    let d = decode::decode_file(path)?;
+    Ok(decode::to_srgb_rgb8(&d.image, d.icc.as_deref(), decode::Background::Black))
 }
 
 /// Save an `RgbImage` as JPEG with quality 92.
@@ -312,28 +312,24 @@ pub async fn process_custom_thumbnail(
         source_path
     );
 
-    let img = load_image(source)?;
+    // Upright, as the editor showed it: the crop is in that space.
+    let decoded = decode::decode_file(source)?;
+    let img = &decoded.image;
 
-    // Clamp crop rect to image bounds
-    let clamped = CropRect {
-        x: crop_rect.x.max(0).min(img.width() as i32 - 1),
-        y: crop_rect.y.max(0).min(img.height() as i32 - 1),
-        width: crop_rect
-            .width
-            .max(1)
-            .min(img.width() as i32 - crop_rect.x.max(0)),
-        height: crop_rect
-            .height
-            .max(1)
-            .min(img.height() as i32 - crop_rect.y.max(0)),
-    };
+    // Clamp the crop to the image.
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let x = crop_rect.x.clamp(0, (w - 1).max(0));
+    let y = crop_rect.y.clamp(0, (h - 1).max(0));
+    let clamped = CropRect { x, y, width: crop_rect.width.clamp(1, (w - x).max(1)), height: crop_rect.height.clamp(1, (h - y).max(1)) };
 
     println!(
         "[thumbnail] Cropping: x={}, y={}, w={}, h={}",
         clamped.x, clamped.y, clamped.width, clamped.height
     );
 
-    let mut result = crop_image(&img, &clamped);
+    let cropped = img.crop_imm(clamped.x as u32, clamped.y as u32, clamped.width as u32, clamped.height as u32);
+    // sRGB, and a transparent logo or graphic on white.
+    let mut result = decode::to_srgb_rgb8(&cropped, decoded.icc.as_deref(), decode::Background::White);
 
     if apply_color_grading_flag {
         println!("[thumbnail] Applying color grading");
@@ -356,3 +352,44 @@ pub async fn process_custom_thumbnail(
     Ok(absolute_path.to_string_lossy().to_string())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::decode::tests::{is_close, jpeg_with_orientation, red_over_blue};
+    use super::*;
+
+    fn crop(x: i32, y: i32, width: i32, height: i32) -> CropRect {
+        CropRect { x, y, width, height }
+    }
+
+    #[tokio::test]
+    async fn a_rotated_photo_is_cropped_where_the_editor_showed_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("photo.jpg");
+        // Shown turned 90° clockwise: 32 wide, 64 tall, blue on the left.
+        std::fs::write(&src, jpeg_with_orientation(&red_over_blue(), 6)).unwrap();
+        let out = process_custom_thumbnail(src.to_str().unwrap(), tmp.path(), &crop(0, 0, 12, 64), false).await.unwrap();
+        let img = image::open(&out).unwrap().to_rgb8();
+        assert_eq!((img.width(), img.height()), (12, 64));
+        for (x, y) in [(2, 2), (6, 32), (10, 60)] {
+            assert!(is_close(*img.get_pixel(x, y), [0, 0, 255]), "({x},{y}) {:?}", img.get_pixel(x, y));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transparent_logo_is_cropped_onto_white() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("logo.png");
+        let mut logo = image::RgbaImage::from_pixel(32, 18, image::Rgba([0, 0, 0, 0]));
+        for x in 8..24 {
+            for y in 4..14 {
+                logo.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        logo.save(&src).unwrap();
+        let out = process_custom_thumbnail(src.to_str().unwrap(), tmp.path(), &crop(0, 0, 32, 18), false).await.unwrap();
+        let img = image::open(&out).unwrap().to_rgb8();
+        assert!(is_close(*img.get_pixel(1, 1), [255, 255, 255]), "{:?}", img.get_pixel(1, 1));
+        assert!(is_close(*img.get_pixel(16, 9), [0, 0, 0]), "{:?}", img.get_pixel(16, 9));
+    }
+}

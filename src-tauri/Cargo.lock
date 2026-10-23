@@ -4408,6 +4408,7 @@ dependencies = [
  "glob",
  "image",
  "md5",
+ "moxcms",
  "ndarray",
  "ort",
  "reqwest",

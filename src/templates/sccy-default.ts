@@ -1,9 +1,12 @@
 import type { TemplateConfig, TemplateData } from "./types";
 import { cssUrl, el, svg } from "./dom";
 import { balanceLines } from "@/lib/titleSplit";
+// A data: URL. html2canvas draws an SVG as an image, and an SVG image can't
+// load the page's fonts, so the logo carries its own.
+import montserrat from "./fonts/Montserrat-Medium.woff2?inline";
 
 /** Bump whenever the template's look changes, so stored renders are redone. */
-export const TEMPLATE_VERSION = 3;
+export const TEMPLATE_VERSION = 4;
 
 /** The text may use the left of the frame up to this width... */
 const MAX_TEXT_WIDTH = 1280 - 80 - 60;
@@ -72,7 +75,9 @@ function logo(): SVGElement {
       },
       [ch],
     );
+  const font = `@font-face { font-family: 'Montserrat'; font-weight: 500; src: url("${montserrat}") format('woff2'); }`;
   return svg("svg", { viewBox: "0 0 130 100", width: 99, height: 76 }, [
+    svg("style", {}, [font]),
     svg("rect", { x: 20, y: 5, width: 90, height: 90, fill: "none", stroke: WHITE, "stroke-width": 3 }),
     svg("line", { x1: 3, y1: 47, x2: 127, y2: 47, stroke: WHITE, "stroke-width": 3 }),
     svg("line", { x1: 3, y1: 53, x2: 127, y2: 53, stroke: WHITE, "stroke-width": 3 }),

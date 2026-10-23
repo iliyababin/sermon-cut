@@ -433,7 +433,11 @@ impl AppState {
                     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
                     let aside = path.with_file_name(format!("state.json.corrupt-{}", stamp));
                     eprintln!("Failed to parse state file ({}); moved to {}", e, aside.display());
-                    let _ = std::fs::rename(path, &aside);
+                    if std::fs::rename(path, &aside).is_ok() {
+                        // It may hold the sign-in, and may have been written
+                        // before state.json was made private.
+                        make_private(&aside);
+                    }
                     let restored = std::fs::read(&backup)
                         .ok()
                         .and_then(|b| serde_json::from_slice::<PersistedState>(&b).ok());
@@ -519,15 +523,39 @@ impl AppState {
     /// Before dropping the old videos from state.json, keep a copy of the
     /// original file (once: a later run must not overwrite the real original).
     pub fn backup_pre_library_state() -> Result<(), String> {
-        let path = get_state_file_path();
-        let backup = path.with_file_name("state.v0.json");
-        if backup.exists() || !path.exists() {
-            return Ok(());
-        }
-        std::fs::copy(&path, &backup)
-            .map(|_| ())
-            .map_err(|e| format!("Failed to back up state.json: {}", e))
+        backup_pre_library_state_at(&get_state_file_path())
     }
+}
+
+/// `backup_pre_library_state` for the state.json at `path`. The copy is
+/// owner-only like state.json (a pre-0.4 one was readable by all), and so
+/// is one an earlier run made.
+fn backup_pre_library_state_at(path: &Path) -> Result<(), String> {
+    let backup = path.with_file_name("state.v0.json");
+    if backup.exists() {
+        make_private(&backup);
+        return Ok(());
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Failed to back up state.json: {}", e)),
+    };
+    crate::library::fsutil::write_atomic_private(&backup, &bytes).map_err(|e| format!("Failed to back up state.json: {}", e))
+}
+
+/// Make a copy of state.json readable by its owner only (it may hold the
+/// YouTube sign-in).
+fn make_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("[warn] Failed to make {} private: {}", path.display(), e);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[cfg(test)]
@@ -703,6 +731,45 @@ mod tests {
         let loaded = AppState::load_from(&path);
         assert!(loaded.settings.youtube_auth.is_none());
         assert!(loaded.notices[0].contains("defaults"), "{}", loaded.notices[0]);
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_of_an_old_readable_state_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let readable = |p: &Path| std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Written by v0.3, readable by all.
+        std::fs::write(&path, br#"{"settings": null, "videos": {"a": {}}}"#).unwrap();
+        readable(&path);
+        backup_pre_library_state_at(&path).unwrap();
+        let v0 = tmp.path().join("state.v0.json");
+        assert_eq!(std::fs::read(&v0).unwrap(), std::fs::read(&path).unwrap());
+        assert_eq!(mode(&v0), 0o600);
+        // One an earlier run made readable is fixed too, not overwritten.
+        readable(&v0);
+        std::fs::write(&path, b"{}").unwrap();
+        backup_pre_library_state_at(&path).unwrap();
+        assert_eq!(mode(&v0), 0o600);
+        assert_ne!(std::fs::read(&v0).unwrap(), b"{}");
+
+        // A damaged one moved aside.
+        std::fs::write(&path, b"garbage").unwrap();
+        readable(&path);
+        AppState::load_from(&path);
+        let aside = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-"))
+            .unwrap();
+        assert_eq!(mode(&aside.path()), 0o600);
     }
 
     #[test]

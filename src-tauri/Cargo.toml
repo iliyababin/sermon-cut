@@ -44,3 +44,6 @@ tauri-plugin-single-instance = "2"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Hooks for the smoke-test build. Only active together with debug_assertions,
+# so a release build never contains them.
+test-hooks = []

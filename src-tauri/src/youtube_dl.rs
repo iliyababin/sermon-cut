@@ -26,14 +26,36 @@ struct YtDlpInfo {
     webpage_url: String,
 }
 
+/// A link yt-dlp may be given: http(s), no whitespace or control
+/// characters (so it can't be read as an option or split).
+fn check_url(url: &str) -> Result<&str, String> {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    let scheme = ["https://", "http://"].into_iter().find(|s| lower.starts_with(s));
+    let has_host = scheme.is_some_and(|s| url.len() > s.len());
+    if !has_host || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Paste a YouTube link that starts with https://".into());
+    }
+    Ok(url)
+}
+
+/// yt-dlp's own config files never apply, and the URL comes after `--`
+/// so it's never taken for an option (docs/INVARIANTS.md #12).
+fn ytdlp_args(options: &[&str], url: &str) -> Result<Vec<String>, String> {
+    let url = check_url(url)?;
+    let mut args = vec!["--ignore-config".to_string()];
+    args.extend(options.iter().map(|s| s.to_string()));
+    args.push("--".into());
+    args.push(url.into());
+    Ok(args)
+}
+
+fn info_args(url: &str) -> Result<Vec<String>, String> {
+    ytdlp_args(&["--dump-json", "--no-download", "--no-playlist"], url)
+}
+
 pub async fn get_video_info(url: &str) -> Result<VideoInfo, String> {
     let output = crate::tools::command("yt-dlp")
-        .args([
-            "--dump-json",
-            "--no-download",
-            "--no-playlist",
-            url,
-        ])
+        .args(info_args(url)?)
         .output()
         .await
         .map_err(|e| crate::tools::spawn_error("yt-dlp", e))?;
@@ -68,6 +90,20 @@ pub async fn get_video_info(url: &str) -> Result<VideoInfo, String> {
     })
 }
 
+fn download_args(format: &str, output: &str, url: &str) -> Result<Vec<String>, String> {
+    ytdlp_args(
+        &[
+            "--format", format,
+            "--output", output,
+            "--no-playlist",
+            "--newline",
+            "--progress",
+            "--progress-template", "PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
+        ],
+        url,
+    )
+}
+
 pub async fn download_video(
     url: &str,
     quality: &str,
@@ -96,15 +132,7 @@ pub async fn download_video(
     };
 
     let mut child = crate::tools::command("yt-dlp")
-        .args([
-            "--format", format,
-            "--output", output_template_str,
-            "--no-playlist",
-            "--newline",
-            "--progress",
-            "--progress-template", "PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-            url,
-        ])
+        .args(download_args(format, output_template_str, url)?)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -234,4 +262,41 @@ fn parse_progress(line: &str) -> Option<(f32, Option<String>, Option<String>)> {
         .map(|s| s.to_string());
 
     Some((percent, speed, eta))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_plain_http_links_are_passed_on() {
+        for bad in [
+            "--exec=touch /tmp/x",
+            "-o/tmp/x",
+            "file:///etc/passwd",
+            "ftp://example.com/v",
+            "youtube.com/watch?v=abc",
+            "https://youtube.com/watch?v=a b",
+            "https://youtube.com/watch?v=a\n--exec=x",
+            "https://youtube.com/\twatch",
+            "https://",
+            "",
+        ] {
+            assert!(info_args(bad).is_err(), "{bad:?}");
+            assert!(download_args("best", "/tmp/%(id)s.%(ext)s", bad).is_err(), "{bad:?}");
+        }
+        for good in ["https://www.youtube.com/watch?v=dQw4w9WgXcQ", "HTTP://youtu.be/dQw4w9WgXcQ"] {
+            assert!(info_args(good).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn config_is_ignored_and_the_url_comes_after_the_separator() {
+        let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        for args in [info_args(url).unwrap(), download_args("best", "/tmp/%(id)s.%(ext)s", url).unwrap()] {
+            assert_eq!(args[0], "--ignore-config");
+            assert_eq!(&args[args.len() - 2..], ["--", url]);
+            assert_eq!(args.iter().filter(|a| *a == "--").count(), 1);
+        }
+    }
 }

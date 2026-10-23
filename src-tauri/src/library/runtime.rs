@@ -1396,11 +1396,7 @@ impl Library {
             .thumbnail_options
             .iter()
             .map(|id| {
-                let raw = raw_variant(id).map(|r| dir.join(r)).filter(|p| p.is_file());
-                let render_from = raw.unwrap_or_else(|| dir.join(id));
-                let version = std::fs::metadata(&render_from)
-                    .map(|m| fsutil::mtime_ms(&m).to_string())
-                    .unwrap_or_default();
+                let (render_from, version) = render_from(&dir, id);
                 ThumbnailOption {
                     id: id.clone(),
                     path: abs(id),
@@ -1751,6 +1747,7 @@ impl Library {
                     title: None,
                     description: None,
                     preacher: old.review.preacher,
+                    single_line: old.review.single_line,
                 },
                 ..Default::default()
             };
@@ -2122,6 +2119,7 @@ impl Library {
         id: &str,
         source: &str,
         render_key: &str,
+        template_version: u32,
         image_bytes: Vec<u8>,
     ) -> Result<String, String> {
         if !valid_render_key(render_key) {
@@ -2131,9 +2129,11 @@ impl Library {
         let dir = self.with_entry(id, |g, paths| {
             g.require_render_allowed(id)?;
             let dir = paths.ensure_video_dir(id)?;
-            if !manifest::load_video_data(&dir).thumbnail_options.contains(&source) {
+            let data = manifest::load_video_data(&dir);
+            if !data.thumbnail_options.contains(&source) {
                 return Err("That thumbnail is no longer one of this video's options".into());
             }
+            check_render_key(&dir, &data, &source, template_version, render_key)?;
             Ok(dir)
         })?;
 
@@ -2160,6 +2160,7 @@ impl Library {
             if !data.thumbnail_options.contains(&source) {
                 return Err("That thumbnail is no longer one of this video's options".into());
             }
+            check_render_key(&dir, &data, &source, template_version, render_key)?;
             std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("Failed to save thumbnail: {}", e))?;
             data.renders.retain(|r| r.source != source);
             data.renders.push(Render {
@@ -2646,6 +2647,40 @@ fn raw_variant(id: &str) -> Option<String> {
     n.bytes().all(|b| b.is_ascii_digit()).then(|| format!("{}_raw.jpg", stem))
 }
 
+/// What the template draws over for source `id` (its plain crop, if it's a
+/// generated option that has one), and that file's version (its mtime), part
+/// of the render key.
+fn render_from(dir: &Path, id: &str) -> (PathBuf, String) {
+    let raw = raw_variant(id).map(|r| dir.join(r)).filter(|p| p.is_file());
+    let from = raw.unwrap_or_else(|| dir.join(id));
+    let version = std::fs::metadata(&from)
+        .map(|m| fsutil::mtime_ms(&m).to_string())
+        .unwrap_or_default();
+    (from, version)
+}
+
+/// Refuse a render whose key isn't the one the saved review gives for this
+/// source now: it was drawn with a title, speaker or image that has changed
+/// since. Keys, not counters: inputs that go A→B→A make A's render current.
+fn check_render_key(dir: &Path, data: &VideoData, source: &str, template_version: u32, key: &str) -> Result<(), String> {
+    let (_, version) = render_from(dir, source);
+    let r = &data.review;
+    let expected = manifest::render_key(
+        template_version,
+        r.title.as_deref().unwrap_or(""),
+        r.preacher.as_deref().unwrap_or(""),
+        r.single_line,
+        source,
+        &version,
+    );
+    if expected != key {
+        return Err(STALE_RENDER.into());
+    }
+    Ok(())
+}
+
+const STALE_RENDER: &str = "The title, speaker or image changed while the thumbnail was being drawn. It will be drawn again.";
+
 /// Which file to send to YouTube as the thumbnail (see `begin_upload`).
 fn resolve_thumbnail(
     dir: &Path,
@@ -3047,6 +3082,51 @@ mod tests {
         out.into_inner()
     }
 
+    const TV: u32 = 4;
+
+    /// The key a render of `source` must carry once the review's title is
+    /// `title` (and the speaker "P").
+    fn test_key(dir: &Path, source: &str, title: &str) -> String {
+        let (_, version) = render_from(dir, source);
+        manifest::render_key(TV, title, "P", false, source, &version)
+    }
+
+    /// Save the review with `title`, then a render of `source` made from it.
+    async fn rendered(lib: &Arc<Library>, id: &str, source: &str, title: &str, bytes: Vec<u8>) -> Result<String, String> {
+        // Refused while the video is processing, as the render then is.
+        let _ = lib.save_review(id, Review { title: Some(title.into()), preacher: Some("P".into()), ..Default::default() }, None);
+        let dir = lib.inner().paths.clone().unwrap().video_dir(id).unwrap();
+        lib.save_rendered_thumbnail(id, source, &test_key(&dir, source, title), TV, bytes).await
+    }
+
+    #[tokio::test]
+    async fn a_render_of_inputs_no_longer_saved_is_refused() {
+        let (_t, lib, id, dir) = processed_library();
+        let source = "thumbnail_option_1.jpg";
+        let review = |title: &str| Review { title: Some(title.into()), preacher: Some("P".into()), ..Default::default() };
+        let key_a = test_key(&dir, source, "A");
+        lib.save_review(&id, review("A"), None).unwrap();
+        lib.save_rendered_thumbnail(&id, source, &key_a, TV, png()).await.unwrap();
+
+        // The title became B: a render of A is stale.
+        lib.save_review(&id, review("B"), None).unwrap();
+        let err = lib.save_rendered_thumbnail(&id, source, &key_a, TV, png()).await.unwrap_err();
+        assert_eq!(err, STALE_RENDER);
+        assert_eq!(lib.detail(&id).unwrap().renders[0].render_key, key_a, "the stored render is kept");
+
+        // And back to A: A's render is current again.
+        lib.save_review(&id, review("A"), None).unwrap();
+        lib.save_rendered_thumbnail(&id, source, &key_a, TV, png()).await.unwrap();
+        // So is a render made with the speaker on one line, once saved so.
+        let one_line = Review { single_line: true, ..review("A") };
+        lib.save_review(&id, one_line, None).unwrap();
+        let (_, version) = render_from(&dir, source);
+        let key = manifest::render_key(TV, "A", "P", true, source, &version);
+        lib.save_rendered_thumbnail(&id, source, &key, TV, png()).await.unwrap();
+        assert!(lib.save_rendered_thumbnail(&id, source, &key, TV + 1, png()).await.is_err(), "another template");
+        assert_eq!(rendered_files(&dir).len(), 1);
+    }
+
     fn rendered_files(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -3061,10 +3141,10 @@ mod tests {
     #[tokio::test]
     async fn renders_replace_per_source_and_keep_the_selection() {
         let (_t, lib, id, dir) = processed_library();
-        let first = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k1", png()).await.unwrap();
-        lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k1", png()).await.unwrap();
+        let first = rendered(&lib, &id, "thumbnail_option_1.jpg", "k1", png()).await.unwrap();
+        rendered(&lib, &id, "thumbnail_option_2.jpg", "k1", png()).await.unwrap();
         // Re-rendering a source replaces its render and deletes the old file.
-        let second = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap();
+        let second = rendered(&lib, &id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap();
         assert!(!Path::new(&first).exists());
         assert!(Path::new(&second).exists());
         assert_eq!(rendered_files(&dir).len(), 2);
@@ -3073,7 +3153,7 @@ mod tests {
         assert_eq!(d.thumbnail_options.len(), 2, "renders never become options");
         assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
         let r1 = d.renders.iter().find(|r| r.source == "thumbnail_option_1.jpg").unwrap();
-        assert_eq!(r1.render_key, "k2");
+        assert_eq!(r1.render_key, test_key(&dir, "thumbnail_option_1.jpg", "k2"));
         assert_eq!(r1.path, second);
         // Generated options render from their plain crop.
         assert!(d.thumbnail_options[0].render_from.ends_with("thumbnail_option_1_raw.jpg"));
@@ -3091,7 +3171,7 @@ mod tests {
     #[tokio::test]
     async fn saves_keep_unrecorded_renders_until_the_next_open_sweeps_them() {
         let (_t, lib, id, dir) = processed_library();
-        let kept = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k1", png()).await.unwrap();
+        let kept = rendered(&lib, &id, "thumbnail_option_1.jpg", "k1", png()).await.unwrap();
         // A render being written, and one renamed into place but not yet
         // recorded, while the review screen saves.
         let writing = format!("{}{}", manifest::RENDER_TMP_PREFIX, manifest::render_file_name("thumbnail_option_2.jpg"));
@@ -3112,7 +3192,7 @@ mod tests {
     #[tokio::test]
     async fn adding_a_source_keeps_selection_and_renders() {
         let (_t, lib, id, dir) = processed_library();
-        lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
+        rendered(&lib, &id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
         // What custom_thumbnail does: a new source at the front.
         std::fs::write(dir.join("custom_thumbnail_1.jpg"), b"jpg").unwrap();
         let mut data = manifest::load_video_data(&dir);
@@ -3134,18 +3214,18 @@ mod tests {
     async fn renders_are_allowed_during_upload_but_not_processing() {
         let (_t, lib, id, _dir) = processed_library();
         let job = lib.begin_upload(&id, None, None).unwrap();
-        lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k", png()).await.unwrap();
+        rendered(&lib, &id, "thumbnail_option_1.jpg", "k", png()).await.unwrap();
         lib.finish_upload(&id, job, None, &public());
 
         lib.inner().queue.push_back(id.clone());
-        let err = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap_err();
+        let err = rendered(&lib, &id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap_err();
         assert!(err.contains("processed"), "{err}");
         lib.inner().queue.clear();
 
         // Not one of the options, or a key that isn't plain ASCII.
-        assert!(lib.save_rendered_thumbnail(&id, "../../x.jpg", "k", png()).await.is_err());
-        assert!(lib.save_rendered_thumbnail(&id, "other.jpg", "k", png()).await.is_err());
-        assert!(lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k/../", png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "../../x.jpg", "k", TV, png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "other.jpg", "k", TV, png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k/../", TV, png()).await.is_err());
     }
 
     #[test]
@@ -3199,9 +3279,9 @@ mod tests {
     #[tokio::test]
     async fn upload_uses_the_current_render_or_the_source() {
         let (_t, lib, id, dir) = processed_library();
-        let render = lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
+        let render = rendered(&lib, &id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
 
-        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("k".into())).unwrap();
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some(test_key(&dir, "thumbnail_option_2.jpg", "k"))).unwrap();
         assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
         lib.finish_upload(&id, job, None, &public());
 
@@ -3221,17 +3301,17 @@ mod tests {
 
     #[tokio::test]
     async fn an_edit_during_an_upload_does_not_lose_its_thumbnail() {
-        let (_t, lib, id, _dir) = processed_library();
-        let render = lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
+        let (_t, lib, id, dir) = processed_library();
+        let render = rendered(&lib, &id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
         let sent = std::fs::read(&render).unwrap();
-        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("k".into())).unwrap();
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some(test_key(&dir, "thumbnail_option_2.jpg", "k"))).unwrap();
 
         // The title changes mid-upload: a new render replaces (deletes) the old one.
         let mut other = image::RgbImage::new(8, 8);
         other.put_pixel(0, 0, image::Rgb([255, 0, 0]));
         let mut bytes = std::io::Cursor::new(Vec::new());
         other.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k2", bytes.into_inner()).await.unwrap();
+        rendered(&lib, &id, "thumbnail_option_2.jpg", "k2", bytes.into_inner()).await.unwrap();
         assert!(!Path::new(&render).exists());
 
         assert_eq!(job.thumbnail_data.as_deref(), Some(sent.as_slice()));

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { errorMessage, getVideo, saveRenderedThumbnail } from "@/lib/tauri";
 import type { ThumbnailOption, ThumbnailRender } from "@/lib/types";
+import { TEMPLATE_VERSION } from "@/templates";
 
 export type RenderMap = Record<string, { path: string; key: string }>;
 
@@ -97,7 +98,7 @@ export function useRenderSync({ videoId, options, keys, enabled, initial, render
           if (cancelled) break;
           await beforeSaveRef.current?.();
           if (cancelled) break;
-          const path = await saveRenderedThumbnail(id, option.id, key, bytes);
+          const path = await saveRenderedThumbnail(id, option.id, key, TEMPLATE_VERSION, bytes);
           saved = true;
           // Taken even if cancelled meanwhile: the backend has recorded it
           // and deleted the render it replaced.

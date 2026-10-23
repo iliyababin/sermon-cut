@@ -95,10 +95,12 @@ pub async fn save_review(
     title: Option<String>,
     description: Option<String>,
     preacher: Option<String>,
+    single_line: Option<bool>,
     selected_source: Option<String>,
 ) -> Result<(), String> {
     let named = preacher.clone().unwrap_or_default();
-    lib.save_review(&video_id, Review { title, description, preacher }, selected_source)?;
+    let review = Review { title, description, preacher, single_line: single_line.unwrap_or(false) };
+    lib.save_review(&video_id, review, selected_source)?;
     // Offered on the next video's review screen.
     let mut s = state.lock().await;
     if s.note_preacher(&video_id, &named) {
@@ -183,8 +185,11 @@ pub async fn save_rendered_thumbnail(
     let video_id = header(request.headers(), "x-video-id")?;
     let source = header(request.headers(), "x-source")?;
     let render_key = header(request.headers(), "x-render-key")?;
+    let template_version = header(request.headers(), "x-template-version")?
+        .parse::<u32>()
+        .map_err(|_| "Invalid x-template-version header".to_string())?;
     let bytes = raw_image(request.body())?;
-    let result = lib.save_rendered_thumbnail(&video_id, &source, &render_key, bytes).await;
+    let result = lib.save_rendered_thumbnail(&video_id, &source, &render_key, template_version, bytes).await;
     // The card shows the selected render.
     changed(&app_handle);
     result

@@ -124,16 +124,16 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   // The template draws title/speaker/logo over each source; the result is
   // saved into the video's library folder. A render is current when its key
   // matches what it would be rendered with now; only stale ones are redone.
-  const [singleLine, setSingleLine] = useState(false);
+  const [singleLine, setSingleLine] = useState(video.review.single_line ?? false);
   const titleLines = useMemo(
     () => (singleLine ? [title.trim()] : splitTitleIntoLines(title)).filter((l) => l),
     [title, singleLine]
   );
   const canRender = titleLines.length > 0 && preacher.trim() !== "";
   const keys = useMemo(() => {
-    const inputs = { titleLines, preacher, singleLine };
+    const inputs = { title, preacher, singleLine };
     return Object.fromEntries(thumbnailOptions.map((o) => [o.id, renderKey(o, inputs)]));
-  }, [thumbnailOptions, titleLines, preacher, singleLine]);
+  }, [thumbnailOptions, title, preacher, singleLine]);
   // A render that failed doesn't block uploading: the plain image is used.
   const {
     renders,
@@ -152,6 +152,9 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       const [result] = await renderThumbnailBatch(getDefaultTemplate(), [option.render_from], titleLines, preacher);
       return result.imageData;
     },
+    // The backend checks each render's key against the saved title, speaker
+    // and layout, so those are saved first.
+    beforeSave: () => saveRenderInputs(),
   });
 
   const thumbnailsReady = staleOptions.length === 0 || renderError !== null;
@@ -189,8 +192,14 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
 
   // Autosave edits (debounced), and flush whatever is pending on close.
-  const latest = useRef({ title, description, preacher, selectedSource });
-  latest.current = { title, description, preacher, selectedSource };
+  const latest = useRef({ title, description, preacher, singleLine, selectedSource });
+  latest.current = { title, description, preacher, singleLine, selectedSource };
+  // The render inputs the backend has, which it checks render keys against.
+  const savedInputs = useRef({
+    title: video.review.title,
+    preacher: video.review.preacher,
+    singleLine: video.review.single_line ?? false,
+  });
   const dirty = useRef(false);
   const firstRender = useRef(true);
   // The save in flight, if any; flushing waits for it, so leaving never
@@ -206,10 +215,11 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       setSavesInFlight((n) => n + 1);
       return saveReview(
         video.id,
-        { title: v.title, description: v.description, preacher: v.preacher },
+        { title: v.title, description: v.description, preacher: v.preacher, singleLine: v.singleLine },
         v.selectedSource
       )
         .then(() => {
+          savedInputs.current = { title: v.title, preacher: v.preacher, singleLine: v.singleLine };
           setSaveError(null);
           setSavedOnce(true);
           return true;
@@ -226,6 +236,16 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     return run;
   };
 
+  /** Save the title, speaker and layout now if the backend doesn't have
+   * them yet (a render is about to be saved). */
+  const saveRenderInputs = async () => {
+    const v = latest.current;
+    const s = savedInputs.current;
+    if (!dirty.current && s.title === v.title && s.preacher === v.preacher && s.singleLine === v.singleLine) return;
+    dirty.current = true;
+    await flush();
+  };
+
   useEffect(() => {
     if (firstRender.current) {
       firstRender.current = false;
@@ -234,7 +254,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     dirty.current = true;
     const timer = setTimeout(flush, AUTOSAVE_MS);
     return () => clearTimeout(timer);
-  }, [title, description, preacher, selectedSource]);
+  }, [title, description, preacher, singleLine, selectedSource]);
 
   useEffect(() => () => void flush(), []);
 

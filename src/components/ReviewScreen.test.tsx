@@ -2,11 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { VideoDetail } from "@/lib/types";
 import { renderKey } from "./review/renderKey";
-import { splitTitleIntoLines } from "@/lib/utils";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (cmd: string, args?: unknown) => invoke(cmd, args),
+  invoke: (cmd: string, ...rest: unknown[]) => invoke(cmd, ...rest),
   convertFileSrc: (p: string) => `asset://${p}`,
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
@@ -28,7 +27,7 @@ const options = [
   { id: "thumbnail_option_2.jpg", path: "/v/thumbnail_option_2.jpg", render_from: "/v/thumbnail_option_2_raw.jpg", version: "1" },
 ];
 const currentKey = (o: (typeof options)[number]) =>
-  renderKey(o, { titleLines: splitTitleIntoLines(TITLE), preacher: PREACHER, singleLine: false });
+  renderKey(o, { title: TITLE, preacher: PREACHER, singleLine: false });
 
 function video(overrides: Partial<VideoDetail> = {}): VideoDetail {
   return {
@@ -138,6 +137,18 @@ describe("ReviewScreen", () => {
     await act(() => new Promise((r) => setTimeout(r, 20)));
     expect(renderThumbnailBatch).not.toHaveBeenCalled();
     expect(calls("save_rendered_thumbnail")).toHaveLength(0);
+  });
+
+  it("saves the title and speaker before a render of them, which the backend checks", async () => {
+    // Fresh from processing: the suggested title was never saved.
+    render(<ReviewScreen video={video({ renders: [], review: { title: null, description: null, preacher: PREACHER } })} onBack={() => {}} />);
+    await waitFor(() => expect(calls("save_rendered_thumbnail").length).toBeGreaterThan(0));
+    const order = invoke.mock.calls.map(([c]) => c).filter((c) => c === "save_review" || c === "save_rendered_thumbnail");
+    expect(order[0]).toBe("save_review");
+    const saved = calls("save_review")[0][1] as Record<string, unknown>;
+    expect(saved).toMatchObject({ title: "a", preacher: PREACHER, singleLine: false });
+    const headers = (calls("save_rendered_thumbnail")[0] as unknown[])[2] as { headers: Record<string, string> };
+    expect(headers.headers["x-render-key"]).toBe(renderKey(options[0], { title: "a", preacher: PREACHER, singleLine: false }));
   });
 
   it("sends one upload for a double-click", async () => {

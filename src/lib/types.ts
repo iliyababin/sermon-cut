@@ -121,6 +121,8 @@ export interface Review {
   title: string | null;
   description: string | null;
   preacher: string | null;
+  /** The thumbnail title on one line; missing when false. */
+  single_line?: boolean;
 }
 
 /** Everything the review screen needs. */

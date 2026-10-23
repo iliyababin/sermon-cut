@@ -303,6 +303,39 @@ pub struct Review {
     pub description: Option<String>,
     #[serde(default)]
     pub preacher: Option<String>,
+    /// The thumbnail title on one line instead of balanced over two.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_line: bool,
+}
+
+/// The key of a template render made from these inputs; the same as the
+/// webview's `renderKey` (src/components/review/renderKey.ts): cyrb53 over
+/// the inputs as a JSON array, as hex. A shared test vector keeps them in
+/// step.
+pub fn render_key(template_version: u32, title: &str, preacher: &str, single_line: bool, source: &str, version: &str) -> String {
+    let json = serde_json::to_string(&(template_version, title, js_trim(preacher), single_line, source, version))
+        .unwrap_or_default();
+    cyrb53(&json)
+}
+
+/// JavaScript's `String.prototype.trim`, which differs from Rust's in two
+/// characters: it strips U+FEFF but not U+0085.
+fn js_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
+}
+
+/// cyrb53 over the string's UTF-16 code units, as JavaScript computes it.
+fn cyrb53(s: &str) -> String {
+    let mut h1: u32 = 0xdeadbeef;
+    let mut h2: u32 = 0x41c6ce57;
+    for ch in s.encode_utf16() {
+        h1 = (h1 ^ ch as u32).wrapping_mul(2654435761);
+        h2 = (h2 ^ ch as u32).wrapping_mul(1597334677);
+    }
+    h1 = (h1 ^ (h1 >> 16)).wrapping_mul(2246822507) ^ (h2 ^ (h2 >> 13)).wrapping_mul(3266489909);
+    h2 = (h2 ^ (h2 >> 16)).wrapping_mul(2246822507) ^ (h1 ^ (h1 >> 13)).wrapping_mul(3266489909);
+    let n = 4294967296u64 * (2097151 & h2) as u64 + h1 as u64;
+    format!("{:x}", n)
 }
 
 /// File name prefix of thumbnails rendered with the template (title,
@@ -896,6 +929,14 @@ mod tests {
         save_video_data(dir, &now).unwrap();
         assert_eq!(prune_renders(dir, &load_video_data(dir)), vec![fresh.clone()]);
         assert!(dir.join(&newer).exists());
+    }
+
+    #[test]
+    fn render_key_matches_the_webview() {
+        // The same vector is in src/components/review/renderKey.test.ts.
+        let key = render_key(4, "Héllo \"world\"\n\t😀 \\ </>", "\u{a0}Pastor Ü\u{feff} ", true, "custom_thumbnail_1.jpg", "1730000000000");
+        assert_eq!(key, "1a4ef5393622d8");
+        assert_eq!(js_trim("\u{85}x\u{feff}"), "\u{85}x");
     }
 
     #[test]

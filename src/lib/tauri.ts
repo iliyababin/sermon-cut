@@ -58,7 +58,7 @@ export async function forgetVideo(videoId: string): Promise<void> {
 
 export async function saveReview(
   videoId: string,
-  review: { title: string; description: string; preacher: string },
+  review: { title: string; description: string; preacher: string; singleLine: boolean },
   selectedSource: string | null
 ): Promise<void> {
   return invoke("save_review", { videoId, ...review, selectedSource });
@@ -253,6 +253,7 @@ export async function saveRenderedThumbnail(
   videoId: string,
   source: string,
   renderKey: string,
+  templateVersion: number,
   imageData: Uint8Array,
 ): Promise<string> {
   return invoke("save_rendered_thumbnail", imageData, {
@@ -260,6 +261,8 @@ export async function saveRenderedThumbnail(
       "x-video-id": encodeURIComponent(videoId),
       "x-source": encodeURIComponent(source),
       "x-render-key": encodeURIComponent(renderKey),
+      // The backend checks the key against the saved review drawn with it.
+      "x-template-version": String(templateVersion),
     },
   });
 }

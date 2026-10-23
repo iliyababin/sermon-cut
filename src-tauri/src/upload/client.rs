@@ -306,6 +306,13 @@ impl Uploader<'_> {
         stored: UploadSession,
         current: &Current<'_>,
     ) -> Result<Settled, UploadError> {
+        if !stored.is_trusted() {
+            // Not YouTube's upload server (an edited library.json): never
+            // contacted, so there is nothing to settle.
+            println!("[upload] Ignoring a stored session that isn't YouTube's");
+            store.save(None);
+            return Ok(Settled::Fresh);
+        }
         let matches = stored.reusable_for(current.file_hash, current.size, current.metadata_hash, chrono::Utc::now());
         let mut failures = 0u32;
         let mut refreshed = false;

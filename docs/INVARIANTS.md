@@ -34,7 +34,9 @@ this file in the same commit and say why.
 
 8. An upload session is discarded only on a definite answer from YouTube
    (308 with a mismatch, 404, 410). Errors, timeouts and unknown answers keep
-   it. A finished session (200/201) is recorded, never re-uploaded.
+   it. A finished session (200/201) is recorded, never re-uploaded. The one
+   exception is a session URI that isn't YouTube's upload server
+   (`UploadSession::is_trusted`): it is dropped without being contacted.
 9. Sessions are settled in one place: when the next upload begins
    (`client::Uploader::settle`). A re-trim, an edit or a cancel never drops
    a session. A finished session for other metadata or an earlier cut is

@@ -9,19 +9,25 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+/// YouTube keeps uploaded data in blocks of this size.
+const BLOCK: usize = 256 * 1024;
+
 /// What the next chunk PUT runs into.
 #[derive(Debug, Clone)]
 pub enum Fault {
     /// Reply with this status (and `Retry-After`) without storing anything.
-    Status { code: u16, retry_after: Option<u64> },
+    Status { code: u16, retry_after: Option<String> },
     /// Store the chunk, then close the connection without a reply.
     DropAfterStore,
-    /// Store only the first n bytes and say so in a 308.
+    /// Store only the first n bytes (whole 256 KiB blocks of them) and say
+    /// so in a 308.
     PartialStore(usize),
     /// Read the chunk, keep none of it, and answer 308 with the same Range.
     NoProgress,
     /// Read the chunk, then never answer.
     Stall,
+    /// Read the first bytes of the chunk, then neither read more nor answer.
+    StallMidBody,
     /// Store the chunk, then never answer (the reply is lost while a
     /// cancel comes in).
     StoreThenHang,
@@ -149,7 +155,27 @@ impl MockServer {
 
     async fn serve(&self, stream: TcpStream) {
         let mut reader = BufReader::new(stream);
-        let Some(req) = read_request(&mut reader).await else { return };
+        let Some(mut req) = read_head(&mut reader).await else { return };
+        let len: usize = req.headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let chunk = req.method == "PUT" && req.path.starts_with("/session/") && !is_query(&req);
+        let stall = chunk && self.with(|s| {
+            let front = matches!(s.faults.front(), Some(Fault::StallMidBody));
+            if front {
+                s.faults.pop_front();
+                s.chunk_puts += 1;
+            }
+            front
+        });
+        if stall {
+            let mut some = vec![0u8; len.min(1000)];
+            let _ = reader.read_exact(&mut some).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            return;
+        }
+        req.body = vec![0u8; len];
+        if reader.read_exact(&mut req.body).await.is_err() {
+            return;
+        }
         let mut stream = reader.into_inner();
         let reply = self.handle(&req);
         match reply {
@@ -212,15 +238,20 @@ impl MockServer {
                 let state = &mut *s;
                 let Some(sess) = state.sessions.get_mut(&id) else { return json(404, "{}") };
                 let start = chunk_start(req).unwrap_or(u64::MAX);
+                // Like YouTube, keep only whole 256 KiB blocks until the end.
                 let mut store = |n: usize, stored: &mut u64| {
                     if start == sess.data.len() as u64 {
+                        let before = sess.data.len();
                         sess.data.extend_from_slice(&req.body[..n.min(req.body.len())]);
-                        *stored += n.min(req.body.len()) as u64;
+                        if (sess.data.len() as u64) < sess.size {
+                            sess.data.truncate(sess.data.len() / BLOCK * BLOCK);
+                        }
+                        *stored += sess.data.len().saturating_sub(before) as u64;
                     }
                 };
                 match fault {
                     Some(Fault::Status { code, retry_after }) => {
-                        let headers = retry_after.map(|r| vec![("Retry-After".to_string(), r.to_string())]).unwrap_or_default();
+                        let headers = retry_after.map(|r| vec![("Retry-After".to_string(), r)]).unwrap_or_default();
                         Reply::Send(code, headers, br#"{"error":{"code":503,"message":"Backend Error"}}"#.to_vec())
                     }
                     Some(Fault::DropAfterStore) => {
@@ -241,7 +272,7 @@ impl MockServer {
                         state.sessions.remove(&id);
                         json(code, "{}")
                     }
-                    Some(Fault::ExpireToken(_)) => unreachable!(),
+                    Some(Fault::ExpireToken(_)) | Some(Fault::StallMidBody) => unreachable!(),
                     None => {
                         store(req.body.len(), &mut state.bytes_stored);
                         session_state(sess)
@@ -301,7 +332,8 @@ fn session_state(sess: &Session) -> Reply {
     Reply::Send(308, headers, Vec::new())
 }
 
-async fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
+/// The request line and headers; the body is read by the caller.
+async fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let mut line = String::new();
     reader.read_line(&mut line).await.ok()?;
     let mut parts = line.split_whitespace();
@@ -321,10 +353,7 @@ async fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
             headers.insert(k.trim().to_lowercase(), v.trim().to_string());
         }
     }
-    let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).await.ok()?;
-    Some(Request { method, path, headers, body })
+    Some(Request { method, path, headers, body: Vec::new() })
 }
 
 async fn write_response(stream: &mut TcpStream, status: u16, headers: &[(String, String)], body: &[u8]) -> std::io::Result<()> {

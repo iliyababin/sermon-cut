@@ -153,7 +153,7 @@ async fn uploads_in_chunks() {
 #[tokio::test]
 async fn retries_503_honouring_retry_after() {
     let h = Harness::new().await;
-    h.faults(vec![Fault::Status { code: 503, retry_after: Some(7) }]);
+    h.faults(vec![Fault::Status { code: 503, retry_after: Some("7".into()) }]);
     assert_eq!(h.upload().await.unwrap(), "vid1");
     h.assert_complete_once();
     assert_eq!(h.sleeps.lock().unwrap().as_slice(), &[Duration::from_secs(7)]);
@@ -203,12 +203,14 @@ async fn completed_but_reply_lost_is_not_uploaded_twice() {
 
 #[tokio::test]
 async fn partial_308_resumes_from_range() {
-    let h = Harness::new().await;
-    h.faults(vec![Fault::PartialStore(1000)]);
+    let mut h = Harness::new().await;
+    h.cfg.chunk_size = 2 * CHUNK;
+    // 1000 bytes past a block: only the whole block is kept.
+    h.faults(vec![Fault::PartialStore(CHUNK as usize + 1000)]);
     assert_eq!(h.upload().await.unwrap(), "vid1");
     h.assert_complete_once();
-    // 1000 bytes, then the rest in three chunks from there.
-    assert_eq!(h.server.with(|s| (s.chunk_puts, s.queries)), (4, 0));
+    // One block, then the rest from there in two chunks.
+    assert_eq!(h.server.with(|s| (s.chunk_puts, s.queries)), (3, 0));
     assert!(h.sleeps.lock().unwrap().is_empty(), "progress isn't a failure");
 }
 
@@ -580,4 +582,61 @@ async fn no_progress_failures_reset_when_the_offset_advances() {
     assert_eq!(h.upload().await.unwrap(), "vid1");
     h.assert_complete_once();
     assert_eq!(h.sleeps.lock().unwrap().len(), 3);
+}
+
+// Mock fidelity: stalls, errors on the status query, Retry-After dates and
+// which session URIs are used at all.
+
+#[tokio::test]
+async fn a_stall_mid_body_is_abandoned_and_resumed() {
+    let h = Harness::new().await;
+    h.faults(vec![Fault::PartialStore(CHUNK as usize), Fault::StallMidBody]);
+    let started = std::time::Instant::now();
+    assert_eq!(h.upload().await.unwrap(), "vid1");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    h.assert_complete_once();
+    assert_eq!(h.sleeps.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_stall_after_the_body_finds_the_chunk_kept() {
+    let h = Harness::new().await;
+    h.faults(vec![Fault::StoreThenHang]);
+    assert_eq!(h.upload().await.unwrap(), "vid1");
+    h.assert_complete_once();
+    // The status query found the chunk; it wasn't sent again.
+    assert_eq!(h.server.with(|s| (s.chunk_puts, s.queries)), (4, 1));
+}
+
+#[tokio::test]
+async fn errors_on_the_status_query_mid_upload_are_retried() {
+    let mut h = Harness::new().await;
+    // A 401 on the query: the refresh gives the token the server wants.
+    h.tokens.next = "tok1".into();
+    h.faults(vec![Fault::PartialStore(CHUNK as usize), Fault::Status { code: 503, retry_after: None }]);
+    h.server.with(|s| s.query_faults = vec![QueryFault::Status(500), QueryFault::Status(401)].into());
+    assert_eq!(h.upload().await.unwrap(), "vid1");
+    h.assert_complete_once();
+    assert_eq!(h.tokens.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(h.server.with(|s| s.queries), 3);
+}
+
+#[tokio::test]
+async fn retry_after_as_an_http_date() {
+    let h = Harness::new().await;
+    let when = (chrono::Utc::now() + chrono::Duration::seconds(30)).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    h.faults(vec![Fault::Status { code: 503, retry_after: Some(when) }]);
+    assert_eq!(h.upload().await.unwrap(), "vid1");
+    let slept = h.sleeps.lock().unwrap()[0];
+    assert!(slept > Duration::from_secs(25) && slept <= Duration::from_secs(30), "{:?}", slept);
+}
+
+#[tokio::test]
+async fn a_session_uri_that_isnt_youtubes_is_never_contacted() {
+    let h = Harness::new().await;
+    let elsewhere = format!("{}/session/s1", h.server.base.replace("127.0.0.1", "localhost"));
+    h.server.add_session(&h.data, CHUNK as usize, "vidA");
+    h.store.save(Some(&h.matching_session(elsewhere)));
+    assert_eq!(h.upload().await.unwrap(), "vid2");
+    assert_eq!(h.server.with(|s| s.queries), 0);
 }

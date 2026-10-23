@@ -54,7 +54,9 @@ impl UploadSession {
     /// A session URI from library.json (a synced, editable file) is only
     /// used if it points at YouTube's upload server.
     pub fn is_trusted(&self) -> bool {
-        self.uri.starts_with(TRUSTED_PREFIX) && !self.uri.contains(['\r', '\n', ' '])
+        // Tests talk to a mock server on 127.0.0.1.
+        let mock = cfg!(test) && self.uri.starts_with("http://127.0.0.1:");
+        (self.uri.starts_with(TRUSTED_PREFIX) || mock) && !self.uri.contains(['\r', '\n', ' '])
     }
 
     /// Whether this session can carry on the upload described.
@@ -148,6 +150,8 @@ mod tests {
         assert!(!s("https://evil.example/upload/").is_trusted());
         assert!(!s("https://www.googleapis.com.evil.example/upload/").is_trusted());
         assert!(!s("http://www.googleapis.com/upload/x").is_trusted());
+        assert!(!s("http://localhost:9/upload/x").is_trusted());
+        assert!(!s("https://www.googleapis.com/upload/x\r\nHost: evil").is_trusted());
     }
 
     #[test]

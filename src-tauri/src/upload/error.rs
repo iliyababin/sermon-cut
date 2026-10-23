@@ -162,10 +162,15 @@ impl UploadError {
     }
 }
 
-/// `Retry-After` in seconds (the HTTP-date form is rare from Google and
-/// falls back to the normal backoff).
+/// `Retry-After`: seconds, or an HTTP date (a date already past means now).
 pub fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
-    value?.trim().parse::<u64>().ok().map(Duration::from_secs)
+    let value = value?.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let wait = when.with_timezone(&chrono::Utc).signed_duration_since(chrono::Utc::now());
+    Some(wait.to_std().unwrap_or(Duration::ZERO))
 }
 
 #[cfg(test)]
@@ -211,6 +216,11 @@ mod tests {
         assert!(api_error(403, "rateLimitExceeded").is_retryable());
         assert!(!UploadError::from_response(400, String::new(), None, true).is_retryable());
         assert_eq!(parse_retry_after(Some(" 7 ")), Some(Duration::from_secs(7)));
-        assert_eq!(parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")), None);
+        // A date in the past: now.
+        assert_eq!(parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")), Some(Duration::ZERO));
+        let soon = (chrono::Utc::now() + chrono::Duration::seconds(60)).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let d = parse_retry_after(Some(&soon)).unwrap();
+        assert!(d > Duration::from_secs(55) && d <= Duration::from_secs(60), "{:?}", d);
+        assert_eq!(parse_retry_after(Some("soon")), None);
     }
 }

@@ -3,10 +3,17 @@ export interface TemplateConfig {
   name: string;
   width: number;
   height: number;
-  render: (data: TemplateData) => string;
+  /**
+   * Build the thumbnail's DOM inside `root` (which is emptied first) and
+   * return the element to capture. Text goes in as text, never as markup.
+   */
+  render: (root: HTMLElement, data: TemplateData) => HTMLElement;
+  /** Faces the template uses, as `document.fonts.load()` descriptors. */
+  fonts: string[];
 }
 
 export interface TemplateData {
+  /** A URL the webview can load (already converted from a file path). */
   backgroundUrl: string;
   titleLines: string[];
   speakerName: string;

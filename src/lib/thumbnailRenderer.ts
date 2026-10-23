@@ -2,26 +2,42 @@ import html2canvas from "html2canvas";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { TemplateConfig, TemplateData } from "@/templates/types";
 
-async function ensureFontsLoaded(): Promise<void> {
-  await document.fonts.load("700 96px 'Baskervville'");
-  await document.fonts.load("400 51px 'Baskervville'");
-  await document.fonts.ready;
-  // Small delay for the DOM to paint with custom fonts
-  await new Promise((r) => setTimeout(r, 50));
+/** The template fonts, declared once for the whole document (html2canvas
+ * clones the document, so they must live in a stylesheet there). */
+const FONT_FACES = `
+@font-face {
+  font-family: 'Baskervville';
+  font-style: normal;
+  font-weight: 700;
+  src: url('/fonts/Baskervville-Bold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Baskervville';
+  font-style: normal;
+  font-weight: 400;
+  src: url('/fonts/Baskervville-Regular.woff2') format('woff2');
+}`;
+
+function installFonts(): void {
+  if (document.getElementById("thumbnail-fonts")) return;
+  const style = document.createElement("style");
+  style.id = "thumbnail-fonts";
+  style.textContent = FONT_FACES;
+  document.head.appendChild(style);
 }
 
-function waitForImageLoad(container: HTMLElement): Promise<void> {
-  const bgDiv = container.querySelector(".bg-image") as HTMLElement | null;
-  if (!bgDiv) return Promise.resolve();
+async function ensureFontsLoaded(template: TemplateConfig): Promise<void> {
+  installFonts();
+  await Promise.all(template.fonts.map((f) => document.fonts.load(f)));
+  await document.fonts.ready;
+}
 
-  const bgUrl = bgDiv.style.backgroundImage.replace(/url\(['"]?(.+?)['"]?\)/, "$1");
-  if (!bgUrl) return Promise.resolve();
-
+function loadImage(url: string): Promise<void> {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => resolve();
     img.onerror = () => resolve(); // Don't block on error
-    img.src = bgUrl;
+    img.src = url;
   });
 }
 
@@ -30,14 +46,22 @@ export interface RenderResult {
   index: number;
 }
 
+export interface RenderOptions {
+  onProgress?: (current: number, total: number) => void;
+  /** File path to a URL the webview can load; Tauri's asset protocol by default. */
+  resolveUrl?: (path: string) => string;
+}
+
+/** Draw the template over each image and return the results as PNG bytes. */
 export async function renderThumbnailBatch(
   template: TemplateConfig,
   baseImagePaths: string[],
   titleLines: string[],
   speakerName: string,
-  onProgress?: (current: number, total: number) => void,
+  options: RenderOptions = {},
 ): Promise<RenderResult[]> {
-  // Create hidden container
+  const resolveUrl = options.resolveUrl ?? convertFileSrc;
+  // Hidden but laid out, so text can be measured.
   const host = document.createElement("div");
   host.style.position = "fixed";
   host.style.left = "-9999px";
@@ -45,57 +69,31 @@ export async function renderThumbnailBatch(
   host.style.zIndex = "-1";
   document.body.appendChild(host);
 
-  // Inject font-face rules into document head so the browser loads them
-  const fontStyle = document.createElement("style");
-  fontStyle.textContent = `
-    @font-face {
-      font-family: 'Baskervville';
-      font-style: normal;
-      font-weight: 700;
-      src: url('/fonts/Baskervville-Bold.woff2') format('woff2');
-    }
-    @font-face {
-      font-family: 'Baskervville';
-      font-style: normal;
-      font-weight: 400;
-      src: url('/fonts/Baskervville-Regular.woff2') format('woff2');
-    }
-  `;
-  document.head.appendChild(fontStyle);
-
-  await ensureFontsLoaded();
+  await ensureFontsLoaded(template);
 
   const results: RenderResult[] = [];
 
   try {
     for (let i = 0; i < baseImagePaths.length; i++) {
-      onProgress?.(i + 1, baseImagePaths.length);
-
-      const assetUrl = convertFileSrc(baseImagePaths[i]);
+      options.onProgress?.(i + 1, baseImagePaths.length);
 
       const data: TemplateData = {
-        backgroundUrl: assetUrl,
+        backgroundUrl: resolveUrl(baseImagePaths[i]),
         titleLines,
         speakerName,
       };
+      const root = template.render(host, data);
+      await loadImage(data.backgroundUrl);
 
-      const html = template.render(data);
-      host.innerHTML = html;
-
-      // Wait for the background image to load
-      await waitForImageLoad(host);
-
-      const canvas = await html2canvas(
-        host.querySelector(".thumbnail-canvas") as HTMLElement,
-        {
-          width: template.width,
-          height: template.height,
-          scale: 1,
-          useCORS: true,
-          allowTaint: true,
-          backgroundColor: "#000000",
-        },
-      );
+      const canvas = await html2canvas(root, {
+        width: template.width,
+        height: template.height,
+        scale: 1,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: "#000000",
+        logging: false,
+      });
 
       const blob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(
@@ -109,7 +107,6 @@ export async function renderThumbnailBatch(
     }
   } finally {
     document.body.removeChild(host);
-    document.head.removeChild(fontStyle);
   }
 
   return results;
@@ -120,12 +117,8 @@ export async function renderSingleThumbnail(
   baseImagePath: string,
   titleLines: string[],
   speakerName: string,
+  options: RenderOptions = {},
 ): Promise<Uint8Array> {
-  const results = await renderThumbnailBatch(
-    template,
-    [baseImagePath],
-    titleLines,
-    speakerName,
-  );
+  const results = await renderThumbnailBatch(template, [baseImagePath], titleLines, speakerName, options);
   return results[0].imageData;
 }

@@ -115,3 +115,25 @@ pub async fn update_ytdlp_if_stale() {
         Err(e) => eprintln!("[tools] yt-dlp update failed: {}", e),
     }
 }
+
+/// For tests that need ffmpeg and ffprobe (found the way the app finds
+/// them): false, with a note, if they're missing, so the test can skip.
+/// With REQUIRE_FFMPEG=1 a missing tool fails the test instead.
+#[cfg(test)]
+pub fn ffmpeg_for_tests() -> bool {
+    let works = |name: &str| {
+        std_command(name)
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    let missing: Vec<&str> = ["ffmpeg", "ffprobe"].into_iter().filter(|n| !works(n)).collect();
+    if missing.is_empty() {
+        return true;
+    }
+    if std::env::var("REQUIRE_FFMPEG").is_ok_and(|v| v == "1") {
+        panic!("{} not found (REQUIRE_FFMPEG=1)", missing.join(" and "));
+    }
+    eprintln!("skipping: {} not found", missing.join(" and "));
+    false
+}

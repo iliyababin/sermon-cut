@@ -64,6 +64,18 @@ export async function saveReview(
   return invoke("save_review", { videoId, ...review, selectedSource });
 }
 
+/** Cut the video again at new points. Resolves with where the cut really
+ * starts (a keyframe may be a moment early) and ends. Progress comes as
+ * `trim-progress` events. */
+export async function setTrim(videoId: string, start: number, end: number): Promise<{ start: number; end: number }> {
+  return invoke("set_trim", { videoId, start, end });
+}
+
+/** A still of the original video at `time`, for when it can't play here. */
+export async function frameStill(videoId: string, time: number): Promise<string> {
+  return invoke("frame_still", { videoId, time });
+}
+
 export async function revealVideo(videoId: string): Promise<void> {
   return invoke("reveal_video", { videoId });
 }

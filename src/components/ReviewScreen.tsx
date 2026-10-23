@@ -37,6 +37,7 @@ import type {
 } from "@/lib/types";
 import { LocalImage } from "./LocalImage";
 import { ThumbnailEditor } from "./ThumbnailEditor";
+import { TrimPanel } from "./TrimPanel";
 import {
   formatTimeDisplay,
 } from "@/lib/clips";
@@ -101,9 +102,15 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   const [recentPreachers, setRecentPreachers] = useState<string[]>([]);
   const preacherTouched = useRef(false);
 
-  // Trim boundaries (what the trimmed video was cut to, used for chapters and captions)
-  const startTime = video.trim_start ?? video.transcription?.sermon_start ?? 0;
-  const endTime = video.trim_end ?? video.transcription?.sermon_end ?? video.duration ?? 0;
+  // Trim boundaries: where the trimmed video really starts and ends in the
+  // original, which chapters and captions are timed from. The trim panel
+  // changes them.
+  const [trim, setTrimPoints] = useState(() => ({
+    start: video.trim_start ?? video.transcription?.sermon_start ?? 0,
+    end: video.trim_end ?? video.transcription?.sermon_end ?? video.duration ?? 0,
+  }));
+  const startTime = trim.start;
+  const endTime = trim.end;
   // What YouTube gets: chapters of the trimmed video, within its limits.
   const shownChapters = useMemo(() => youtubeChapters(chapters, startTime, endTime), [chapters, startTime, endTime]);
   const youtubeDescription = useMemo(
@@ -887,6 +894,17 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
             </div>
           </div>
+
+          <TrimPanel
+            videoId={video.id}
+            sourcePath={video.file_path}
+            duration={video.duration}
+            start={startTime}
+            end={endTime}
+            segments={video.transcription?.segments ?? []}
+            disabled={phase.kind === "uploading"}
+            onTrimmed={(start, end) => setTrimPoints({ start, end })}
+          />
 
           {/* Actions Footer */}
           <div className="flex justify-between items-center pt-4 border-t border-border">

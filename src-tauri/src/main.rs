@@ -191,6 +191,8 @@ fn main() {
             library::commands::regenerate_thumbnails,
             library::commands::process_custom_thumbnail,
             library::commands::save_rendered_thumbnail,
+            library::commands::set_trim,
+            library::commands::frame_still,
             commands::crop_standalone_thumbnail,
             commands::save_standalone_thumbnail,
             commands::copy_file,

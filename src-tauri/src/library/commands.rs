@@ -135,6 +135,39 @@ pub async fn process_custom_thumbnail(
     result
 }
 
+/// Cut the video again at new points; resolves with where the cut really
+/// starts and ends. Progress comes as `trim-progress` events.
+#[tauri::command]
+pub async fn set_trim(
+    lib: State<'_, LibraryHandle>,
+    app_handle: AppHandle,
+    video_id: String,
+    start: f64,
+    end: f64,
+) -> Result<TrimResult, String> {
+    let (start, end) = lib.set_trim(&app_handle, &video_id, start, end).await?;
+    Ok(TrimResult { start, end })
+}
+
+#[derive(serde::Serialize)]
+pub struct TrimResult {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// A still of the original at `time` (seconds), for when it can't play.
+#[tauri::command]
+pub async fn frame_still(
+    lib: State<'_, LibraryHandle>,
+    app_handle: AppHandle,
+    video_id: String,
+    time: f64,
+) -> Result<String, String> {
+    let path = lib.frame_still(&video_id, time).await?;
+    let _ = tauri::Manager::asset_protocol_scope(&app_handle).allow_file(&path);
+    Ok(path)
+}
+
 /// Save a template render of one thumbnail source. The JPEG comes as the
 /// raw invoke body (no JSON number array); the video, source and render key
 /// come as percent-encoded headers. Resolves with the saved file's path.

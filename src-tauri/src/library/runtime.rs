@@ -1455,13 +1455,13 @@ impl Library {
             start = 0.0;
             end = duration;
         }
-        let ext = Path::new(&file_name)
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .filter(|e| super::VIDEO_EXTENSIONS.contains(&e.as_str()))
-            .unwrap_or_else(|| "mp4".into());
-        let trimmed_name = format!("trimmed.{}", ext);
-        crate::ffmpeg::trim_video(&video_path, start, end, &staging.join(&trimmed_name)).await?;
+        let trimmed_name = trimmed_name(&file_name);
+        // The cut may start at a keyframe a moment early; chapters and
+        // captions are timed from where it really starts.
+        let on_step = |f: f32, _: &str| {
+            self.set_progress(app, id, ProcessingStage::Trimming, 50.0 + 25.0 * f, "Trimming video to sermon boundaries...");
+        };
+        let start = crate::ffmpeg::trim_accurate(&video_path, start, end, &staging.join(&trimmed_name), &on_step).await?;
 
         self.set_progress(app, id, ProcessingStage::GeneratingThumbnails, 75.0, "Generating thumbnail options...");
         let title = transcription.suggested_title.clone().unwrap_or(display_title);
@@ -1518,6 +1518,118 @@ impl Library {
         }
         self.set_progress(app, id, ProcessingStage::Complete, 100.0, "Processing complete!");
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Trim
+
+    /// Cut the trimmed video again at new points (the review screen's trim
+    /// panel). Refused while the video is queued, processing, uploading or
+    /// otherwise busy, and busy itself until done. Returns where the new
+    /// cut really starts (see `ffmpeg::trim_accurate`) and ends.
+    pub async fn set_trim(self: &Arc<Self>, app: &AppHandle, id: &str, start: f64, end: f64) -> Result<(f64, f64), String> {
+        let on_step = |f: f32, message: &str| {
+            let _ = app.emit(
+                "trim-progress",
+                serde_json::json!({ "video_id": id, "progress": (f * 100.0).round(), "message": message }),
+            );
+        };
+        let result = self.set_trim_with(id, start, end, &on_step).await;
+        emit_changed(app);
+        result
+    }
+
+    async fn set_trim_with(
+        self: &Arc<Self>,
+        id: &str,
+        start: f64,
+        end: f64,
+        on_step: &(dyn Fn(f32, &str) + Send + Sync),
+    ) -> Result<(f64, f64), String> {
+        let (_busy, paths, entry, _data) = self.begin_op(id)?;
+        if !matches!(entry.status, EntryStatus::ReadyForReview | EntryStatus::Done) {
+            return Err("Process the video before changing where it starts and ends".into());
+        }
+        let end = match entry.duration {
+            Some(d) => end.min(d),
+            None => end,
+        };
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end - start < 1.0 {
+            return Err("The end must be at least a second after the start".into());
+        }
+        let dir = paths.ensure_video_dir(id)?;
+        let video_path = paths.original(&entry.file_name)?;
+        paths.ensure_dir(&paths.tmp_dir())?;
+        let staging = paths.tmp_dir().join(format!("trim-{}", id));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir(&staging).map_err(|e| format!("Failed to create work folder: {}", e))?;
+
+        let result = async {
+            let name = trimmed_name(&entry.file_name);
+            let out = staging.join(&name);
+            let actual = crate::ffmpeg::trim_accurate(&video_path, start, end, &out, on_step).await?;
+
+            let check = video_path.clone();
+            let now = blocking(move || fsutil::fingerprint(&check)).await??;
+            if !fingerprint_matches(&now, &entry.fingerprint) {
+                return Err(FILE_CHANGED.to_string());
+            }
+            // Nothing else writes this folder while the video is busy.
+            let (dir, staged) = (dir.clone(), out.clone());
+            blocking(move || -> Result<(), String> {
+                let mut data = manifest::load_video_data(&dir);
+                std::fs::rename(&staged, dir.join(&name)).map_err(|e| format!("Failed to save the trimmed video: {}", e))?;
+                if let Some(old) = data.trimmed_file.as_ref().filter(|old| **old != name) {
+                    let _ = std::fs::remove_file(dir.join(old));
+                }
+                data.trimmed_file = Some(name);
+                data.trim_start = Some(actual);
+                data.trim_end = Some(end);
+                manifest::save_video_data(&dir, &data)
+            })
+            .await??;
+            {
+                // A half-finished upload was of the old cut.
+                let mut g = self.inner();
+                if let Ok(e) = g.entry_mut(id) {
+                    if e.upload_session.take().is_some() {
+                        g.save_logged();
+                    }
+                }
+            }
+            Ok((actual, end))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&staging);
+        result
+    }
+
+    /// A still of the original video at `time`, for the trim panel when the
+    /// video itself can't play in the app. Written to the system temp
+    /// folder; older stills there are cleared out.
+    pub async fn frame_still(&self, id: &str, time: f64) -> Result<String, String> {
+        if !time.is_finite() || time < 0.0 {
+            return Err("Invalid time".into());
+        }
+        let video_path = {
+            let g = self.inner();
+            let paths = g.paths.clone().ok_or("The library isn't open")?;
+            paths.original(&g.entry(id)?.file_name)?
+        };
+        let dir = std::env::temp_dir().join("sermon-cut-stills");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+        if let Ok(old) = std::fs::read_dir(&dir) {
+            let hour = std::time::Duration::from_secs(3600);
+            for f in old.flatten() {
+                let stale = f.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > hour);
+                if stale {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+        let out = dir.join(format!("{}-{}.jpg", id, (time * 1000.0).round() as u64));
+        crate::ffmpeg::extract_frame(&path_string(&video_path), time, &path_string(&out)).await?;
+        Ok(path_string(&out))
     }
 
     // -----------------------------------------------------------------------
@@ -2091,6 +2203,16 @@ impl Library {
             }
         }
     }
+}
+
+/// "trimmed.<ext>", keeping the original's container.
+fn trimmed_name(file_name: &str) -> String {
+    let ext = Path::new(file_name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .filter(|e| super::VIDEO_EXTENSIONS.contains(&e.as_str()))
+        .unwrap_or_else(|| "mp4".into());
+    format!("trimmed.{}", ext)
 }
 
 /// Where and how a video goes on YouTube.
@@ -2782,6 +2904,48 @@ mod tests {
         lib.finish_job(&id, &Some(Err("no network".into())));
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!((v.status, v.error.as_deref()), (ViewStatus::Error, Some("no network")));
+    }
+
+    #[tokio::test]
+    async fn set_trim_recuts_and_records_the_real_start() {
+        if !crate::tools::ffmpeg_for_tests() {
+            return;
+        }
+        let (_t, lib, id, dir) = processed_library();
+        let root = lib.root().unwrap();
+        let status = crate::tools::std_command("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25", "-t", "20"])
+            .args(["-c:v", "mpeg4", "-g", "50"])
+            .arg(root.join("a.mp4"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        {
+            let mut g = lib.inner();
+            let fp = fsutil::fingerprint(&root.join("a.mp4")).unwrap();
+            let e = g.entry_mut(&id).unwrap();
+            e.fingerprint = fp;
+            e.duration = Some(20.0);
+            e.upload_session = Some(UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m"));
+        }
+        let none = |_: f32, _: &str| {};
+
+        // Not while it's queued.
+        lib.inner().queue.push_back(id.clone());
+        assert!(lib.set_trim_with(&id, 3.0, 15.0, &none).await.is_err());
+        lib.inner().queue.clear();
+
+        // Keyframes every 2 s: a start of 5.2 snaps to 4.
+        let (start, end) = lib.set_trim_with(&id, 5.2, 30.0, &none).await.unwrap();
+        assert_eq!((start, end), (4.0, 20.0), "the end is kept inside the video");
+        let d = lib.detail(&id).unwrap();
+        assert_eq!((d.trim_start, d.trim_end), (Some(4.0), Some(20.0)));
+        let trimmed = d.trimmed_path.unwrap();
+        assert!((crate::ffmpeg::probe_duration_blocking(Path::new(&trimmed)).unwrap() - 16.0).abs() < 0.2);
+        assert_eq!(lib.upload_session(&id), None, "an upload of the old cut isn't continued");
+        assert!(!lib.inner().busy.contains(&id));
+        assert!(dir.join("thumbnail_option_1.jpg").exists(), "thumbnails are kept");
+        assert!(lib.set_trim_with(&id, 9.5, 10.0, &none).await.is_err(), "at least a second");
     }
 
     #[test]

@@ -57,6 +57,15 @@ impl Library {
     // Queue
 
     pub async fn enqueue(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        let (root, expected) = self.check_enqueue(id).await?;
+        self.add_to_queue(id, &root, &expected)
+    }
+
+    /// The first half of `enqueue`: everything that could refuse it, so a
+    /// caller can prepare (see `reprocess`) only once it would be taken.
+    /// Returns the library root and the file's fingerprint for
+    /// `add_to_queue`.
+    pub(super) async fn check_enqueue(self: &Arc<Self>, id: &str) -> Result<(PathBuf, Fingerprint), String> {
         let (root, path, expected) = {
             let g = self.inner();
             g.require_not_updating()?;
@@ -86,13 +95,13 @@ impl Library {
         if meta.len() != expected.size || fsutil::mtime_ms(&meta) != expected.mtime_ms {
             return Err(FILE_CHANGED.into());
         }
-        self.add_to_queue(id, &root, &expected)
+        Ok((root, expected))
     }
 
     /// The second half of `enqueue`, after the file was checked without the
     /// lock: everything may have changed meanwhile (the library switched,
     /// went read-only, the entry went or its file changed), so look again.
-    fn add_to_queue(&self, id: &str, root: &Path, expected: &Fingerprint) -> Result<(), String> {
+    pub(super) fn add_to_queue(&self, id: &str, root: &Path, expected: &Fingerprint) -> Result<(), String> {
         let mut g = self.inner();
         g.require_not_updating()?;
         if g.writable()?.root != root {

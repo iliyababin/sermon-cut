@@ -801,14 +801,14 @@ impl Library {
     }
 
     /// Process a video again from a new transcription: its saved transcript
-    /// goes (under the video's lock, never `inner`), then it is queued. The
-    /// results so far stay until the new ones are committed, and the review
-    /// typed so far (title, description, speaker) is kept (`commit_job`).
+    /// goes (under the video's lock, never `inner`) once it would be
+    /// queued, then it is queued. The results so far stay until the new
+    /// ones are committed, and the review typed so far (title, description, speaker) is kept (`commit_job`).
     pub async fn reprocess(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        let dir = self.with_entry(id, |g, paths| {
-            g.require_idle(id)?;
-            paths.video_dir(id)
-        })?;
+        // Everything that could refuse the queueing first, so a refused
+        // reprocess loses nothing.
+        let (root, expected) = self.check_enqueue(id).await?;
+        let dir = self.with_entry(id, |_, paths| paths.video_dir(id))?;
         let lock = self.video_lock(id);
         blocking(move || {
             let _v = hold(&lock);
@@ -818,7 +818,7 @@ impl Library {
             }
         })
         .await??;
-        self.enqueue(id).await
+        self.add_to_queue(id, &root, &expected)
     }
 
     /// Back to New: delete what processing made. Keeps upload history.
@@ -1560,6 +1560,26 @@ mod tests {
         // And after: the entry is New again, with nothing to review.
         assert!(lib.save_review(&id, review(), None).is_err());
         assert!(!dir.exists(), "an autosave doesn't bring the old review back");
+    }
+
+    /// A reprocess that queueing would refuse keeps the paid transcript.
+    #[tokio::test]
+    async fn a_refused_reprocess_keeps_the_transcript() {
+        let (_t, lib, id, dir) = processed_library();
+        std::fs::write(dir.join("transcript.json"), b"{}").unwrap();
+        lib.inner().entry_mut(&id).unwrap().duration = Some(MAX_TRANSCRIBE_SECS + 60.0);
+        assert!(lib.reprocess(&id).await.is_err());
+        assert!(dir.join("transcript.json").exists());
+
+        lib.inner().entry_mut(&id).unwrap().duration = Some(60.0);
+        lib.inner().last.copying_ids.insert(id.clone());
+        assert_eq!(lib.reprocess(&id).await.unwrap_err(), FILE_CHANGED);
+        assert!(dir.join("transcript.json").exists());
+
+        lib.inner().last.copying_ids.clear();
+        lib.reprocess(&id).await.unwrap();
+        assert!(!dir.join("transcript.json").exists());
+        assert_eq!(lib.inner().queue.front(), Some(&id));
     }
 
     /// Reset, forget and trash refuse a review while their folder goes.

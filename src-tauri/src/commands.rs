@@ -15,12 +15,32 @@ type AppStateHandle = Arc<Mutex<AppState>>;
 /// library is chosen at runtime, so its scope is added here rather than in
 /// tauri.conf.json. `.sermon-cut` needs its own rule: scope globs don't
 /// match hidden folders.
+/// The logo was checked when it was chosen (`checked_logo`); here it only
+/// has to still be an image, so the scope never widens to anything else.
 pub fn allow_user_paths(app_handle: &AppHandle, library_root: Option<&Path>, settings: &Settings) {
     allow_library_paths(app_handle, library_root);
     let scope = app_handle.asset_protocol_scope();
-    if let Some(logo) = settings.logo_path.as_deref().filter(|p| !p.is_empty()) {
+    if let Some(logo) = settings.logo_path.as_deref().filter(|p| !p.is_empty()).and_then(|p| image_file(Path::new(p))) {
         let _ = scope.allow_file(logo);
     }
+}
+
+/// `path` resolved, if it's a JPEG, PNG, WebP, GIF or HEIC image by its
+/// first bytes.
+fn image_file(path: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let resolved = resolve(path)?;
+    let mut head = Vec::with_capacity(16);
+    std::fs::File::open(&resolved).ok()?.take(16).read_to_end(&mut head).ok()?;
+    image_mime(&head).map(|_| resolved)
+}
+
+/// A newly chosen logo: picked in the dialog (or in the app's folders), and
+/// an image. Returns the resolved path to save.
+fn checked_logo(path: &Path, roots: &[PathBuf], picked: bool) -> Result<PathBuf, String> {
+    let resolved = allowed_path(path, roots, picked, Access::Data)
+        .ok_or("Choose the logo with the button above, so Sermon Cut may use it.")?;
+    image_file(&resolved).ok_or_else(|| "The logo must be a PNG, JPEG, WebP, GIF or HEIC image.".to_string())
 }
 
 /// Whether `path` is inside one of `roots` (see `fsutil::resolve_within`).
@@ -115,10 +135,17 @@ pub async fn save_settings(
     state: State<'_, AppStateHandle>,
     lib: State<'_, LibraryHandle>,
     app_handle: AppHandle,
-    patch: SettingsPatch,
+    mut patch: SettingsPatch,
     seq: u64,
     epoch: String,
 ) -> Result<SettingsView, String> {
+    if let Some(logo) = patch.logo_path.as_mut().filter(|p| !p.trim().is_empty()) {
+        use tauri_plugin_fs::FsExt;
+        let path = Path::new(logo.trim());
+        let picked = app_handle.try_fs_scope().is_some_and(|scope| scope.is_allowed(path));
+        let roots = allowed_roots(lib.root(), app_handle.path().app_data_dir().ok(), Access::Data);
+        *logo = checked_logo(path, &roots, picked)?.to_string_lossy().to_string();
+    }
     let library = lib.inner().clone();
     let result = apply_settings_patch(
         &state,
@@ -813,6 +840,23 @@ mod tests {
         assert_eq!(image_mime(b"{\"refresh_token\": \"x\"}"), None);
         assert_eq!(image_mime(b"RIFF\x24\0\0\0WAVEfmt "), None);
         assert_eq!(image_mime(b""), None);
+    }
+
+    #[test]
+    fn a_logo_must_be_a_picked_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("logo.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        let fake = tmp.path().join("state.png");
+        std::fs::write(&fake, b"{\"refresh_token\": \"x\"}").unwrap();
+        assert_eq!(checked_logo(&png, &[], true), Ok(png.canonicalize().unwrap()));
+        // Not picked and outside the app's folders.
+        assert!(checked_logo(&png, &[], false).is_err());
+        // Picked, but not an image.
+        assert!(checked_logo(&fake, &[], true).is_err());
+        assert!(checked_logo(&tmp.path().join("missing.png"), &[], true).is_err());
+        assert_eq!(image_file(&png), Some(png.canonicalize().unwrap()));
+        assert_eq!(image_file(&fake), None);
     }
 
     #[test]

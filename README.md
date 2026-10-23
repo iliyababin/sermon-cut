@@ -17,6 +17,8 @@ That's it. It takes about a minute and opens Sermon Cut when it's done. It insta
 
 No Homebrew or admin password needed. The app updates itself, and keeps yt-dlp up to date in the background. If something ever breaks, run the same line again to reinstall everything.
 
+If Sermon Cut is open, the installer asks it to quit and waits up to a minute. If it's still open (for example, in the middle of an upload), the installer stops without changing anything; quit Sermon Cut when it's done and run the line again.
+
 Requires an Apple Silicon Mac (M1 or newer).
 
 ## Using the library
@@ -76,4 +78,4 @@ YouTube sign-in needs `src-tauri/resources/youtube_client_secrets.json`, which C
 
 ### Releasing
 
-Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, then push a `v*` tag. CI builds every platform into a **draft** release; publish it so the installer and in-app updater pick it up.
+Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, then push a `v*` tag (or run the workflow by hand and give it the tag). CI builds every platform into a **draft** release; publish it so the installer and in-app updater pick it up.

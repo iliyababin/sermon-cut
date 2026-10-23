@@ -7,12 +7,20 @@
 # isn't writable), plus the tools it needs: ffmpeg, ffprobe, yt-dlp, and the
 # QuickJS runtime yt-dlp uses for YouTube. No Homebrew or admin password needed.
 # Run it again any time to update everything.
+#
+# Environment overrides:
+#   APP_DIR                  where the app goes (default /Applications)
+#   SERMON_CUT_TOOLS_DIR     where ffmpeg/yt-dlp/QuickJS go
+#   INSTALL_QUIT_TIMEOUT     seconds to wait for a running copy to quit (60)
+#   SERMON_CUT_SKIP_QUIT=1   never ask a running Sermon Cut to quit (testing)
+#   SERMON_CUT_NO_OPEN=1     don't open the app when done
 
 set -euo pipefail
 
 REPO="iliyababin/sermon-cut"
 APP_NAME="Sermon Cut"
-APP_DIR="${SERMON_CUT_APP_DIR:-/Applications}"
+APP_DIR="${APP_DIR:-${SERMON_CUT_APP_DIR:-/Applications}}"
+QUIT_TIMEOUT="${INSTALL_QUIT_TIMEOUT:-60}"
 TOOLS_DIR="${SERMON_CUT_TOOLS_DIR:-$HOME/Library/Application Support/com.youthscc.sermon-cut/bin}"
 
 # Pinned tool versions. Bump these (and the hashes) to update.
@@ -37,7 +45,31 @@ check_sha() { # file expected
 }
 
 [ "$(uname -s)" = "Darwin" ] || fail "This installer is for macOS."
-[ "$(uname -m)" = "arm64" ] || fail "Sermon Cut currently needs an Apple Silicon Mac (M1 or newer)."
+# hw.optional.arm64 reports the hardware, even when this shell runs under Rosetta.
+[ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] \
+  || fail "Sermon Cut currently needs an Apple Silicon Mac (M1 or newer)."
+
+if [ ! -w "$APP_DIR" ]; then
+  APP_DIR="$HOME/Applications"
+  mkdir -p "$APP_DIR"
+fi
+APP="$APP_DIR/$APP_NAME.app"
+APP_NEW="$APP_DIR/.$APP_NAME.app.new"
+APP_OLD="$APP_DIR/.$APP_NAME.app.old"
+
+# --- Recover from an interrupted earlier run --------------------------------
+# The swap below is: stage .new, move the app to .old, move .new into place,
+# delete .old. If that was cut short and the app is missing, put a copy back.
+if [ ! -d "$APP" ]; then
+  if [ -d "$APP_OLD" ]; then
+    step "Restoring $APP_NAME from an interrupted update"
+    mv "$APP_OLD" "$APP"
+  elif [ -d "$APP_NEW" ]; then
+    step "Finishing an interrupted update of $APP_NAME"
+    mv "$APP_NEW" "$APP"
+  fi
+fi
+rm -rf "$APP_OLD" "$APP_NEW"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -97,29 +129,84 @@ step "Checking tools"
 echo "yt-dlp $("$TOOLS_DIR/yt-dlp" --version </dev/null)"
 "$TOOLS_DIR/qjs" -e 'print("QuickJS ok")' </dev/null
 
+
 # --- The app ---------------------------------------------------------------
-if [ ! -w "$APP_DIR" ]; then
-  APP_DIR="$HOME/Applications"
-  mkdir -p "$APP_DIR"
+# Find the macOS tarball in the latest release. Its name changed over time
+# (Sermon.Cut_aarch64.app.tar.gz, later Sermon.Cut_<version>_aarch64.app.tar.gz),
+# so look it up instead of hard-coding it.
+step "Downloading $APP_NAME"
+release_json=$(curl -fsSL --retry 3 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+asset_url() { # name-suffix regex; prints nothing if there's no such asset
+  { printf '%s' "$release_json" \
+      | grep -oE "\"browser_download_url\": *\"[^\"]*$1\"" || true; } \
+    | head -1 | sed -E 's/.*"(https:[^"]*)"$/\1/'
+}
+app_url=$(asset_url '_aarch64\.app\.tar\.gz')
+sums_url=$(asset_url '/SHA256SUMS\.txt')
+if [ -z "$app_url" ]; then
+  # API unreachable or rate limited: fall back to the original asset name.
+  app_url="https://github.com/$REPO/releases/latest/download/Sermon.Cut_aarch64.app.tar.gz"
+fi
+app_asset=$(basename "$app_url")
+download "$app_url" "$TMP/$app_asset"
+
+# SHA256SUMS.txt catches a truncated or corrupted download. It is not a
+# security guarantee: it comes from the same release as the tarball.
+if [ -n "$sums_url" ]; then
+  download "$sums_url" "$TMP/SHA256SUMS.txt"
+  expected=$(awk -v n="$app_asset" '$2 == n { print $1 }' "$TMP/SHA256SUMS.txt")
+  [ -n "$expected" ] || fail "SHA256SUMS.txt has no entry for $app_asset"
+  check_sha "$TMP/$app_asset" "$expected"
+  echo "Checksum OK"
+else
+  echo "(This release has no SHA256SUMS.txt; skipping the checksum check.)"
 fi
 
-step "Downloading $APP_NAME"
-download "https://github.com/$REPO/releases/latest/download/Sermon.Cut_aarch64.app.tar.gz" "$TMP/app.tar.gz"
-tar -xzf "$TMP/app.tar.gz" -C "$TMP"
-[ -d "$TMP/$APP_NAME.app" ] || fail "The download didn't contain $APP_NAME.app"
+mkdir "$TMP/app"
+tar -xzf "$TMP/$app_asset" -C "$TMP/app"
+[ -d "$TMP/app/$APP_NAME.app" ] || fail "The download didn't contain $APP_NAME.app"
 
-# Quit a running copy before replacing it.
-osascript -e "quit app \"$APP_NAME\"" >/dev/null 2>&1 || true
-sleep 1
+# --- Make sure the installed copy isn't running ------------------------------
+bundle_exe() { # app-path
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$1/Contents/Info.plist" 2>/dev/null
+}
+if [ -d "$APP" ]; then
+  EXE=$(bundle_exe "$APP" || bundle_exe "$TMP/app/$APP_NAME.app" || echo "$APP_NAME")
+  # Match the full executable path, so only the copy in $APP_DIR counts (not,
+  # say, another copy elsewhere). pgrep -f takes a regex, so escape it.
+  exe_re=$(printf '%s' "$APP/Contents/MacOS/$EXE" | sed 's/[][\.*^$+?(){}|]/\\&/g')
+  if pgrep -f "^$exe_re" >/dev/null; then
+    step "Waiting for $APP_NAME to quit"
+    if [ -z "${SERMON_CUT_SKIP_QUIT:-}" ]; then
+      osascript -e 'with timeout of 10 seconds' -e "tell application \"$APP_NAME\" to quit" \
+        -e 'end timeout' >/dev/null 2>&1 || true
+    fi
+    waited=0
+    while pgrep -f "^$exe_re" >/dev/null && [ "$waited" -lt "$QUIT_TIMEOUT" ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if pgrep -f "^$exe_re" >/dev/null; then
+      printf '\n%s%s is still open%s (it may be uploading a video).\n' "$bold" "$APP_NAME" "$reset" >&2
+      echo "Nothing was changed. Quit $APP_NAME when it's done, then run this installer again." >&2
+      exit 1
+    fi
+  fi
+fi
 
-rm -rf "${APP_DIR:?}/$APP_NAME.app"
-mv "$TMP/$APP_NAME.app" "$APP_DIR/"
+# --- Swap in the new copy ----------------------------------------------------
 # Downloads made by curl aren't quarantined, but clear it in case this
 # script itself was downloaded through a browser.
-xattr -dr com.apple.quarantine "$APP_DIR/$APP_NAME.app" 2>/dev/null || true
+xattr -dr com.apple.quarantine "$TMP/app/$APP_NAME.app" 2>/dev/null || true
+mv "$TMP/app/$APP_NAME.app" "$APP_NEW"
+if [ -d "$APP" ]; then
+  mv "$APP" "$APP_OLD"
+fi
+mv "$APP_NEW" "$APP"
+rm -rf "$APP_OLD"
 
 printf '\n%s✓ %s is installed in %s%s\n' "$green" "$APP_NAME" "$APP_DIR" "$reset"
 
 if [ -z "${SERMON_CUT_NO_OPEN:-}" ]; then
-  open "$APP_DIR/$APP_NAME.app"
+  open "$APP"
 fi

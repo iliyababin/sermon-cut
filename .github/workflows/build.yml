@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build into (e.g. v0.5.0). The draft release is created for this tag.'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,12 +29,16 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
 
+    env:
+      # Tag pushes use the pushed tag; manual runs use the required `tag` input.
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -59,22 +68,43 @@ jobs:
 
       - name: Setup YouTube client secrets
         shell: bash
+        env:
+          YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
         run: |
-          echo '${{ secrets.YOUTUBE_CLIENT_SECRETS }}' > src-tauri/resources/youtube_client_secrets.json
+          printf '%s' "$YOUTUBE_CLIENT_SECRETS" > src-tauri/resources/youtube_client_secrets.json
 
       - name: Install frontend dependencies
         run: npm ci
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Sermon Cut ${{ github.ref_name }}'
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: 'Sermon Cut ${{ env.RELEASE_TAG }}'
           releaseBody: 'See the assets below to download for your platform.'
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      # SHA256SUMS.txt lets install.sh detect a truncated or corrupted download.
+      # It is a corruption check, NOT a security guarantee: it lives in the same
+      # release as the tarball, so anyone able to replace one can replace both.
+      # The file is hashed as downloaded back from the release, so the line names
+      # exactly the asset install.sh fetches (the glob also covers tauri-action v1,
+      # which puts the version in the name, e.g. Sermon.Cut_0.5.0_aarch64.app.tar.gz).
+      - name: Upload SHA256SUMS.txt (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*_aarch64.app.tar.gz' --dir "$dir"
+          (cd "$dir" && shasum -a 256 -- *_aarch64.app.tar.gz > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release upload "$RELEASE_TAG" "$dir/SHA256SUMS.txt" --repo "$GITHUB_REPOSITORY" --clobber

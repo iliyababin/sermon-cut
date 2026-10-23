@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -80,132 +81,238 @@ impl YouTubeCredentials {
     }
 }
 
-pub async fn start_oauth_flow(credentials: &YouTubeCredentials) -> Result<YouTubeTokens, String> {
-    // Find an available port
+/// Google's sign-in endpoints; tests use a local mock.
+#[derive(Debug, Clone)]
+pub struct OAuthEndpoints {
+    pub auth: String,
+    pub token: String,
+}
+
+impl OAuthEndpoints {
+    pub fn google() -> Self {
+        OAuthEndpoints { auth: AUTH_URL.into(), token: TOKEN_URL.into() }
+    }
+}
+
+pub const SIGN_IN_CANCELLED: &str = "Sign-in was cancelled.";
+pub const SIGN_IN_TIMED_OUT: &str = "Sign-in took too long. Click Sign in to try again.";
+pub const SIGN_IN_REPLACED: &str = "A newer sign-in was started.";
+
+/// How one sign-in runs.
+pub struct OAuthFlow {
+    pub endpoints: OAuthEndpoints,
+    /// Give up when the browser hasn't come back by then.
+    pub timeout: std::time::Duration,
+    /// Opens the authorization URL (the browser in the app, a fake in tests).
+    pub open_browser: Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
+    /// Cancelled when a newer sign-in starts.
+    pub cancel: CancellationToken,
+}
+
+impl OAuthFlow {
+    pub fn new(cancel: CancellationToken) -> Self {
+        OAuthFlow {
+            endpoints: OAuthEndpoints::google(),
+            timeout: std::time::Duration::from_secs(5 * 60),
+            open_browser: Box::new(open_in_browser),
+            cancel,
+        }
+    }
+}
+
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    result.map(|_| ()).map_err(|e| format!("Failed to open browser: {}", e))
+}
+
+/// Only one sign-in listens at a time: starting one cancels the one before
+/// (whose browser tab may have been closed).
+#[derive(Default)]
+pub struct SignInSlot {
+    current: std::sync::Mutex<Option<(u64, CancellationToken)>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl SignInSlot {
+    pub fn begin(&self) -> (u64, CancellationToken) {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let token = CancellationToken::new();
+        let previous = self.current.lock().unwrap().replace((id, token.clone()));
+        if let Some((_, previous)) = previous {
+            previous.cancel();
+        }
+        (id, token)
+    }
+
+    pub fn end(&self, id: u64) {
+        let mut current = self.current.lock().unwrap();
+        if current.as_ref().is_some_and(|(c, _)| *c == id) {
+            *current = None;
+        }
+    }
+}
+
+/// What a request to the loopback listener was.
+#[derive(Debug, PartialEq)]
+enum Callback {
+    Code(String),
+    /// Google sent the user back with `error=` (they clicked Cancel).
+    Denied(String),
+    /// Not the callback: a favicon, a preconnect, a wrong state.
+    Other,
+}
+
+fn parse_callback(request_line: &str, expected_state: &str) -> Callback {
+    let Some(target) = request_line.split_whitespace().nth(1) else { return Callback::Other };
+    let Some((_, query)) = target.split_once('?') else { return Callback::Other };
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    for param in query.split('&') {
+        let Some((key, value)) = param.split_once('=') else { continue };
+        let Ok(value) = urlencoding::decode(&value.replace('+', " ")).map(|v| v.to_string()) else { continue };
+        match key {
+            "code" => code = Some(value),
+            "state" => state = Some(value),
+            "error" => error = Some(value),
+            _ => {}
+        }
+    }
+    // Anything without our state could come from any page in the browser.
+    if state.as_deref() != Some(expected_state) {
+        return Callback::Other;
+    }
+    match (error, code) {
+        (Some(e), _) => Callback::Denied(e),
+        (None, Some(c)) if !c.is_empty() => Callback::Code(c),
+        _ => Callback::Other,
+    }
+}
+
+const PAGE_DONE: &str = "<html><body style=\"font-family:-apple-system,sans-serif;text-align:center;padding:60px\"><h1>Signed in to YouTube</h1><p>You can close this window and return to Sermon Cut.</p><script>window.close();</script></body></html>";
+
+fn page(title: &str, text: &str) -> String {
+    format!(
+        "<html><body style=\"font-family:-apple-system,sans-serif;text-align:center;padding:60px\"><h1>{}</h1><p>{}</p></body></html>",
+        title,
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    )
+}
+
+async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// The request line of one connection (headers are read and dropped).
+async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = async {
+        reader.read_line(&mut line).await.ok()?;
+        loop {
+            let mut header = String::new();
+            let n = reader.read_line(&mut header).await.ok()?;
+            if n == 0 || header == "\r\n" || header == "\n" {
+                break;
+            }
+        }
+        Some(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read).await.ok()??;
+    Some(line)
+}
+
+/// Sign in with the system browser. Waits up to five minutes; a newer
+/// sign-in cancels this one.
+pub async fn start_oauth_flow(credentials: &YouTubeCredentials, cancel: CancellationToken) -> Result<YouTubeTokens, String> {
+    run_oauth_flow(credentials, &OAuthFlow::new(cancel)).await
+}
+
+pub async fn run_oauth_flow(credentials: &YouTubeCredentials, flow: &OAuthFlow) -> Result<YouTubeTokens, String> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("Failed to bind to port: {}", e))?;
-    let port = listener.local_addr().unwrap().port();
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{}", port);
 
-    // Generate CSRF state parameter
+    // CSRF protection: only a callback carrying this state counts.
     let oauth_state = uuid::Uuid::new_v4().to_string();
 
-    // Build authorization URL
     let auth_url = format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
-        AUTH_URL,
+        flow.endpoints.auth,
         urlencoding::encode(&credentials.client_id),
         urlencoding::encode(&redirect_uri),
         urlencoding::encode("https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/youtube.force-ssl"),
         urlencoding::encode(&oauth_state)
     );
 
-    println!("[youtube] Opening browser for OAuth: {}", auth_url);
+    println!("[youtube] Opening browser for sign-in; waiting on port {}", port);
+    (flow.open_browser)(&auth_url)?;
 
-    // Open browser - use platform-specific commands for reliability
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&auth_url)
-            .spawn()
-            .map_err(|e| format!("Failed to open browser: {}", e))?;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&auth_url)
-            .spawn()
-            .map_err(|e| format!("Failed to open browser: {}", e))?;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", &auth_url])
-            .spawn()
-            .map_err(|e| format!("Failed to open browser: {}", e))?;
-    }
-
-    println!("[youtube] Waiting for OAuth callback on port {}...", port);
-
-    // Wait for the callback (async)
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .map_err(|e| format!("Failed to accept connection: {}", e))?;
-
-    let mut reader = BufReader::new(&mut stream);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .await
-        .map_err(|e| format!("Failed to read request: {}", e))?;
-
-    // Extract authorization code from the request and validate state
-    let code = extract_code_from_request(&request_line, &oauth_state)?;
-
-    // Send success response to browser
-    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h1>Authentication successful!</h1><p>You can close this window and return to the app.</p><script>window.close();</script></body></html>";
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|e| format!("Failed to send response: {}", e))?;
-
-    // Exchange code for tokens
-    exchange_code_for_tokens(credentials, &code, &redirect_uri).await
-}
-
-fn extract_code_from_request(request_line: &str, expected_state: &str) -> Result<String, String> {
-    // Parse "GET /?code=xxx&state=yyy&scope=... HTTP/1.1"
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Err("Invalid request format".to_string());
-    }
-
-    let path = parts[1];
-    let mut code: Option<String> = None;
-    let mut state: Option<String> = None;
-
-    if let Some(query_start) = path.find('?') {
-        let query = &path[query_start + 1..];
-        for param in query.split('&') {
-            if let Some((key, value)) = param.split_once('=') {
-                if key == "code" {
-                    code = Some(urlencoding::decode(value)
-                        .map_err(|e| format!("Failed to decode code: {}", e))?
-                        .to_string());
+    // Connections are read side by side, so an idle preconnect can't hold
+    // up the real callback.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(tokio::net::TcpStream, String)>(16);
+    let accept_loop = async {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.map_err(|e| format!("Failed to accept connection: {}", e))?;
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if let Some(line) = read_request_line(&mut stream).await {
+                            let _ = tx.send((stream, line)).await;
+                        }
+                    });
                 }
-                if key == "state" {
-                    state = Some(urlencoding::decode(value)
-                        .map_err(|e| format!("Failed to decode state: {}", e))?
-                        .to_string());
-                }
-                if key == "error" {
-                    return Err(format!("OAuth error: {}", value));
-                }
+                Some((mut stream, line)) = rx.recv() => match parse_callback(&line, &oauth_state) {
+                    Callback::Other => respond(&mut stream, "404 Not Found", "").await,
+                    Callback::Denied(error) => {
+                        println!("[youtube] Sign-in ended in the browser: {}", error);
+                        respond(&mut stream, "200 OK", &page("Sign-in cancelled", "You can close this window.")).await;
+                        return Err(SIGN_IN_CANCELLED.to_string());
+                    }
+                    Callback::Code(code) => {
+                        // Exchange first, so the page tells the truth.
+                        let result = exchange_code_for_tokens(credentials, &code, &redirect_uri, &flow.endpoints.token).await;
+                        match &result {
+                            Ok(_) => respond(&mut stream, "200 OK", PAGE_DONE).await,
+                            Err(e) => respond(&mut stream, "200 OK", &page("Sign-in failed", e)).await,
+                        }
+                        return result;
+                    }
+                },
             }
         }
-    }
+    };
 
-    // Validate CSRF state parameter
-    match state {
-        Some(ref s) if s == expected_state => {}
-        Some(_) => return Err("OAuth state mismatch — possible CSRF attack".to_string()),
-        None => return Err("Missing OAuth state parameter in callback".to_string()),
+    tokio::select! {
+        r = accept_loop => r,
+        _ = tokio::time::sleep(flow.timeout) => Err(SIGN_IN_TIMED_OUT.to_string()),
+        _ = flow.cancel.cancelled() => Err(SIGN_IN_REPLACED.to_string()),
     }
-
-    code.ok_or_else(|| "No authorization code in callback".to_string())
 }
 
 async fn exchange_code_for_tokens(
     credentials: &YouTubeCredentials,
     code: &str,
     redirect_uri: &str,
+    token_url: &str,
 ) -> Result<YouTubeTokens, String> {
-    let client = Client::new();
-
     let mut params = HashMap::new();
     params.insert("client_id", credentials.client_id.as_str());
     params.insert("client_secret", credentials.client_secret.as_str());
@@ -213,19 +320,20 @@ async fn exchange_code_for_tokens(
     params.insert("grant_type", "authorization_code");
     params.insert("redirect_uri", redirect_uri);
 
-    let response = client
-        .post(TOKEN_URL)
+    let response = crate::upload::http_client()
+        .post(token_url)
+        .timeout(std::time::Duration::from_secs(60))
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Failed to exchange code: {}", e))?;
+        .map_err(|e| format!("Couldn't reach Google to finish signing in: {}", e))?;
 
     if !response.status().is_success() {
         let error_text = response
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("Token exchange failed: {}", error_text));
+        return Err(format!("Signing in failed: {}", error_text));
     }
 
     let token_response: TokenResponse = response
@@ -250,6 +358,14 @@ pub async fn refresh_access_token(
     credentials: &YouTubeCredentials,
     refresh_token: &str,
 ) -> Result<YouTubeTokens, UploadError> {
+    refresh_access_token_at(credentials, refresh_token, TOKEN_URL).await
+}
+
+pub async fn refresh_access_token_at(
+    credentials: &YouTubeCredentials,
+    refresh_token: &str,
+    token_url: &str,
+) -> Result<YouTubeTokens, UploadError> {
     let mut params = HashMap::new();
     params.insert("client_id", credentials.client_id.as_str());
     params.insert("client_secret", credentials.client_secret.as_str());
@@ -257,7 +373,7 @@ pub async fn refresh_access_token(
     params.insert("grant_type", "refresh_token");
 
     let response = crate::upload::http_client()
-        .post(TOKEN_URL)
+        .post(token_url)
         .timeout(std::time::Duration::from_secs(60))
         .form(&params)
         .send()
@@ -381,4 +497,160 @@ pub async fn list_playlists(access_token: &str) -> Result<Vec<PlaylistInfo>, Str
         .collect();
 
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::upload::test_server::MockServer;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn credentials() -> YouTubeCredentials {
+        YouTubeCredentials { client_id: "client".into(), client_secret: "secret".into() }
+    }
+
+    /// A sign-in against the mock token endpoint. Returns the running flow
+    /// and, once the "browser" opened, the redirect URI and state.
+    struct Running {
+        handle: tokio::task::JoinHandle<Result<YouTubeTokens, String>>,
+        redirect: String,
+        state: String,
+    }
+
+    async fn start(server: &MockServer, timeout: Duration, cancel: CancellationToken) -> Running {
+        let opened: Arc<Mutex<Option<String>>> = Arc::default();
+        let seen = opened.clone();
+        let flow = OAuthFlow {
+            endpoints: OAuthEndpoints { auth: format!("{}/auth", server.base), token: format!("{}/token", server.base) },
+            timeout,
+            open_browser: Box::new(move |url| {
+                *seen.lock().unwrap() = Some(url.to_string());
+                Ok(())
+            }),
+            cancel,
+        };
+        let handle = tokio::spawn(async move { run_oauth_flow(&credentials(), &flow).await });
+        let url = loop {
+            if let Some(url) = opened.lock().unwrap().clone() {
+                break url;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let param = |name: &str| {
+            let (_, query) = url.split_once('?').unwrap();
+            let value = query.split('&').find_map(|p| p.strip_prefix(&format!("{}=", name))).unwrap();
+            urlencoding::decode(value).unwrap().to_string()
+        };
+        assert!(url.starts_with(&format!("{}/auth?", server.base)));
+        Running { handle, redirect: param("redirect_uri"), state: param("state") }
+    }
+
+    async fn get(url: &str) -> (u16, String, String) {
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        let status = resp.status().as_u16();
+        let connection = resp.headers().get("connection").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+        (status, connection, resp.text().await.unwrap())
+    }
+
+    #[test]
+    fn recognises_the_callback() {
+        let line = |q: &str| format!("GET {} HTTP/1.1\r\n", q);
+        assert_eq!(parse_callback(&line("/favicon.ico"), "s1"), Callback::Other);
+        assert_eq!(parse_callback(&line("/?code=abc&state=s2"), "s1"), Callback::Other);
+        assert_eq!(parse_callback(&line("/?code=abc"), "s1"), Callback::Other);
+        assert_eq!(parse_callback(&line("/?state=s1"), "s1"), Callback::Other);
+        assert_eq!(parse_callback(&line("/?code=4%2Fabc&state=s1&scope=x"), "s1"), Callback::Code("4/abc".into()));
+        assert_eq!(parse_callback(&line("/?error=access_denied&state=s1"), "s1"), Callback::Denied("access_denied".into()));
+        // An error from some other page doesn't end the sign-in.
+        assert_eq!(parse_callback(&line("/?error=access_denied&state=nope"), "s1"), Callback::Other);
+        assert_eq!(parse_callback("garbage", "s1"), Callback::Other);
+    }
+
+    #[tokio::test]
+    async fn ignores_junk_then_signs_in() {
+        let server = MockServer::start().await;
+        let run = start(&server, Duration::from_secs(10), CancellationToken::new()).await;
+        // A browser preconnect that never sends anything.
+        let _idle = tokio::net::TcpStream::connect(run.redirect.trim_start_matches("http://")).await.unwrap();
+        assert_eq!(get(&format!("{}/favicon.ico", run.redirect)).await.0, 404);
+        assert_eq!(get(&format!("{}/?code=abc&state=wrong", run.redirect)).await.0, 404);
+        assert_eq!(get(&format!("{}/?state={}", run.redirect, run.state)).await.0, 404);
+
+        let (status, connection, body) = get(&format!("{}/?code=abc&state={}", run.redirect, run.state)).await;
+        assert_eq!(status, 200);
+        assert_eq!(connection, "close");
+        assert!(body.contains("Signed in"), "{}", body);
+        // The page came after the exchange.
+        let requests = server.with(|s| s.token_requests.clone());
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("code=abc") && requests[0].contains("grant_type=authorization_code"));
+
+        let tokens = run.handle.await.unwrap().unwrap();
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh"));
+    }
+
+    #[tokio::test]
+    async fn access_denied_ends_the_sign_in() {
+        let server = MockServer::start().await;
+        let run = start(&server, Duration::from_secs(10), CancellationToken::new()).await;
+        let (status, _, body) = get(&format!("{}/?error=access_denied&state={}", run.redirect, run.state)).await;
+        assert_eq!(status, 200);
+        assert!(body.contains("cancelled"));
+        assert_eq!(run.handle.await.unwrap().unwrap_err(), SIGN_IN_CANCELLED);
+        assert!(server.with(|s| s.token_requests.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_exchange_says_so_in_the_browser() {
+        let server = MockServer::start().await;
+        server.with(|s| s.token_reply = (400, r#"{"error":"invalid_grant"}"#.into()));
+        let run = start(&server, Duration::from_secs(10), CancellationToken::new()).await;
+        let (_, _, body) = get(&format!("{}/?code=abc&state={}", run.redirect, run.state)).await;
+        assert!(body.contains("Sign-in failed"), "{}", body);
+        assert!(run.handle.await.unwrap().unwrap_err().contains("invalid_grant"));
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_the_timeout() {
+        let server = MockServer::start().await;
+        let run = start(&server, Duration::from_millis(150), CancellationToken::new()).await;
+        assert_eq!(run.handle.await.unwrap().unwrap_err(), SIGN_IN_TIMED_OUT);
+        // The listener is gone.
+        assert!(reqwest::get(format!("{}/?code=abc&state={}", run.redirect, run.state)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_second_sign_in_cancels_the_first() {
+        let server = MockServer::start().await;
+        let slot = SignInSlot::default();
+        let (first_id, first) = slot.begin();
+        let first_run = start(&server, Duration::from_secs(10), first).await;
+        let (second_id, second) = slot.begin();
+        assert_eq!(first_run.handle.await.unwrap().unwrap_err(), SIGN_IN_REPLACED);
+        // The first one finishing doesn't clear the second's slot.
+        slot.end(first_id);
+        assert!(!second.is_cancelled());
+        let second_run = start(&server, Duration::from_secs(10), second).await;
+        get(&format!("{}/?code=abc&state={}", second_run.redirect, second_run.state)).await;
+        assert!(second_run.handle.await.unwrap().is_ok());
+        slot.end(second_id);
+        assert!(slot.current.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_maps_a_revoked_sign_in_to_auth() {
+        let server = MockServer::start().await;
+        let url = format!("{}/token", server.base);
+        let tokens = refresh_access_token_at(&credentials(), "r1", &url).await.unwrap();
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("r1"));
+        assert!(server.with(|s| s.token_requests[0].contains("grant_type=refresh_token")));
+
+        server.with(|s| s.token_reply = (400, r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#.into()));
+        let err = refresh_access_token_at(&credentials(), "r1", &url).await.unwrap_err();
+        assert!(matches!(err, UploadError::Auth(_)));
+        assert_eq!(err.user_message(), crate::upload::error::SIGN_IN_AGAIN);
+    }
 }

@@ -285,6 +285,7 @@ pub async fn youtube_get_auth_status(
 #[tauri::command]
 pub async fn youtube_sign_in(
     state: State<'_, AppStateHandle>,
+    sign_in: State<'_, crate::youtube::SignInSlot>,
     app_handle: AppHandle,
 ) -> Result<YouTubeAuthStatus, String> {
     use crate::youtube::{self, YouTubeCredentials};
@@ -293,8 +294,12 @@ pub async fn youtube_sign_in(
     // Load credentials
     let credentials = YouTubeCredentials::load_from_resource(&app_handle)?;
 
-    // Start OAuth flow (blocks until user completes auth)
-    let tokens = youtube::start_oauth_flow(&credentials).await?;
+    // Wait for the browser (up to five minutes). Starting another sign-in
+    // cancels this one.
+    let (slot, cancel) = sign_in.begin();
+    let tokens = youtube::start_oauth_flow(&credentials, cancel).await;
+    sign_in.end(slot);
+    let tokens = tokens?;
 
     // Get channel info
     let channel_info = youtube::get_channel_info(&tokens.access_token).await?;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { getSettings, saveSettings, getAppDataDir, resetState, clearLibraryData, checkLibraryFolder, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists, errorMessage } from "@/lib/tauri";
 import type { Settings as SettingsType, YouTubeAuthStatus, PlaylistInfo } from "@/lib/types";
@@ -86,23 +86,27 @@ export function Settings() {
     }
   }
 
+  // Clicking again while waiting for the browser starts over; the backend
+  // cancels the earlier sign-in, and only the latest one updates the screen.
+  const signInRequest = useRef(0);
   async function handleYoutubeSignIn() {
+    const request = ++signInRequest.current;
     try {
       setYoutubeLoading(true);
       setYoutubeError(null);
-      console.log("[Settings] Starting YouTube sign in...");
       const status = await youtubeSignIn();
-      console.log("[Settings] Sign in complete:", status);
+      if (request !== signInRequest.current) return;
       setYoutubeAuth(status);
       if (status.is_authenticated) {
         loadPlaylists();
       }
       await reloadSignIn();
     } catch (err) {
+      if (request !== signInRequest.current) return;
       console.error("Failed to sign in to YouTube:", err);
       setYoutubeError(err instanceof Error ? err.message : String(err));
     } finally {
-      setYoutubeLoading(false);
+      if (request === signInRequest.current) setYoutubeLoading(false);
     }
   }
 
@@ -330,13 +334,13 @@ export function Settings() {
           ) : (
             <button
               onClick={handleYoutubeSignIn}
-              disabled={youtubeLoading}
+              title={youtubeLoading ? "Finish signing in in the browser, or click to start again" : undefined}
               className="w-full px-4 py-3 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
             >
               {youtubeLoading ? (
                 <>
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  Connecting...
+                  Waiting for the browser… (click to start again)
                 </>
               ) : (
                 <>

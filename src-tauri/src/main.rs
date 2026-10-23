@@ -148,6 +148,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(app_state)
+        .manage(youtube::SignInSlot::default())
         .manage(library.clone())
         .invoke_handler(tauri::generate_handler![
             commands::get_video_info,

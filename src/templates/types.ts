@@ -10,6 +10,12 @@ export interface TemplateConfig {
   render: (root: HTMLElement, data: TemplateData) => HTMLElement;
   /** Faces the template uses, as `document.fonts.load()` descriptors. */
   fonts: string[];
+  /**
+   * Adjust a rendered thumbnail to fit, e.g. shrink a long title. Called
+   * with the element attached to the document and the fonts loaded, so
+   * text can be measured.
+   */
+  fit?: (canvas: HTMLElement, data: TemplateData) => void;
 }
 
 export interface TemplateData {

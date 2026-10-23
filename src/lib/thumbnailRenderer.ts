@@ -83,6 +83,7 @@ export async function renderThumbnailBatch(
         speakerName,
       };
       const root = template.render(host, data);
+      template.fit?.(root, data);
       await loadImage(data.backgroundUrl);
 
       const canvas = await html2canvas(root, {

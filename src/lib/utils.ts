@@ -1,25 +1,20 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { balanceLines } from "./titleSplit";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
 /**
- * Split a title string into lines for stacked thumbnail display.
- * Aims for 2-3 lines with roughly balanced word distribution.
+ * Split a title into lines for the stacked thumbnail: one or two words stay
+ * on one line, longer titles go on two lines of similar width. (The
+ * template shrinks, and if need be re-splits into three, to fit.)
  */
 export function splitTitleIntoLines(title: string): string[] {
-  const words = title.trim().split(/\s+/);
+  const words = title.trim().split(/\s+/).filter(Boolean);
   if (words.length <= 2) return [words.join(" ")];
-
-  // Split into 2 lines, shorter top line, longer bottom
-  const mid = Math.floor(words.length / 2);
-  const splitAt = Math.max(1, mid);
-  return [
-    words.slice(0, splitAt).join(" "),
-    words.slice(splitAt).join(" "),
-  ];
+  return balanceLines(words.join(" "), 2);
 }
 
 /**

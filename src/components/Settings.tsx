@@ -1,39 +1,68 @@
 import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { getSettings, saveSettings, getAppDataDir, resetState, clearLibraryData, checkLibraryFolder, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists, errorMessage } from "@/lib/tauri";
+import { getSettings, saveSettings, nextSettingsSeq, getAppDataDir, resetState, clearLibraryData, checkLibraryFolder, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists, errorMessage } from "@/lib/tauri";
 import type { Settings as SettingsType, YouTubeAuthStatus, PlaylistInfo } from "@/lib/types";
-import { settingsPatch } from "@/lib/settingsPatch";
-import { Save, Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle, RefreshCw, Download } from "lucide-react";
+import { EDITABLE_SETTINGS, settingsPatch } from "@/lib/settingsPatch";
+import { Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle, RefreshCw, Download } from "lucide-react";
 import { useUpdater } from "@/hooks/useUpdater";
 import { open } from "@tauri-apps/plugin-dialog";
 import { LocalImage } from "./LocalImage";
 
+type Field = (typeof EDITABLE_SETTINGS)[number];
+
+/** How long typing pauses before a field is saved. */
+export const AUTOSAVE_DELAY_MS = 600;
+
 export function Settings() {
   const [settings, setSettings] = useState<SettingsType | null>(null);
-  // As last loaded or saved; a save sends only what differs from it.
-  const [savedSettings, setSavedSettings] = useState<SettingsType | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [appDataDir, setAppDataDir] = useState<string>("");
   const [youtubeAuth, setYoutubeAuth] = useState<YouTubeAuthStatus | null>(null);
   const [youtubeLoading, setYoutubeLoading] = useState(false);
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
   const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
+  const [playlistsError, setPlaylistsError] = useState<string | null>(null);
   const [resetConfirm, setResetConfirm] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [clearConfirm, setClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [folderWarnings, setFolderWarnings] = useState<string[]>([]);
   const [appVersion, setAppVersion] = useState("");
   const updater = useUpdater();
 
+  // Autosave: each field is saved on its own, AUTOSAVE_DELAY_MS after the
+  // last change to it (or at once for picks and on blur). Every save gets a
+  // newer seq, so the backend ignores one that arrives late.
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<Field, string>>>({});
+  const [savesInFlight, setSavesInFlight] = useState(0);
+  const [savedOnce, setSavedOnce] = useState(false);
+  // As last loaded or saved; a save sends only what differs from it.
+  const saved = useRef<SettingsType | null>(null);
+  const edited = useRef<SettingsType | null>(null);
+  // Fields waiting to be saved; null: until flushField (Enter or blur).
+  const timers = useRef(new Map<Field, ReturnType<typeof setTimeout> | null>());
+  const newestApplied = useRef(0);
+
+  useEffect(() => {
+    edited.current = settings;
+  }, [settings]);
+
   useEffect(() => {
     loadSettings();
     loadYoutubeAuth();
-    getVersion().then(setAppVersion);
+    getVersion().then(setAppVersion).catch(() => {});
+    const pending = timers.current;
+    return () => {
+      // Leaving with edits still waiting: save them now.
+      for (const [field, timer] of pending) {
+        if (timer) clearTimeout(timer);
+        void saveField(field);
+      }
+      pending.clear();
+    };
   }, []);
 
   const libraryFolder = settings?.output_folder ?? "";
@@ -48,17 +77,87 @@ export function Settings() {
   async function loadSettings() {
     try {
       setLoading(true);
+      setLoadError(null);
       const [loadedSettings, dataDir] = await Promise.all([
         getSettings(),
         getAppDataDir(),
       ]);
+      saved.current = loadedSettings;
       setSettings(loadedSettings);
-      setSavedSettings(loadedSettings);
       setAppDataDir(dataDir);
     } catch (err) {
-      console.error("Failed to load settings:", err);
+      setLoadError(errorMessage(err, "Couldn't load the settings"));
     } finally {
       setLoading(false);
+    }
+  }
+
+  /** Change one field and save it after `delay` ms (0: now; Infinity: on
+   * flushField). */
+  function edit<F extends Field>(field: F, value: SettingsType[F], delay = AUTOSAVE_DELAY_MS) {
+    setSettings((s) => (s ? { ...s, [field]: value } : s));
+    if (edited.current) edited.current = { ...edited.current, [field]: value };
+    setFieldErrors(({ [field]: _, ...rest }) => rest as typeof fieldErrors);
+    const previous = timers.current.get(field);
+    if (previous) clearTimeout(previous);
+    timers.current.delete(field);
+    if (delay <= 0) {
+      void saveField(field);
+    } else if (delay === Infinity) {
+      timers.current.set(field, null);
+    } else {
+      timers.current.set(
+        field,
+        setTimeout(() => {
+          timers.current.delete(field);
+          void saveField(field);
+        }, delay)
+      );
+    }
+  }
+
+  /** Save a field waiting for its timer right away (e.g. on blur). */
+  function flushField(field: Field) {
+    if (!timers.current.has(field)) return;
+    const timer = timers.current.get(field);
+    if (timer) clearTimeout(timer);
+    timers.current.delete(field);
+    void saveField(field);
+  }
+
+  async function saveField(field: Field) {
+    const base = saved.current;
+    const current = edited.current;
+    if (!base || !current) return;
+    const patch = settingsPatch(base, { ...base, [field]: current[field] });
+    if (Object.keys(patch).length === 0) return;
+    const seq = nextSettingsSeq();
+    setSavesInFlight((n) => n + 1);
+    try {
+      const updated = await saveSettings(patch, seq);
+      if (seq < newestApplied.current) return;
+      newestApplied.current = seq;
+      saved.current = updated;
+      // Show the value as saved (e.g. trimmed), unless it was edited since.
+      const sent = current[field];
+      setSettings((s) =>
+        s && s[field] === sent ? { ...s, [field]: updated[field] } : s
+      );
+      setSavedOnce(true);
+    } catch (err) {
+      setFieldErrors((e) => ({ ...e, [field]: errorMessage(err, "Couldn't save this setting") }));
+      if (field === "output_folder") {
+        // A refused folder change was put back; show the folder in use.
+        try {
+          const current = await getSettings();
+          saved.current = current;
+          setSettings((s) => (s ? { ...s, output_folder: current.output_folder } : current));
+        } catch {
+          // Keep the edit on screen.
+        }
+      }
+    } finally {
+      setSavesInFlight((n) => n - 1);
     }
   }
 
@@ -70,17 +169,18 @@ export function Settings() {
         loadPlaylists();
       }
     } catch (err) {
-      console.error("Failed to load YouTube auth status:", err);
+      setYoutubeError(errorMessage(err, "Couldn't check the YouTube sign-in"));
     }
   }
 
   async function loadPlaylists() {
     try {
       setPlaylistsLoading(true);
+      setPlaylistsError(null);
       const list = await youtubeListPlaylists();
       setPlaylists(list);
     } catch (err) {
-      console.error("Failed to load playlists:", err);
+      setPlaylistsError(errorMessage(err, "Couldn't load your playlists"));
     } finally {
       setPlaylistsLoading(false);
     }
@@ -103,8 +203,7 @@ export function Settings() {
       await reloadSignIn();
     } catch (err) {
       if (request !== signInRequest.current) return;
-      console.error("Failed to sign in to YouTube:", err);
-      setYoutubeError(err instanceof Error ? err.message : String(err));
+      setYoutubeError(errorMessage(err, "Couldn't sign in to YouTube"));
     } finally {
       if (request === signInRequest.current) setYoutubeLoading(false);
     }
@@ -113,57 +212,49 @@ export function Settings() {
   async function handleYoutubeSignOut() {
     try {
       setYoutubeLoading(true);
+      setYoutubeError(null);
       await youtubeSignOut();
       setYoutubeAuth({ is_authenticated: false, channel_name: null, channel_id: null });
+      setPlaylists([]);
       await reloadSignIn();
     } catch (err) {
-      console.error("Failed to sign out of YouTube:", err);
+      setYoutubeError(errorMessage(err, "Couldn't sign out of YouTube"));
     } finally {
       setYoutubeLoading(false);
     }
   }
 
-  // Sign-in changed on the backend: refresh what's shown about it without
-  // dropping unsaved edits.
+  // Sign-in changed on the backend: reload the settings, keeping any edit
+  // that hasn't been saved yet.
   async function reloadSignIn() {
     try {
       const fresh = await getSettings();
-      const signIn = {
-        youtube_signed_in: fresh.youtube_signed_in,
-        youtube_channel_name: fresh.youtube_channel_name,
-      };
-      setSavedSettings((s) => (s ? { ...s, ...signIn } : fresh));
-      setSettings((s) => (s ? { ...s, ...signIn } : fresh));
+      saved.current = fresh;
+      setSettings((s) => {
+        if (!s) return fresh;
+        const next = { ...fresh };
+        for (const field of timers.current.keys()) {
+          (next as Record<Field, unknown>)[field] = s[field];
+        }
+        return next;
+      });
     } catch (err) {
-      console.error("Failed to reload settings:", err);
+      setActionError(errorMessage(err, "Couldn't reload the settings"));
     }
   }
 
-  async function handleSave() {
-    if (!settings || !savedSettings) return;
-
-    try {
-      setSaving(true);
-      setSaveError(null);
-      const updated = await saveSettings(settingsPatch(savedSettings, settings));
-      setSavedSettings(updated);
-      setSettings(updated);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch (err) {
-      console.error("Failed to save settings:", err);
-      setSaveError(errorMessage(err, "Failed to save settings"));
-      // A refused folder change was put back; show what's really in effect.
-      try {
-        const current = await getSettings();
-        setSavedSettings(current);
-        setSettings((s) => (s ? { ...s, output_folder: current.output_folder } : current));
-      } catch {
-        // Keep the edits on screen.
-      }
-    } finally {
-      setSaving(false);
-    }
+  if (!loading && loadError) {
+    return (
+      <div className="p-6 max-w-2xl mx-auto">
+        <h2 className="text-2xl font-bold mb-6">Settings</h2>
+        <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center justify-between gap-3">
+          <span>{loadError}</span>
+          <button onClick={loadSettings} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg text-sm">
+            Try Again
+          </button>
+        </div>
+      </div>
+    );
   }
 
   if (loading || !settings) {
@@ -176,7 +267,22 @@ export function Settings() {
 
   return (
     <div className="p-6 max-w-2xl mx-auto">
-      <h2 className="text-2xl font-bold mb-6">Settings</h2>
+      <div className="flex items-baseline justify-between mb-6">
+        <h2 className="text-2xl font-bold">Settings</h2>
+        <span className="text-sm text-muted-foreground flex items-center gap-1" aria-live="polite">
+          {savesInFlight > 0 ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Saving…
+            </>
+          ) : savedOnce ? (
+            <>
+              <CheckCircle className="w-4 h-4" />
+              Saved
+            </>
+          ) : null}
+        </span>
+      </div>
 
       <div className="space-y-6">
         {/* Download Quality */}
@@ -184,14 +290,13 @@ export function Settings() {
           <h3 className="text-lg font-semibold mb-4">Download</h3>
 
           <div>
-            <label className="block text-sm font-medium mb-2">
+            <label htmlFor="settings-quality" className="block text-sm font-medium mb-2">
               Default Quality
             </label>
             <select
+              id="settings-quality"
               value={settings.download_quality}
-              onChange={(e) =>
-                setSettings({ ...settings, download_quality: e.target.value })
-              }
+              onChange={(e) => edit("download_quality", e.target.value, 0)}
               className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring bg-background"
             >
               <option value="best">Best Available</option>
@@ -201,22 +306,28 @@ export function Settings() {
               <option value="720p">720p</option>
               <option value="480p">480p</option>
             </select>
+            <FieldError message={fieldErrors.download_quality} />
           </div>
 
           <div className="mt-4">
-            <label className="block text-sm font-medium mb-2">
+            <label htmlFor="settings-folder" className="block text-sm font-medium mb-2">
               Library Folder
             </label>
             <p className="text-sm text-muted-foreground mb-2">
               Every video in this folder shows up in the library. Drop recordings in here; downloads from YouTube are saved here too.
             </p>
             <div className="flex gap-2">
+              {/* A typed path is saved on Enter or leaving the field, not
+                  while typing: each save switches the library. */}
               <input
+                id="settings-folder"
                 type="text"
                 value={settings.output_folder}
-                onChange={(e) =>
-                  setSettings({ ...settings, output_folder: e.target.value })
-                }
+                onChange={(e) => edit("output_folder", e.target.value, Infinity)}
+                onBlur={() => flushField("output_folder")}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") flushField("output_folder");
+                }}
                 placeholder="Leave empty for default"
                 className="flex-1 px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring"
               />
@@ -224,9 +335,10 @@ export function Settings() {
                 onClick={async () => {
                   const selected = await open({ directory: true });
                   if (selected && typeof selected === "string") {
-                    setSettings({ ...settings, output_folder: selected });
+                    edit("output_folder", selected, 0);
                   }
                 }}
+                title="Choose folder"
                 className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
               >
                 <FolderOpen className="w-5 h-5" />
@@ -235,6 +347,7 @@ export function Settings() {
             <p className="mt-2 text-sm text-muted-foreground">
               Default: Movies/sermon-cut on Mac, Videos/sermon-cut on Windows and Linux
             </p>
+            <FieldError message={fieldErrors.output_folder} />
             {folderWarnings.map((warning, i) => (
               <div key={i} className="mt-2 flex items-start gap-2 p-3 text-sm rounded-lg bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">
                 <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -271,7 +384,7 @@ export function Settings() {
                     <p className="text-xs text-muted-foreground truncate">{settings.logo_path}</p>
                   </div>
                   <button
-                    onClick={() => setSettings({ ...settings, logo_path: null })}
+                    onClick={() => edit("logo_path", null, 0)}
                     className="p-2 hover:bg-secondary rounded-lg transition-colors"
                     title="Remove logo"
                   >
@@ -286,8 +399,8 @@ export function Settings() {
                     multiple: false,
                     filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp"] }],
                   });
-                  if (selected) {
-                    setSettings({ ...settings, logo_path: selected as string });
+                  if (selected && typeof selected === "string") {
+                    edit("logo_path", selected, 0);
                   }
                 }}
                 className="w-full px-4 py-8 border-2 border-dashed border-border rounded-lg hover:border-muted-foreground/50 transition-colors flex flex-col items-center gap-2 text-muted-foreground"
@@ -297,6 +410,7 @@ export function Settings() {
                 <span className="text-xs">PNG with transparency recommended</span>
               </button>
             )}
+            <FieldError message={fieldErrors.logo_path} />
           </div>
         </div>
 
@@ -359,7 +473,7 @@ export function Settings() {
 
           {youtubeAuth?.is_authenticated && (
             <div className="mt-4">
-              <label className="block text-sm font-medium mb-2">
+              <label htmlFor="settings-playlist" className="block text-sm font-medium mb-2">
                 Upload Playlist
               </label>
               <p className="text-sm text-muted-foreground mb-2">
@@ -372,13 +486,9 @@ export function Settings() {
                 </div>
               ) : (
                 <select
+                  id="settings-playlist"
                   value={settings.youtube_playlist_id ?? ""}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      youtube_playlist_id: e.target.value || null,
-                    })
-                  }
+                  onChange={(e) => edit("youtube_playlist_id", e.target.value || null, 0)}
                   className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring bg-background"
                 >
                   <option value="">None</option>
@@ -389,6 +499,15 @@ export function Settings() {
                   ))}
                 </select>
               )}
+              {playlistsError && (
+                <div className="mt-2 flex items-center justify-between gap-3 p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
+                  <span>{playlistsError}</span>
+                  <button onClick={loadPlaylists} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg text-sm">
+                    Try Again
+                  </button>
+                </div>
+              )}
+              <FieldError message={fieldErrors.youtube_playlist_id} />
             </div>
           )}
         </div>
@@ -398,35 +517,34 @@ export function Settings() {
           <h3 className="text-lg font-semibold mb-4">Transcription API</h3>
 
           <div>
-            <label className="block text-sm font-medium mb-2">
+            <label htmlFor="settings-modal-url" className="block text-sm font-medium mb-2">
               Modal API URL
             </label>
             <input
+              id="settings-modal-url"
               type="text"
               value={settings.modal_api_url}
-              onChange={(e) =>
-                setSettings({ ...settings, modal_api_url: e.target.value })
-              }
+              onChange={(e) => edit("modal_api_url", e.target.value)}
+              onBlur={() => flushField("modal_api_url")}
               className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring font-mono text-sm"
             />
+            <FieldError message={fieldErrors.modal_api_url} />
           </div>
 
           <div className="mt-4">
-            <label className="block text-sm font-medium mb-2">
+            <label htmlFor="settings-modal-key" className="block text-sm font-medium mb-2">
               API Key (Optional)
             </label>
             <input
+              id="settings-modal-key"
               type="password"
               value={settings.modal_api_key ?? ""}
-              onChange={(e) =>
-                setSettings({
-                  ...settings,
-                  modal_api_key: e.target.value || null,
-                })
-              }
+              onChange={(e) => edit("modal_api_key", e.target.value || null)}
+              onBlur={() => flushField("modal_api_key")}
               placeholder="Leave empty if not required"
               className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring"
             />
+            <FieldError message={fieldErrors.modal_api_key} />
           </div>
         </div>
 
@@ -530,12 +648,13 @@ export function Settings() {
                 onConfirm={async () => {
                   try {
                     setResetting(true);
+                    setActionError(null);
                     await resetState();
                     await loadSettings();
                     await loadYoutubeAuth();
                     setResetConfirm(false);
                   } catch (err) {
-                    setSaveError(errorMessage(err, "Failed to reset settings"));
+                    setActionError(errorMessage(err, "Failed to reset settings"));
                   } finally {
                     setResetting(false);
                   }
@@ -569,7 +688,7 @@ export function Settings() {
                     await clearLibraryData();
                     setClearConfirm(false);
                   } catch (err) {
-                    setSaveError(errorMessage(err, "Failed to clear library data"));
+                    setActionError(errorMessage(err, "Failed to clear library data"));
                   } finally {
                     setClearing(false);
                   }
@@ -579,35 +698,19 @@ export function Settings() {
           </div>
         </div>
 
-        {/* Save Button */}
-        {saveError && (
-          <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">{saveError}</div>
+        {actionError && (
+          <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">{actionError}</div>
         )}
-        <div className="flex justify-end">
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 flex items-center gap-2 transition-colors"
-          >
-            {saving ? (
-              <>
-                <Loader2 className="w-5 h-5 animate-spin" />
-                Saving...
-              </>
-            ) : saved ? (
-              <>
-                <CheckCircle className="w-5 h-5" />
-                Saved!
-              </>
-            ) : (
-              <>
-                <Save className="w-5 h-5" />
-                Save Settings
-              </>
-            )}
-          </button>
-        </div>
       </div>
+    </div>
+  );
+}
+
+function FieldError({ message }: { message?: string }) {
+  if (!message) return null;
+  return (
+    <div role="alert" className="mt-2 p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
+      {message}
     </div>
   );
 }

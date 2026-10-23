@@ -116,9 +116,10 @@ export function nextSettingsSeq(): number {
   return lastSettingsSeq;
 }
 
-/** Save only the given fields. Resolves with the settings as they now are. */
-export async function saveSettings(patch: SettingsPatch): Promise<Settings> {
-  return invoke("save_settings", { patch, seq: nextSettingsSeq() });
+/** Save only the given fields. Resolves with the settings as they now are.
+ * Pass a `seq` from nextSettingsSeq() to tell responses apart. */
+export async function saveSettings(patch: SettingsPatch, seq = nextSettingsSeq()): Promise<Settings> {
+  return invoke("save_settings", { patch, seq });
 }
 
 export async function resetState(): Promise<void> {

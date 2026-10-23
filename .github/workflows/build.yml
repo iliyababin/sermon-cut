@@ -43,13 +43,15 @@ jobs:
           node-version: 22
           cache: npm
 
+      # Third-party actions are pinned to commit SHAs (tag or branch in the comment).
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri -> target
 
@@ -66,6 +68,19 @@ jobs:
             libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev
 
+      # No install scripts run from the registry. esbuild is the only dependency
+      # whose install script matters (it checks its platform binary); fsevents
+      # ships prebuilt. Rebuild only the allow-listed ones.
+      - name: Install frontend dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm rebuild esbuild
+
+      # Built on its own, with no secrets in the environment; tauri-action is
+      # told not to rebuild it (beforeBuildCommand is emptied below).
+      - name: Build frontend
+        run: npm run build
+
       - name: Setup YouTube client secrets
         shell: bash
         env:
@@ -73,11 +88,8 @@ jobs:
         run: |
           printf '%s' "$YOUTUBE_CLIENT_SECRETS" > src-tauri/resources/youtube_client_secrets.json
 
-      - name: Install frontend dependencies
-        run: npm ci
-
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@action-v0.6.2
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -88,7 +100,12 @@ jobs:
           releaseBody: 'See the assets below to download for your platform.'
           releaseDraft: true
           prerelease: false
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} --config '{"build":{"beforeBuildCommand":""}}'
+
+      - name: Remove YouTube client secrets
+        if: always()
+        shell: bash
+        run: rm -f src-tauri/resources/youtube_client_secrets.json
 
       # SHA256SUMS.txt lets install.sh detect a truncated or corrupted download.
       # It is a corruption check, NOT a security guarantee: it lives in the same

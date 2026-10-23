@@ -11,8 +11,7 @@
 # Environment overrides:
 #   APP_DIR                  where the app goes (default /Applications)
 #   SERMON_CUT_TOOLS_DIR     where ffmpeg/yt-dlp/QuickJS go
-#   INSTALL_QUIT_TIMEOUT     seconds to wait for a running copy to quit (60)
-#   SERMON_CUT_SKIP_QUIT=1   never ask a running Sermon Cut to quit (testing)
+#   SERMON_CUT_BUNDLE_ID     bundle id used to spot a running copy (testing)
 #   SERMON_CUT_NO_OPEN=1     don't open the app when done
 
 set -euo pipefail
@@ -20,7 +19,7 @@ set -euo pipefail
 REPO="iliyababin/sermon-cut"
 APP_NAME="Sermon Cut"
 APP_DIR="${APP_DIR:-${SERMON_CUT_APP_DIR:-/Applications}}"
-QUIT_TIMEOUT="${INSTALL_QUIT_TIMEOUT:-60}"
+BUNDLE_ID="${SERMON_CUT_BUNDLE_ID:-com.youthscc.sermon-cut}"
 TOOLS_DIR="${SERMON_CUT_TOOLS_DIR:-$HOME/Library/Application Support/com.youthscc.sermon-cut/bin}"
 
 # Pinned tool versions. Bump these (and the hashes) to update.
@@ -51,11 +50,39 @@ check_sha() { # file expected
 
 if [ ! -w "$APP_DIR" ]; then
   APP_DIR="$HOME/Applications"
-  mkdir -p "$APP_DIR"
 fi
 APP="$APP_DIR/$APP_NAME.app"
 APP_NEW="$APP_DIR/.$APP_NAME.app.new"
 APP_OLD="$APP_DIR/.$APP_NAME.app.old"
+
+# --- Refuse to run while Sermon Cut is open ---------------------------------
+# Checked before anything changes, the tools included: the app may be in the
+# middle of an upload or processing, and quitting it from here would cut that
+# short. So the user quits it themselves.
+bundle_exe() { # app-path
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$1/Contents/Info.plist" 2>/dev/null
+}
+EXE=$(bundle_exe "$APP" || echo "$APP_NAME")
+app_running() {
+  # 1. The copy in $APP_DIR, by full executable path. pgrep -f takes a regex,
+  #    so escape it.
+  local exe_re
+  exe_re=$(printf '%s' "$APP/Contents/MacOS/$EXE" | sed 's/[][\.*^$+?(){}|]/\\&/g')
+  pgrep -f "^$exe_re" >/dev/null && return 0
+  # 2. Any copy by bundle id (one run from Downloads, or translocated).
+  #    lsappinfo prints an ASN line per running match and a blank line if none.
+  lsappinfo find "bundleid=$BUNDLE_ID" 2>/dev/null | grep -q 'ASN:' && return 0
+  # 3. Fallback: any process with the app's executable name.
+  pgrep -x "$EXE" >/dev/null && return 0
+  return 1
+}
+if app_running; then
+  printf '\n%s%s is open.%s Check no upload or processing is running, quit it (⌘Q), then run this again.\n' \
+    "$bold" "$APP_NAME" "$reset" >&2
+  echo "Nothing was changed." >&2
+  exit 1
+fi
+mkdir -p "$APP_DIR"
 
 # --- Recover from an interrupted earlier run --------------------------------
 # The swap below is: stage .new, move the app to .old, move .new into place,
@@ -72,7 +99,18 @@ fi
 rm -rf "$APP_OLD" "$APP_NEW"
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# On any exit: if the swap below was cut short and the app is missing, put
+# the old copy back; never leave a staged .new behind. A successful run has
+# the app in place and no .old, so this restores nothing.
+cleanup() {
+  if [ ! -d "$APP" ] && [ -d "$APP_OLD" ]; then
+    mv "$APP_OLD" "$APP" || true
+  fi
+  rm -rf "$APP_NEW" "$TMP"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "$TOOLS_DIR"
 
@@ -166,35 +204,11 @@ mkdir "$TMP/app"
 tar -xzf "$TMP/$app_asset" -C "$TMP/app"
 [ -d "$TMP/app/$APP_NAME.app" ] || fail "The download didn't contain $APP_NAME.app"
 
-# --- Make sure the installed copy isn't running ------------------------------
-bundle_exe() { # app-path
-  /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$1/Contents/Info.plist" 2>/dev/null
-}
-if [ -d "$APP" ]; then
-  EXE=$(bundle_exe "$APP" || bundle_exe "$TMP/app/$APP_NAME.app" || echo "$APP_NAME")
-  # Match the full executable path, so only the copy in $APP_DIR counts (not,
-  # say, another copy elsewhere). pgrep -f takes a regex, so escape it.
-  exe_re=$(printf '%s' "$APP/Contents/MacOS/$EXE" | sed 's/[][\.*^$+?(){}|]/\\&/g')
-  if pgrep -f "^$exe_re" >/dev/null; then
-    step "Waiting for $APP_NAME to quit"
-    if [ -z "${SERMON_CUT_SKIP_QUIT:-}" ]; then
-      osascript -e 'with timeout of 10 seconds' -e "tell application \"$APP_NAME\" to quit" \
-        -e 'end timeout' >/dev/null 2>&1 || true
-    fi
-    waited=0
-    while pgrep -f "^$exe_re" >/dev/null && [ "$waited" -lt "$QUIT_TIMEOUT" ]; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    if pgrep -f "^$exe_re" >/dev/null; then
-      printf '\n%s%s is still open%s (it may be uploading a video).\n' "$bold" "$APP_NAME" "$reset" >&2
-      echo "Nothing was changed. Quit $APP_NAME when it's done, then run this installer again." >&2
-      exit 1
-    fi
-  fi
-fi
-
 # --- Swap in the new copy ----------------------------------------------------
+# Check again: it may have been opened while the tools were downloading.
+if app_running; then
+  fail "$APP_NAME was opened during the install. The tools were updated but the app wasn't; quit it (⌘Q) and run this again."
+fi
 # Downloads made by curl aren't quarantined, but clear it in case this
 # script itself was downloaded through a browser.
 xattr -dr com.apple.quarantine "$TMP/app/$APP_NAME.app" 2>/dev/null || true

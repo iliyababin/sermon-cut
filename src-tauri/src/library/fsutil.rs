@@ -143,9 +143,24 @@ pub fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
     })
 }
 
-/// Move a file, copying across volumes when rename can't. Safe to repeat:
-/// if the source is gone and the destination exists, it's already done.
+/// A temp name next to `dst` that no other move or write uses.
+fn unique_tmp(dst: &Path) -> std::path::PathBuf {
+    dst.with_file_name(format!(
+        "{}{}{}-{}",
+        dst.file_name().unwrap_or_default().to_string_lossy(),
+        TMP_MARKER,
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Move a file, copying when it has to cross to another volume. Safe to
+/// repeat: if the source is gone and the destination exists, it's done.
 pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
+    move_file_with(src, dst, |a, b| fs::rename(a, b))
+}
+
+fn move_file_with(src: &Path, dst: &Path, rename: impl Fn(&Path, &Path) -> io::Result<()>) -> io::Result<()> {
     if !src.exists() {
         if dst.exists() {
             return Ok(());
@@ -155,25 +170,28 @@ pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
             format!("{} not found", src.display()),
         ));
     }
-    match fs::rename(src, dst) {
+    match rename(src, dst) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            // Different volume (EXDEV) or similar: copy, verify, then delete.
-            let tmp = dst.with_file_name(format!(
-                "{}{}{}",
-                dst.file_name().unwrap_or_default().to_string_lossy(),
-                TMP_MARKER,
-                std::process::id()
-            ));
-            let copied = fs::copy(src, &tmp)?;
-            File::open(&tmp)?.sync_all()?;
-            if copied != fs::metadata(src)?.len() {
+        // Only a different volume is worth a copy; any other failure (no
+        // permission, a folder in the way) would fail the copy too, or
+        // worse, half-succeed.
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+            let tmp = unique_tmp(dst);
+            let result = (|| {
+                let copied = fs::copy(src, &tmp)?;
+                File::open(&tmp)?.sync_all()?;
+                if copied != fs::metadata(src)?.len() {
+                    return Err(io::Error::other("copy size mismatch"));
+                }
+                fs::rename(&tmp, dst)
+            })();
+            if result.is_err() {
                 let _ = fs::remove_file(&tmp);
-                return Err(io::Error::other("copy size mismatch"));
             }
-            fs::rename(&tmp, dst)?;
+            result?;
             fs::remove_file(src)
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -200,7 +218,9 @@ pub fn mp4_completeness(path: &Path, size: u64) -> Completeness {
             return Completeness::Truncated;
         }
         if size - offset < 8 {
-            return Completeness::Truncated;
+            // A few bytes of padding after a complete file (some muxers
+            // and copy tools add them) aren't a box still being written.
+            return if seen_moov { Completeness::Complete } else { Completeness::Truncated };
         }
         let mut header = [0u8; 16];
         if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut header[..8]).is_err() {
@@ -321,6 +341,51 @@ mod tests {
 
         fs::write(&path, b"not an mp4 file at all").unwrap();
         assert_eq!(mp4_completeness(&path, 22), Completeness::Unknown);
+    }
+
+    #[test]
+    fn trailing_padding_after_moov_is_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v.mp4");
+        let mut full = mp4_box(b"ftyp", 16);
+        full.extend(mp4_box(b"mdat", 500));
+        full.extend(mp4_box(b"moov", 100));
+        for extra in 1..=7 {
+            let mut padded = full.clone();
+            padded.extend(std::iter::repeat(0u8).take(extra));
+            fs::write(&path, &padded).unwrap();
+            assert_eq!(mp4_completeness(&path, padded.len() as u64), Completeness::Complete, "{extra}");
+        }
+        // Without a moov, a short tail is still a cut-off box header.
+        let mut no_moov = mp4_box(b"ftyp", 16);
+        no_moov.extend(mp4_box(b"mdat", 500));
+        no_moov.extend([0u8; 3]);
+        fs::write(&path, &no_moov).unwrap();
+        assert_eq!(mp4_completeness(&path, no_moov.len() as u64), Completeness::Truncated);
+    }
+
+    #[test]
+    fn move_file_copies_only_across_volumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a");
+        let dst = tmp.path().join("b");
+        fs::write(&src, b"x").unwrap();
+
+        // Any failure but EXDEV is reported, with nothing copied.
+        let denied = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(move_file_with(&src, &dst, denied).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(src.exists() && !dst.exists());
+
+        // Across volumes: copied, source removed, no temp file left.
+        let exdev = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::CrossesDevices));
+        move_file_with(&src, &dst, exdev).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"x");
+        assert!(!src.exists());
+        let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("b")]);
+
+        // Temp names never repeat, so two moves to one name can't collide.
+        assert_ne!(unique_tmp(&dst), unique_tmp(&dst));
     }
 
     #[test]

@@ -261,25 +261,24 @@ impl Inner {
 
     /// The second half of a scan: match what `observe` saw to the entries.
     /// Callers hold the scan lock from before the observe until after this.
-    fn apply_scan(&mut self, obs: &[FileObs]) {
+    /// Returns the replaced entries whose old outputs must be deleted (see
+    /// `Library::finish_scan`); they're marked busy until then.
+    fn apply_scan(&mut self, obs: &[FileObs]) -> Vec<String> {
         let busy = self.busy_set();
         let last_present = self.scanned.then(|| std::mem::take(&mut self.last.present));
         let reconciled =
             scan::reconcile_adopting(&mut self.manifest.entries, obs, &busy, last_present.as_ref(), &mut self.orphans);
+        let mut stale = Vec::new();
         if self.mode == Mode::Writable {
-            if let Some(paths) = self.paths.clone() {
-                for id in &reconciled.replaced {
-                    if let Err(e) = manifest::remove_video_dir(&paths, id) {
-                        eprintln!("[library] {}", e);
-                    }
-                }
-            }
+            stale = reconciled.replaced.clone();
+            self.busy.extend(stale.iter().cloned());
             if reconciled.changed {
                 self.save_logged();
             }
         }
         self.last = reconciled;
         self.scanned = true;
+        stale
     }
 
     fn save_logged(&self) {
@@ -945,22 +944,51 @@ impl Library {
         })
         .await?;
 
-        let mut g = self.inner();
-        let (result, cache) = observed;
-        g.cache = cache;
-        let obs = match result {
-            Ok(obs) => obs,
-            Err(e) => {
-                let folder = g.paths.as_ref().map(|p| path_string(&p.root)).unwrap_or_default();
-                g.mode = Mode::Unavailable(format!(
-                    "Can't read the library folder {} ({}). If it's on an external drive, plug it back in.",
-                    folder, e
-                ));
-                return Ok(());
+        let obs = {
+            let mut g = self.inner();
+            let (result, cache) = observed;
+            g.cache = cache;
+            match result {
+                Ok(obs) => obs,
+                Err(e) => {
+                    let folder = g.paths.as_ref().map(|p| path_string(&p.root)).unwrap_or_default();
+                    g.mode = Mode::Unavailable(format!(
+                        "Can't read the library folder {} ({}). If it's on an external drive, plug it back in.",
+                        folder, e
+                    ));
+                    return Ok(());
+                }
             }
         };
-        g.apply_scan(&obs);
+        self.finish_scan(&obs).await;
         Ok(())
+    }
+
+    /// Apply a scan, then delete replaced videos' old outputs outside the
+    /// lock. Those videos stay busy (nothing can be queued) until done.
+    async fn finish_scan(self: &Arc<Self>, obs: &[FileObs]) {
+        let (stale, paths) = {
+            let mut g = self.inner();
+            (g.apply_scan(obs), g.paths.clone())
+        };
+        if stale.is_empty() {
+            return;
+        }
+        if let Some(paths) = paths {
+            let ids = stale.clone();
+            let _ = blocking(move || {
+                for id in &ids {
+                    if let Err(e) = manifest::remove_video_dir(&paths, id) {
+                        eprintln!("[library] {}", e);
+                    }
+                }
+            })
+            .await;
+        }
+        let mut g = self.inner();
+        for id in &stale {
+            g.busy.remove(id);
+        }
     }
 
     pub fn view(&self, notices: Vec<String>) -> LibraryView {
@@ -2631,6 +2659,32 @@ mod tests {
         assert_eq!(v[0].status, ViewStatus::ReadyForReview);
         assert_eq!(lib.detail(&id).unwrap().thumbnail_options.len(), 2);
         assert!(paths.manifest().exists());
+    }
+
+    #[tokio::test]
+    async fn replaced_files_lose_their_old_outputs_outside_the_lock() {
+        let (_t, lib, id, dir) = processed_library();
+        assert!(dir.join("thumbnail_option_1.jpg").exists());
+        let replaced = FileObs {
+            name: "a.mp4".into(),
+            size: 99,
+            mtime_ms: i64::MAX / 2,
+            state: ObsState::Ready,
+            hash: Some("re-exported".into()),
+            duration: Some(60.0),
+        };
+        // Busy from the reconcile until the folder is gone.
+        let stale = lib.inner().apply_scan(std::slice::from_ref(&replaced));
+        assert_eq!(stale, vec![id.clone()]);
+        assert!(lib.inner().busy.contains(&id));
+        assert!(lib.enqueue(&id).await.is_err());
+        lib.inner().busy.remove(&id);
+
+        let r = FileObs { hash: Some("again".into()), size: 100, ..replaced };
+        lib.finish_scan(&[r]).await;
+        assert!(!dir.exists());
+        assert!(!lib.inner().busy.contains(&id));
+        assert_eq!(lib.view(vec![]).videos[0].status, ViewStatus::New);
     }
 
     #[test]

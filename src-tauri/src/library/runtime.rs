@@ -2253,7 +2253,7 @@ impl Library {
     pub async fn custom_thumbnail(
         self: &Arc<Self>,
         id: &str,
-        source: String,
+        source: PathBuf,
         crop: crate::thumbnail::CropRect,
         grading: bool,
     ) -> Result<String, String> {

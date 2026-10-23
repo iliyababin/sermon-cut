@@ -297,12 +297,12 @@ pub async fn generate_thumbnail_options(
 /// Process a custom image as a thumbnail: crop, and optionally colour grade.
 /// No logo: the template draws it. CPU work, so on a blocking thread.
 pub async fn process_custom_thumbnail(
-    source_path: &str,
+    source_path: impl AsRef<Path>,
     output_dir: &Path,
     crop_rect: &CropRect,
     apply_color_grading_flag: bool,
 ) -> Result<String, String> {
-    let (source, output_dir, crop_rect) = (PathBuf::from(source_path), output_dir.to_path_buf(), crop_rect.clone());
+    let (source, output_dir, crop_rect) = (source_path.as_ref().to_path_buf(), output_dir.to_path_buf(), crop_rect.clone());
     tokio::task::spawn_blocking(move || custom_thumbnail(&source, &output_dir, &crop_rect, apply_color_grading_flag))
         .await
         .map_err(|e| format!("Thumbnail task failed: {}", e))?

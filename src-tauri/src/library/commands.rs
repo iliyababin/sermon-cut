@@ -146,8 +146,8 @@ pub async fn process_custom_thumbnail(
 ) -> Result<String, String> {
     // A picked image (the dialog adds picks to the fs scope) or one of the
     // video's own.
-    crate::commands::check_path(&app_handle, &lib, &source_image_path, crate::commands::Access::Data)?;
-    let result = lib.custom_thumbnail(&video_id, source_image_path, crop_rect, apply_color_grading).await;
+    let source = crate::commands::check_path(&app_handle, &lib, &source_image_path, crate::commands::Access::Data)?;
+    let result = lib.custom_thumbnail(&video_id, source, crop_rect, apply_color_grading).await;
     changed(&app_handle);
     result
 }

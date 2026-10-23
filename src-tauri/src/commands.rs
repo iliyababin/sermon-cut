@@ -65,18 +65,27 @@ fn is_state_file(path: &Path) -> bool {
     named(path) || resolve(path).is_some_and(|p| named(&p))
 }
 
-/// Whether a file command may use `path`: inside `roots`, or picked by the
-/// user in a dialog; never one of state.json's files when reading or
-/// writing.
-pub fn path_allowed(path: &Path, roots: &[PathBuf], picked: bool, access: Access) -> bool {
+/// The resolved path (see `fsutil::resolve`) a file command may use for
+/// `path`: inside `roots`, or picked by the user in a dialog; never one of
+/// state.json's files when reading or writing.
+pub fn allowed_path(path: &Path, roots: &[PathBuf], picked: bool, access: Access) -> Option<PathBuf> {
     if access == Access::Data && is_state_file(path) {
-        return false;
+        return None;
     }
-    is_within(path, roots) || picked
+    roots
+        .iter()
+        .find_map(|root| resolve_within(path, root))
+        .or_else(|| picked.then(|| resolve(path)).flatten())
+}
+
+pub fn path_allowed(path: &Path, roots: &[PathBuf], picked: bool, access: Access) -> bool {
+    allowed_path(path, roots, picked, access).is_some()
 }
 
 /// Refuse a path outside the app's folders, unless the user picked it in an
 /// open/save dialog this session (the dialog adds picks to the fs scope).
+/// Returns the resolved path, which callers use instead of the string they
+/// were given (docs/INVARIANTS.md #11).
 pub fn check_path(app_handle: &AppHandle, lib: &LibraryHandle, path: &str, access: Access) -> Result<PathBuf, String> {
     use tauri_plugin_fs::FsExt;
     let p = Path::new(path);
@@ -84,11 +93,8 @@ pub fn check_path(app_handle: &AppHandle, lib: &LibraryHandle, path: &str, acces
         .try_fs_scope()
         .is_some_and(|scope| scope.is_allowed(p));
     let roots = allowed_roots(lib.root(), app_handle.path().app_data_dir().ok(), access);
-    if path_allowed(p, &roots, picked, access) {
-        Ok(p.to_path_buf())
-    } else {
-        Err(format!("Sermon Cut can only use files in its own folders or ones you chose: {}", path))
-    }
+    allowed_path(p, &roots, picked, access)
+        .ok_or_else(|| format!("Sermon Cut can only use files in its own folders or ones you chose: {}", path))
 }
 
 #[tauri::command]
@@ -227,7 +233,7 @@ pub async fn read_image_base64(
     path: String,
 ) -> Result<String, String> {
     use base64::Engine;
-    check_path(&app_handle, &lib, &path, Access::Data)?;
+    let path = check_path(&app_handle, &lib, &path, Access::Data)?;
 
     let bytes = std::fs::read(&path)
         .map_err(|e| format!("Failed to read image: {}", e))?;
@@ -248,8 +254,8 @@ pub async fn read_image_base64(
 
 #[tauri::command]
 pub async fn open_file(app_handle: AppHandle, lib: State<'_, LibraryHandle>, path: String) -> Result<(), String> {
-    check_path(&app_handle, &lib, &path, Access::Open)?;
-    println!("[open_file] Opening file: {}", path);
+    let path = check_path(&app_handle, &lib, &path, Access::Open)?;
+    println!("[open_file] Opening file: {}", path.display());
 
     #[cfg(target_os = "linux")]
     {
@@ -270,7 +276,8 @@ pub async fn open_file(app_handle: AppHandle, lib: State<'_, LibraryHandle>, pat
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path])
+            .args(["/C", "start", ""])
+            .arg(&path)
             .spawn()
             .map_err(|e| format!("Failed to open file: {}", e))?;
     }
@@ -280,8 +287,8 @@ pub async fn open_file(app_handle: AppHandle, lib: State<'_, LibraryHandle>, pat
 
 #[tauri::command]
 pub async fn open_folder(app_handle: AppHandle, lib: State<'_, LibraryHandle>, path: String) -> Result<(), String> {
-    check_path(&app_handle, &lib, &path, Access::Open)?;
-    open_folder_path(path)
+    let path = check_path(&app_handle, &lib, &path, Access::Open)?;
+    open_folder_path(path.to_string_lossy().to_string())
 }
 
 /// Open a folder (or a file's folder) in the file manager, unchecked: for
@@ -573,14 +580,14 @@ pub async fn crop_standalone_thumbnail(
     crop_rect: crate::thumbnail::CropRect,
 ) -> Result<String, String> {
     // Usually a picked image; the dialog adds picks to the fs scope.
-    check_path(&app_handle, &lib, &source_image_path, Access::Data)?;
+    let source = check_path(&app_handle, &lib, &source_image_path, Access::Data)?;
     let dir = standalone_dir(&app_handle)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let _ = std::fs::remove_file(e.path());
         }
     }
-    crate::thumbnail::process_custom_thumbnail(&source_image_path, &dir, &crop_rect, false)
+    crate::thumbnail::process_custom_thumbnail(&source, &dir, &crop_rect, false)
         .await
 }
 
@@ -615,13 +622,13 @@ pub async fn copy_file(
     source: String,
     destination: String,
 ) -> Result<(), String> {
-    check_path(&app_handle, &lib, &source, Access::Data)?;
-    check_path(&app_handle, &lib, &destination, Access::Data)?;
-    if let Some(parent) = Path::new(&destination).parent() {
+    let from = check_path(&app_handle, &lib, &source, Access::Data)?;
+    let to = check_path(&app_handle, &lib, &destination, Access::Data)?;
+    if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create destination directory: {}", e))?;
     }
-    std::fs::copy(&source, &destination)
+    std::fs::copy(&from, &to)
         .map_err(|e| format!("Failed to copy {} to {}: {}", source, destination, e))?;
     Ok(())
 }
@@ -764,6 +771,26 @@ mod tests {
             assert!(is_within(&tmp.path().join("alias/sub/a.jpg"), &roots));
             assert!(is_within(&root.join("sub/a.jpg"), &[tmp.path().join("alias")]));
         }
+    }
+
+    #[test]
+    fn the_checked_path_is_the_resolved_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/a.jpg"), b"x").unwrap();
+        let real = root.canonicalize().unwrap();
+        let roots = vec![root.clone()];
+        let got = allowed_path(&root.join("sub/../sub/./a.jpg"), &roots, false, Access::Data);
+        assert_eq!(got, Some(real.join("sub/a.jpg")));
+        // A pick outside the roots comes back resolved too.
+        let picked = tmp.path().join("pick.png");
+        std::fs::write(&picked, b"x").unwrap();
+        assert_eq!(
+            allowed_path(&tmp.path().join("lib/../pick.png"), &roots, true, Access::Data),
+            Some(picked.canonicalize().unwrap())
+        );
+        assert_eq!(allowed_path(&picked, &roots, false, Access::Data), None);
     }
 
     #[test]

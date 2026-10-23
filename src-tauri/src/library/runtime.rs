@@ -147,6 +147,10 @@ struct Inner {
     /// rebuilt library), which auto-process must leave alone: the entries
     /// it adds count as already there (`first_seen` 0).
     baseline_scan: bool,
+    /// Files that baseline scan saw still settling (copying, or not yet
+    /// readable): they were there too, so when a later scan adds them they
+    /// count as already there as well.
+    baseline_settling: HashSet<String>,
 }
 
 pub struct Library {
@@ -219,19 +223,31 @@ impl Inner {
     fn apply_scan(&mut self, obs: &[FileObs]) -> Vec<String> {
         let busy = self.busy_set();
         let last_present = self.scanned.then(|| std::mem::take(&mut self.last.present));
-        let known: Option<HashSet<String>> =
-            self.baseline_scan.then(|| self.manifest.entries.iter().map(|e| e.id.clone()).collect());
+        let known: Option<HashSet<String>> = (self.baseline_scan || !self.baseline_settling.is_empty())
+            .then(|| self.manifest.entries.iter().map(|e| e.id.clone()).collect());
         let reconciled =
             scan::reconcile_adopting(&mut self.manifest.entries, obs, &busy, last_present.as_ref(), &mut self.orphans);
         if let Some(known) = known {
+            let baseline = self.baseline_scan;
             for e in self.manifest.entries.iter_mut().filter(|e| !known.contains(&e.id)) {
-                e.first_seen = 0;
+                if baseline || self.baseline_settling.contains(&e.file_name) {
+                    e.first_seen = 0;
+                }
             }
         }
         let mut stale = Vec::new();
         if self.mode == Mode::Writable {
             // Only a saved scan settles the backlog: a read-only one is
-            // forgotten when the library is reopened for writing.
+            // forgotten when the library is reopened for writing. Files it
+            // couldn't add yet (a scan only adds a file it has watched hold
+            // still) stay backlog until they're added.
+            let settling: HashSet<String> =
+                reconciled.copying.iter().chain(&reconciled.unreadable).map(|o| o.name.clone()).collect();
+            if self.baseline_scan {
+                self.baseline_settling = settling;
+            } else {
+                self.baseline_settling.retain(|n| settling.contains(n));
+            }
             self.baseline_scan = false;
             stale = reconciled.replaced.clone();
             self.busy.extend(stale.iter().cloned());
@@ -394,6 +410,7 @@ impl Library {
                 orphans: std::collections::HashMap::new(),
                 updating: false,
                 baseline_scan: false,
+                baseline_settling: HashSet::new(),
             }),
             scan_lock: tokio::sync::Mutex::new(()),
             lock_file_mutex: tokio::sync::Mutex::new(()),
@@ -1289,6 +1306,33 @@ mod tests {
         assert_eq!(lib.inner().manifest.entries.len(), 2);
         assert!(lib.auto_process(since).await.is_empty());
         assert!(!lib.inner().baseline_scan);
+    }
+
+    /// Found by the smoke test: the first scan after a regain (or switch)
+    /// sees files it hasn't watched hold still as copying and adds them on a
+    /// later scan. They're the backlog all the same.
+    #[tokio::test]
+    async fn backlog_files_still_settling_at_the_first_scan_stay_backlog() {
+        let (_t, lib, _id, _dir) = processed_library();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("old 1.mp4"), b"one").unwrap();
+        std::fs::write(other.path().join("old 2.mp4"), b"two").unwrap();
+        let since = chrono::Utc::now().timestamp_millis();
+        lib.switch(other.path().to_string_lossy().to_string()).await.unwrap();
+        let root = lib.root().unwrap();
+        let settling = |name: &str| FileObs { state: ObsState::Copying, hash: None, duration: None, ..seen(&root, name) };
+        lib.inner().apply_scan(&[settling("old 1.mp4"), seen(&root, "old 2.mp4")]);
+        assert_eq!(lib.inner().manifest.entries.len(), 1);
+
+        // It settles; a file that starts arriving now is new.
+        std::fs::write(root.join("new.mp4"), b"three").unwrap();
+        lib.inner().apply_scan(&[seen(&root, "old 1.mp4"), seen(&root, "old 2.mp4"), settling("new.mp4")]);
+        assert_eq!(lib.inner().manifest.entries.len(), 2);
+        assert!(lib.auto_process(since).await.is_empty());
+        lib.inner().apply_scan(&[seen(&root, "old 1.mp4"), seen(&root, "old 2.mp4"), seen(&root, "new.mp4")]);
+        let new = lib.inner().manifest.entries.iter().find(|e| e.file_name == "new.mp4").unwrap().id.clone();
+        assert_eq!(lib.auto_process(since).await, vec![new]);
+        assert!(lib.inner().baseline_settling.is_empty());
     }
 
     pub(super) fn saved_queue(lib: &Library) -> Vec<String> {

@@ -201,6 +201,8 @@ export interface TranscriptionResult {
   suggested_chapters: Chapter[] | null;
   /** Why the AI couldn't find the sermon; the whole video was kept. */
   analysis_error?: string | null;
+  /** The AI ran but found no sermon, and says why (newer servers). */
+  no_sermon_reason?: string | null;
 }
 
 export interface YouTubeAuthStatus {

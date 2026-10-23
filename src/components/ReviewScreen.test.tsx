@@ -113,6 +113,11 @@ describe("ReviewScreen", () => {
     render(<ReviewScreen video={video({ transcription })} onBack={() => {}} />);
     await screen.findByRole("button", { name: /upload/i });
     expect(screen.queryByText(/Couldn't find the sermon automatically/)).toBeNull();
+    cleanup();
+    // The AI ran, found no sermon, and says why.
+    render(<ReviewScreen video={video({ transcription: { ...transcription, no_sermon_reason: "Only worship songs" } })} onBack={() => {}} />);
+    expect(await screen.findByText(/Couldn't find the sermon automatically/)).toBeTruthy();
+    expect(screen.getByText("Only worship songs")).toBeTruthy();
   });
 
   it("times captions from where a new trim really starts", async () => {

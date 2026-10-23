@@ -77,6 +77,10 @@ pub struct TranscriptionResult {
     /// whole video is used, and the review screen asks for the start and end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis_error: Option<String>,
+    /// The AI ran but found no sermon, and says why (`sermon_analysis.reason`;
+    /// older servers don't send it). The review screen shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_sermon_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

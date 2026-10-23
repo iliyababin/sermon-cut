@@ -775,13 +775,18 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         </div>
       )}
 
-      {video.transcription?.analysis_error && !trimmedHere && (
+      {(video.transcription?.analysis_error || video.transcription?.no_sermon_reason) && !trimmedHere && (
         <div
           role="status"
           className="mx-4 mt-4 p-3 bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300 rounded-lg text-sm flex items-center gap-2"
         >
           <AlertTriangle className="w-4 h-4 shrink-0" />
-          <span className="flex-1">Couldn't find the sermon automatically — set the start and end below</span>
+          <span className="flex-1">
+            Couldn't find the sermon automatically — set the start and end below
+            {video.transcription?.no_sermon_reason && (
+              <span className="block text-xs opacity-80">{video.transcription.no_sermon_reason}</span>
+            )}
+          </span>
           <button
             onClick={() => trimPanel.current?.scrollIntoView?.({ behavior: "smooth" })}
             className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"

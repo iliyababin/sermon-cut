@@ -30,6 +30,9 @@ struct SermonAnalysis {
     title: Option<String>,
     description: Option<String>,
     chapters: Option<Vec<ModalChapter>>,
+    /// Why no sermon was found (then sermon_start is null).
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,8 +282,12 @@ fn parse_response(bytes: &[u8]) -> Result<TranscriptionResult, String> {
         .collect();
 
     let mut analysis_error = None;
+    let mut no_sermon_reason = None;
     let (sermon_start, sermon_end, suggested_title, suggested_description, suggested_chapters) =
         if let Some(analysis) = modal_response.sermon_analysis {
+            if analysis.sermon_start.is_none() {
+                no_sermon_reason = analysis.reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+            }
             (
                 analysis.sermon_start,
                 analysis.sermon_end,
@@ -315,6 +322,7 @@ fn parse_response(bytes: &[u8]) -> Result<TranscriptionResult, String> {
         suggested_description,
         suggested_chapters,
         analysis_error,
+        no_sermon_reason,
     })
 }
 
@@ -357,6 +365,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.analysis_error, None);
+    }
+
+    #[test]
+    fn the_reason_no_sermon_was_found_is_kept() {
+        let r = parse_response(
+            br#"{"segments":[],"text":"","sermon_analysis":{"sermon_start":null,"sermon_end":null,"title":null,"description":null,"chapters":null,"reason":"Only worship songs"}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.no_sermon_reason.as_deref(), Some("Only worship songs"));
+        assert_eq!((r.sermon_start, r.analysis_error.as_deref()), (None, None));
+        // Older servers don't send one.
+        let r = parse_response(br#"{"segments":[],"text":"","sermon_analysis":{"sermon_start":null,"sermon_end":null,"title":null,"description":null,"chapters":null}}"#).unwrap();
+        assert_eq!(r.no_sermon_reason, None);
+        // Saved, and read back.
+        let saved: TranscriptionResult = serde_json::from_str(&serde_json::to_string(&TranscriptionResult {
+            no_sermon_reason: Some("why".into()),
+            ..r
+        }).unwrap())
+        .unwrap();
+        assert_eq!(saved.no_sermon_reason.as_deref(), Some("why"));
     }
 
     #[test]

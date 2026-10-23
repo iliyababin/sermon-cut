@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { ErrorBanner } from "./ErrorBanner";
 import { useCanvasEditor, type ImageLoad } from "@/hooks/useCanvasEditor";
-import { readImageBase64, processCustomThumbnail } from "@/lib/tauri";
+import { readImageBase64, processCustomThumbnail, errorMessage } from "@/lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
 import { LocalImage } from "./LocalImage";
 import type { ThumbnailOption } from "@/lib/types";
@@ -154,7 +155,7 @@ export function ThumbnailEditor({
       onSave(newThumbnailPath);
     } catch (err) {
       console.error("Failed to process thumbnail:", err);
-      setError(err instanceof Error ? err.message : String(err || "Failed to process thumbnail"));
+      setError(errorMessage(err, "Couldn't save the thumbnail"));
     } finally {
       setIsSaving(false);
     }
@@ -343,9 +344,7 @@ export function ThumbnailEditor({
 
           {/* Error */}
           {error && (
-            <div role="alert" className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
-              {error}
-            </div>
+            <ErrorBanner message={error} />
           )}
         </div>
 

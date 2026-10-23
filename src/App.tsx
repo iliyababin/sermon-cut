@@ -7,6 +7,7 @@ import { DownloadForm } from "./components/DownloadForm";
 import { ReviewScreen } from "./components/ReviewScreen";
 import { Settings } from "./components/Settings";
 import { ThumbnailGenerator } from "./components/ThumbnailGenerator";
+import { ErrorBanner } from "./components/ErrorBanner";
 import { getVideo, errorMessage } from "./lib/tauri";
 import type { LibraryVideo, VideoDetail } from "./lib/types";
 import { Download, Film, Settings as SettingsIcon, Clapperboard, ArrowUpCircle, Image } from "lucide-react";
@@ -146,17 +147,14 @@ export default function App() {
       {/* Main Content */}
       <main className="flex-1 overflow-auto relative">
         {leaveBlocked && (
-          <div role="alert" className="m-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center justify-between gap-3">
-            <span>{leaveBlocked.message}</span>
-            <span className="flex gap-2 shrink-0">
-              <button onClick={() => setLeaveBlocked(null)} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg">
-                Stay
-              </button>
-              <button onClick={leaveBlocked.leave} className="px-3 py-1 bg-destructive text-destructive-foreground rounded-lg">
-                Leave anyway
-              </button>
-            </span>
-          </div>
+          <ErrorBanner className="m-4" message={leaveBlocked.message}>
+            <button onClick={() => setLeaveBlocked(null)} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg">
+              Stay
+            </button>
+            <button onClick={leaveBlocked.leave} className="px-3 py-1 bg-destructive text-destructive-foreground rounded-lg">
+              Leave anyway
+            </button>
+          </ErrorBanner>
         )}
         <div className={currentView === "library" ? "" : "hidden"}>
           <VideoLibrary onVideoSelect={handleVideoSelect} visible={currentView === "library"} />

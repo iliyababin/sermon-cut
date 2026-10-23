@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useReducer, useRef } from "react";
 import { useBeforeLeave } from "@/lib/beforeLeave";
+import { ErrorBanner } from "./ErrorBanner";
 import {
   regenerateThumbnails,
   getVideo,
@@ -809,17 +810,19 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
           </button>
         </div>
       )}
-      {saveError && <ErrorBanner message={saveError} />}
+      {saveError && <ErrorBanner className="mx-4 mt-4" message={saveError} />}
       {actionError && (
         <ErrorBanner
+          className="mx-4 mt-4"
           message={actionError}
           onReveal={isStuckCommit(actionError) ? () => revealCommitBackup(video.id).catch(() => {}) : undefined}
           onDismiss={() => setActionError(null)}
         />
       )}
-      {youtubeError && <ErrorBanner message={youtubeError} onRetry={loadYoutube} />}
+      {youtubeError && <ErrorBanner className="mx-4 mt-4" message={youtubeError} onRetry={loadYoutube} />}
       {renderError && !renderProgress && (
         <ErrorBanner
+          className="mx-4 mt-4"
           message={`Couldn't update the thumbnails: ${renderError}. Uploading uses the plain image.`}
           onRetry={retryRenders}
         />
@@ -1090,40 +1093,6 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   );
 }
 
-function ErrorBanner({
-  message,
-  onRetry,
-  onReveal,
-  onDismiss,
-}: {
-  message: string;
-  onRetry?: () => void;
-  /** Show leftovers of an unfinished save (see isStuckCommit). */
-  onReveal?: () => void;
-  onDismiss?: () => void;
-}) {
-  return (
-    <div role="alert" className="mx-4 mt-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center gap-2">
-      <AlertCircle className="w-4 h-4 shrink-0" />
-      <span className="flex-1">{message}</span>
-      {onRetry && (
-        <button onClick={onRetry} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors">
-          Try again
-        </button>
-      )}
-      {onReveal && (
-        <button onClick={onReveal} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors">
-          Show leftovers
-        </button>
-      )}
-      {onDismiss && (
-        <button onClick={onDismiss} className="px-3 py-1 hover:bg-destructive/10 rounded-lg transition-colors">
-          Dismiss
-        </button>
-      )}
-    </div>
-  );
-}
 
 /** A text field, select or other element that takes typing. */
 function isEditable(target: EventTarget | null): boolean {

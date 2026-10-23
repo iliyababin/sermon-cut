@@ -11,6 +11,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { LocalImage } from "./LocalImage";
+import { ErrorBanner } from "./ErrorBanner";
 import { useCanvasEditor, type ImageLoad } from "@/hooks/useCanvasEditor";
 import { getDefaultTemplate } from "@/templates";
 import { renderSingleThumbnail } from "@/lib/thumbnailRenderer";
@@ -20,6 +21,7 @@ import {
   cropStandaloneThumbnail,
   saveStandaloneThumbnail,
   copyFile,
+  errorMessage,
 } from "@/lib/tauri";
 
 export function ThumbnailGenerator() {
@@ -114,7 +116,7 @@ export function ThumbnailGenerator() {
       const path = await saveStandaloneThumbnail(imageData);
       setSavedPath(path);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setRendering(false);
     }
@@ -132,7 +134,7 @@ export function ThumbnailGenerator() {
       try {
         await copyFile(savedPath, destination);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errorMessage(e));
       }
     }
   };
@@ -318,7 +320,7 @@ export function ThumbnailGenerator() {
           </div>
 
           {error && (
-            <p className="text-sm text-destructive">{error}</p>
+            <ErrorBanner message={error} />
           )}
         </div>
 

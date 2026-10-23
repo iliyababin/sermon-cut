@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { ErrorBanner } from "./ErrorBanner";
 import {
   getLibrary,
   rescanLibrary,
@@ -313,17 +314,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
           </Banner>
         ))}
         {actionError && (
-          <Banner
-            tone="error"
-            icon={<AlertCircle className="w-5 h-5" />}
-            action={
-              <button onClick={() => setActionError(null)} className="p-1 rounded hover:bg-secondary" title="Dismiss">
-                <X className="w-4 h-4" />
-              </button>
-            }
-          >
-            {actionError}
-          </Banner>
+          <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />
         )}
       </div>
 

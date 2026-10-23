@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import { getVideoInfo, downloadVideo, cancelDownload, getSettings, errorMessage } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import type { VideoInfo } from "@/lib/types";
-import { Loader2, AlertCircle, Clock, User, Zap, Download, X } from "lucide-react";
+import { Loader2, Clock, User, Zap, Download, X } from "lucide-react";
+import { ErrorBanner } from "./ErrorBanner";
 
 interface DownloadProgress {
   video_id: string;
@@ -172,10 +173,7 @@ export function DownloadForm({ onGoToLibrary, isActive }: DownloadFormProps) {
 
         {/* Error */}
         {error && (
-          <div className="flex items-center gap-2 p-4 bg-destructive/10 text-destructive rounded-lg">
-            <AlertCircle className="w-5 h-5 flex-shrink-0" />
-            <p>{error}</p>
-          </div>
+          <ErrorBanner message={error} />
         )}
 
         {/* Video Preview */}

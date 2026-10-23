@@ -7,6 +7,7 @@ import { Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTrian
 import { useUpdater } from "@/hooks/useUpdater";
 import { open } from "@tauri-apps/plugin-dialog";
 import { LocalImage } from "./LocalImage";
+import { ErrorBanner } from "./ErrorBanner";
 
 type Field = (typeof EDITABLE_SETTINGS)[number];
 
@@ -265,12 +266,7 @@ export function Settings() {
     return (
       <div className="p-6 max-w-2xl mx-auto">
         <h2 className="text-2xl font-bold mb-6">Settings</h2>
-        <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center justify-between gap-3">
-          <span>{loadError}</span>
-          <button onClick={loadSettings} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg text-sm">
-            Try Again
-          </button>
-        </div>
+        <ErrorBanner message={loadError} onRetry={loadSettings} />
       </div>
     );
   }
@@ -502,9 +498,7 @@ export function Settings() {
           )}
 
           {youtubeError && (
-            <div className="mt-3 p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
-              {youtubeError}
-            </div>
+            <ErrorBanner className="mt-3" message={youtubeError} />
           )}
 
           {youtubeAuth?.is_authenticated && (
@@ -536,12 +530,7 @@ export function Settings() {
                 </select>
               )}
               {playlistsError && (
-                <div className="mt-2 flex items-center justify-between gap-3 p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
-                  <span>{playlistsError}</span>
-                  <button onClick={loadPlaylists} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg text-sm">
-                    Try Again
-                  </button>
-                </div>
+                <ErrorBanner className="mt-2" message={playlistsError} onRetry={loadPlaylists} />
               )}
               <FieldError message={fieldErrors.youtube_playlist_id} />
             </div>
@@ -747,7 +736,7 @@ export function Settings() {
         </div>
 
         {actionError && (
-          <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">{actionError}</div>
+          <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />
         )}
       </div>
     </div>
@@ -773,9 +762,7 @@ function FolderRow({ label, path, onOpen }: { label: string; path: string; onOpe
 function FieldError({ message }: { message?: string }) {
   if (!message) return null;
   return (
-    <div role="alert" className="mt-2 p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
-      {message}
-    </div>
+    <ErrorBanner className="mt-2" message={message} />
   );
 }
 

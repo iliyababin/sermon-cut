@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ErrorBanner } from "./ErrorBanner";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Loader2, Scissors, Crosshair, Play } from "lucide-react";
@@ -127,17 +128,10 @@ export function TrimPanel({ videoId, sourcePath, duration, start, end, segments,
 
       {!valid && <p className="text-sm text-destructive">The end must be at least a second after the start.</p>}
       {error && (
-        <p role="alert" className="text-sm text-destructive">
-          {error}
-          {isStuckCommit(error) && (
-            <button
-              onClick={() => revealCommitBackup(videoId).catch(() => {})}
-              className="ml-2 px-2 py-0.5 text-xs bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
-            >
-              Show leftovers
-            </button>
-          )}
-        </p>
+        <ErrorBanner
+          message={error}
+          onReveal={isStuckCommit(error) ? () => revealCommitBackup(videoId).catch(() => {}) : undefined}
+        />
       )}
       {result && !changed && (
         <p className="text-sm text-muted-foreground" aria-live="polite">

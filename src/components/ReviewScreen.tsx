@@ -940,8 +940,9 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
               </div>
 
               <div>
-                <label className="block text-sm font-medium mb-1">Title</label>
+                <label htmlFor="review-title" className="block text-sm font-medium mb-1">Title</label>
                 <input
+                  id="review-title"
                   type="text"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
@@ -950,10 +951,11 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
               </div>
 
               <div>
-                <label className="block text-sm font-medium mb-1">
+                <label htmlFor="review-preacher" className="block text-sm font-medium mb-1">
                   Preacher / Speaker <span className="text-red-500">*</span>
                 </label>
                 <input
+                  id="review-preacher"
                   type="text"
                   aria-label="Preacher"
                   value={preacher}
@@ -976,10 +978,11 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
               {video.source_url && (
                 <div>
-                  <label className="block text-sm font-medium mb-1">
+                  <label htmlFor="review-source-url" className="block text-sm font-medium mb-1">
                     Original YouTube URL
                   </label>
                   <input
+                    id="review-source-url"
                     type="text"
                     value={video.source_url}
                     readOnly

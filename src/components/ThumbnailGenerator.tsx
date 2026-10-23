@@ -174,6 +174,7 @@ export function ThumbnailGenerator() {
                 <div className="flex items-center gap-3 mt-2">
                   <button
                     onClick={zoomOut}
+                    aria-label="Zoom out"
                     className="p-1.5 hover:bg-secondary rounded transition-colors"
                     disabled={!imageLoaded}
                   >
@@ -184,12 +185,14 @@ export function ThumbnailGenerator() {
                     min="100"
                     max="500"
                     value={zoomPercent}
+                    aria-label="Zoom"
                     onChange={(e) => setZoom(Number(e.target.value) / 100)}
                     className="flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer"
                     disabled={!imageLoaded}
                   />
                   <button
                     onClick={zoomIn}
+                    aria-label="Zoom in"
                     className="p-1.5 hover:bg-secondary rounded transition-colors"
                     disabled={!imageLoaded}
                   >
@@ -241,8 +244,9 @@ export function ThumbnailGenerator() {
 
           {/* Title */}
           <div>
-            <label className="block text-sm font-medium mb-1">Title</label>
+            <label htmlFor="generator-title" className="block text-sm font-medium mb-1">Title</label>
             <input
+              id="generator-title"
               type="text"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
@@ -269,8 +273,9 @@ export function ThumbnailGenerator() {
 
           {/* Speaker Name */}
           <div>
-            <label className="block text-sm font-medium mb-1">Speaker Name</label>
+            <label htmlFor="generator-speaker" className="block text-sm font-medium mb-1">Speaker Name</label>
             <input
+              id="generator-speaker"
               type="text"
               value={speakerName}
               onChange={(e) => setSpeakerName(e.target.value)}

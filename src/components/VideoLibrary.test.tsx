@@ -131,4 +131,29 @@ describe("VideoLibrary", () => {
     fireEvent.click(await screen.findByRole("button", { name: /review next/i }));
     expect(onVideoSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "older" }));
   });
+
+  it("a card is one Review button with the actions menu beside it, not inside", async () => {
+    const onVideoSelect = vi.fn();
+    render(<VideoLibrary onVideoSelect={onVideoSelect} />);
+    const open = await screen.findByRole("button", { name: "Review older" });
+    expect(open.querySelector("button")).toBeNull();
+    const more = screen.getByRole("button", { name: "More actions for older" });
+    expect(open.contains(more)).toBe(false);
+    fireEvent.click(open);
+    expect(onVideoSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "older" }));
+
+    // The menu opens without opening the review, and closes on Esc or a
+    // click elsewhere.
+    onVideoSelect.mockClear();
+    fireEvent.click(more);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    expect(more.getAttribute("aria-expanded")).toBe("true");
+    expect(onVideoSelect).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    fireEvent.click(more);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    fireEvent.click(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
 });

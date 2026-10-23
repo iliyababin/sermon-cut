@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useModalDialog } from "@/hooks/useModalDialog";
 import { useCanvasEditor, type ImageLoad } from "@/hooks/useCanvasEditor";
 import { readImageBase64, processCustomThumbnail } from "@/lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -160,15 +161,26 @@ export function ThumbnailEditor({
   }, [videoId, displayedPath, getCropRect, applyColorGrading, onSave]);
 
   const zoomPercent = Math.round(zoom * 100);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useModalDialog(dialogRef, onClose);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
-      <div className="bg-card border border-border rounded-xl shadow-xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="thumbnail-editor-title"
+        tabIndex={-1}
+        className="bg-card border border-border rounded-xl shadow-xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col"
+      >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border">
-          <h2 className="text-lg font-semibold">Edit Thumbnail</h2>
+          <h2 id="thumbnail-editor-title" className="text-lg font-semibold">Edit Thumbnail</h2>
           <button
             onClick={onClose}
+            aria-label="Close"
+            title="Close (Esc)"
             className="p-2 hover:bg-secondary rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -184,6 +196,7 @@ export function ThumbnailEditor({
           >
             <canvas
               ref={canvasRef}
+              aria-label="Crop preview: drag to move the image"
               className="w-full h-full cursor-grab active:cursor-grabbing"
               style={{ display: "block" }}
               {...handlers}
@@ -199,9 +212,10 @@ export function ThumbnailEditor({
 
           {/* Zoom Controls */}
           <div className="flex items-center gap-4">
-            <span className="text-sm text-muted-foreground w-12">Zoom:</span>
+            <span className="text-sm text-muted-foreground w-12" aria-hidden="true">Zoom:</span>
             <button
               onClick={zoomOut}
+              aria-label="Zoom out"
               className="p-2 hover:bg-secondary rounded-lg transition-colors"
               disabled={!imageLoaded}
             >
@@ -212,12 +226,14 @@ export function ThumbnailEditor({
               min="100"
               max="500"
               value={zoomPercent}
+              aria-label="Zoom"
               onChange={(e) => setZoom(Number(e.target.value) / 100)}
               className="flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer"
               disabled={!imageLoaded}
             />
             <button
               onClick={zoomIn}
+              aria-label="Zoom in"
               className="p-2 hover:bg-secondary rounded-lg transition-colors"
               disabled={!imageLoaded}
             >
@@ -250,11 +266,13 @@ export function ThumbnailEditor({
 
           {/* Source Selection */}
           <div className="space-y-3">
-            <label className="text-sm font-medium">Source:</label>
-            <div className="flex flex-wrap gap-2">
+            <span id="thumbnail-editor-source" className="text-sm font-medium">Source:</span>
+            <div role="group" aria-labelledby="thumbnail-editor-source" className="flex flex-wrap gap-2">
               {/* Upload Custom Button */}
               <button
                 onClick={handleUploadCustom}
+                aria-label={customImagePath ? "Your image (choose another)" : "Choose your own image"}
+                aria-pressed={sourceType === "custom" && !!customImagePath}
                 className={`relative aspect-video w-24 rounded-lg border-2 transition-colors flex flex-col items-center justify-center gap-1 ${
                   sourceType === "custom" && customImagePath
                     ? "border-primary ring-2 ring-primary/30"
@@ -287,6 +305,8 @@ export function ThumbnailEditor({
                 <button
                   key={option.id}
                   onClick={() => handleSelectAiOption(index)}
+                  aria-label={`AI Option ${index + 1}`}
+                  aria-pressed={sourceType === "ai" && selectedAiIndex === index}
                   className={`relative aspect-video w-24 rounded-lg border-2 overflow-hidden transition-colors ${
                     sourceType === "ai" && selectedAiIndex === index
                       ? "border-primary ring-2 ring-primary/30"
@@ -323,7 +343,7 @@ export function ThumbnailEditor({
 
           {/* Error */}
           {error && (
-            <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
+            <div role="alert" className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
               {error}
             </div>
           )}

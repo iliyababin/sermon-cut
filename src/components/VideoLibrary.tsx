@@ -159,12 +159,19 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
     };
   }, [refresh]);
 
-  // Close the actions menu on any outside click.
+  // Close the actions menu on any outside click, or Esc.
   useEffect(() => {
     if (!openMenu) return;
     const close = () => setOpenMenu(null);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
     window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [openMenu]);
 
   async function run(action: () => Promise<unknown>) {
@@ -466,12 +473,21 @@ function VideoCard(props: VideoCardProps) {
 
   return (
     <div
-      onClick={reviewable ? props.onOpen : undefined}
-      className={`flex gap-4 p-4 bg-card border border-border rounded-lg transition-colors ${
+      className={`relative flex gap-4 p-4 bg-card border border-border rounded-lg transition-colors ${
         reviewable ? "cursor-pointer hover:bg-accent" : ""
       } ${dimmed ? "opacity-60" : ""} ${video.hidden ? "border-dashed" : ""}`}
     >
-      <div className="w-48 h-28 bg-muted rounded-lg overflow-hidden flex-shrink-0">
+      {/* The whole card opens the review: one button stretched over it.
+          The card's own controls sit above it, as its siblings. */}
+      {reviewable && (
+        <button
+          type="button"
+          onClick={props.onOpen}
+          aria-label={`Review ${video.title}`}
+          className="absolute inset-0 rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        />
+      )}
+      <div className="relative pointer-events-none w-48 h-28 bg-muted rounded-lg overflow-hidden flex-shrink-0">
         {video.thumbnail ? (
           <LocalImage path={video.thumbnail} alt={video.title} className="w-full h-full object-cover" />
         ) : (
@@ -481,7 +497,7 @@ function VideoCard(props: VideoCardProps) {
         )}
       </div>
 
-      <div className="flex-1 min-w-0">
+      <div className="relative pointer-events-none flex-1 min-w-0">
         <h3 className="font-semibold truncate" title={video.title}>
           {video.title}
         </h3>
@@ -537,7 +553,7 @@ function VideoCard(props: VideoCardProps) {
         {isStuckCommit(video.error) && (
           <button
             onClick={props.onRevealLeftovers}
-            className="mt-2 px-3 py-1 text-xs bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+            className="pointer-events-auto mt-2 px-3 py-1 text-xs bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
           >
             Show leftovers
           </button>
@@ -559,19 +575,21 @@ function VideoCard(props: VideoCardProps) {
               e.stopPropagation();
               openUrl(lastUpload.url);
             }}
-            className="mt-2 text-xs text-primary hover:underline flex items-center gap-1"
+            className="pointer-events-auto mt-2 text-xs text-primary hover:underline flex items-center gap-1"
           >
             {video.status === "done" ? "On YouTube" : "A previous version was uploaded"}
             <ExternalLink className="w-3 h-3" />
           </button>
         )}
         {video.status === "done" && lastUpload?.warnings && lastUpload.warnings.length > 0 && (
-          <UploadWarnings videoId={video.id} warnings={lastUpload.warnings} compact />
+          <div className="pointer-events-auto">
+            <UploadWarnings videoId={video.id} warnings={lastUpload.warnings} compact />
+          </div>
         )}
       </div>
 
       {!pending && (
-        <div className="flex items-start gap-2" onClick={(e) => e.stopPropagation()}>
+        <div className="relative flex items-start gap-2">
           {(video.status === "new" || video.status === "error") && (
             <button
               onClick={props.onProcess}
@@ -628,11 +646,15 @@ function VideoCard(props: VideoCardProps) {
                 }}
                 className="p-2 text-muted-foreground rounded-lg hover:bg-secondary transition-colors"
                 title="More"
+                aria-label={`More actions for ${video.title}`}
+                aria-haspopup="menu"
+                aria-expanded={props.menuOpen}
               >
                 <MoreHorizontal className="w-5 h-5" />
               </button>
               {props.menuOpen && (
                 <div
+                  role="menu"
                   onClick={props.onToggleMenu}
                   className="absolute right-0 top-10 z-10 w-48 bg-card border border-border rounded-lg shadow-lg py-1 text-sm"
                 >
@@ -681,6 +703,7 @@ function MenuItem({
 }) {
   return (
     <button
+      role="menuitem"
       onClick={onClick}
       disabled={disabled}
       className={`w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-secondary disabled:opacity-40 disabled:hover:bg-transparent ${

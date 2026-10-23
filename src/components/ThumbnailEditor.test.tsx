@@ -125,4 +125,40 @@ describe("ThumbnailEditor", () => {
     expect(args.cropRect).toEqual({ x: 0, y: 0, width: 1280, height: 720 });
     expect(onSave).toHaveBeenCalledWith("/v/custom_thumbnail_1.jpg");
   });
+
+  it("is a modal dialog: focus moves in, Tab stays in, Esc closes, focus goes back", async () => {
+    invoke.mockImplementation(() => Promise.resolve(null));
+    const opener = document.createElement("button");
+    opener.textContent = "Edit";
+    document.body.appendChild(opener);
+    opener.focus();
+    const onClose = vi.fn();
+    const { unmount } = render(
+      <ThumbnailEditor videoId="v" thumbnailOptions={options} selectedSource={options[0].id} onSave={() => {}} onClose={onClose} />
+    );
+    await act(async () => {});
+    const dialog = screen.getByRole("dialog", { name: "Edit Thumbnail" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(screen.getByRole("slider", { name: "Zoom" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Zoom in" })).toBeTruthy();
+    // Tab from the last control wraps to the first.
+    const close = screen.getByRole("button", { name: "Close" });
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    cancel.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel);
+    // Esc closes it, and nothing behind it sees the key.
+    const behind = vi.fn();
+    window.addEventListener("keydown", behind);
+    fireEvent.keyDown(window, { key: "Escape" });
+    window.removeEventListener("keydown", behind);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(behind).not.toHaveBeenCalled();
+    unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
 });

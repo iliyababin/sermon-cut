@@ -89,9 +89,9 @@ pub async fn save_review(
     title: Option<String>,
     description: Option<String>,
     preacher: Option<String>,
-    selected_thumbnail: Option<String>,
+    selected_source: Option<String>,
 ) -> Result<(), String> {
-    lib.save_review(&video_id, Review { title, description, preacher }, selected_thumbnail)
+    lib.save_review(&video_id, Review { title, description, preacher }, selected_source)
 }
 
 #[tauri::command]
@@ -127,14 +127,17 @@ pub async fn process_custom_thumbnail(
     .await
 }
 
+/// Save a template render (PNG bytes) of one thumbnail source. Resolves
+/// with the saved file's path.
 #[tauri::command]
 pub async fn save_rendered_thumbnail(
     lib: State<'_, LibraryHandle>,
     video_id: String,
+    source: String,
+    render_key: String,
     image_data: Vec<u8>,
-    filename: String,
 ) -> Result<String, String> {
-    lib.save_rendered_thumbnail(&video_id, image_data, filename).await
+    lib.save_rendered_thumbnail(&video_id, &source, &render_key, image_data).await
 }
 
 /// Show the trimmed video (or the original) in Finder.
@@ -226,7 +229,8 @@ pub async fn youtube_upload_video(
     video_id: String,
     title: String,
     description: String,
-    thumbnail_path: Option<String>,
+    thumbnail_source: Option<String>,
+    render_key: Option<String>,
     privacy: Option<String>,
     start_time: Option<f64>,
     end_time: Option<f64>,
@@ -234,7 +238,7 @@ pub async fn youtube_upload_video(
 ) -> Result<String, String> {
     use crate::youtube;
 
-    let job = lib.begin_upload(&video_id, thumbnail_path)?;
+    let job = lib.begin_upload(&video_id, thumbnail_source, render_key)?;
     changed(&app_handle);
 
     let result: Result<String, String> = async {

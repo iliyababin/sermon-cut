@@ -5,7 +5,7 @@
 
 use super::fsutil::{self, TMP_MARKER};
 use super::lock::{self, Acquire};
-use super::manifest::{self, Loaded, Manifest, Review, TranscriptFile, VideoData};
+use super::manifest::{self, Loaded, Manifest, Render, Review, TranscriptFile, VideoData, RENDERED_PREFIX};
 use super::scan::{self, FileObs, ObsState, Reconciled, ScanCache};
 use super::{Entry, EntryStatus, Fingerprint, LibraryPaths, UploadRecord, MAX_TRANSCRIBE_SECS};
 use crate::state::{AppState, ProcessingStage, TranscriptionResult};
@@ -142,9 +142,35 @@ pub struct VideoDetail {
     pub trimmed_path: Option<String>,
     pub trim_start: Option<f64>,
     pub trim_end: Option<f64>,
-    pub thumbnail_options: Vec<String>,
+    pub thumbnail_options: Vec<ThumbnailOption>,
+    /// Stored template renders whose files exist, one per source at most.
+    pub renders: Vec<RenderView>,
+    pub selected_source: Option<String>,
+    /// The selected render, or its source (absolute path).
     pub selected_thumbnail: Option<String>,
     pub review: Review,
+}
+
+/// A thumbnail source on the review screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThumbnailOption {
+    /// The file name; stable across reopens, so renders and the selection
+    /// are keyed by it.
+    pub id: String,
+    pub path: String,
+    /// What the template draws over: the plain crop of a generated option
+    /// (the option itself has the logo burned in), else the option.
+    pub render_from: String,
+    /// Changes whenever the image is regenerated (its mtime), so it is part
+    /// of the render key.
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenderView {
+    pub source: String,
+    pub path: String,
+    pub render_key: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +257,19 @@ impl Inner {
 
     fn present(&self, id: &str) -> bool {
         self.last.present.contains(id)
+    }
+
+    /// Template renders replace nothing processing makes, so they may run
+    /// during an upload, but not while the video is (about to be) processed
+    /// or its thumbnails are being regenerated.
+    fn require_render_allowed(&self, id: &str) -> Result<(), String> {
+        if self.queue.iter().any(|q| q == id) || self.running.as_ref().is_some_and(|r| r.id == id) {
+            return Err("This video is being processed".into());
+        }
+        if self.busy.contains(id) && !self.uploads.contains_key(id) {
+            return Err("This video is busy. Wait for it to finish, or cancel it first.".into());
+        }
+        Ok(())
     }
 
     fn require_idle(&self, id: &str) -> Result<(), String> {
@@ -752,13 +791,42 @@ impl Library {
             .filter(|t| t.file_hash == hash)
             .map(|t| t.transcription);
         let abs = |name: &String| path_string(&dir.join(name));
+        let thumbnail_options = data
+            .thumbnail_options
+            .iter()
+            .map(|id| {
+                let raw = raw_variant(id).map(|r| dir.join(r)).filter(|p| p.is_file());
+                let render_from = raw.unwrap_or_else(|| dir.join(id));
+                let version = std::fs::metadata(&render_from)
+                    .map(|m| fsutil::mtime_ms(&m).to_string())
+                    .unwrap_or_default();
+                ThumbnailOption {
+                    id: id.clone(),
+                    path: abs(id),
+                    render_from: path_string(&render_from),
+                    version,
+                }
+            })
+            .collect();
+        let renders = data
+            .renders
+            .iter()
+            .filter(|r| dir.join(&r.file).is_file())
+            .map(|r| RenderView {
+                source: r.source.clone(),
+                path: abs(&r.file),
+                render_key: r.render_key.clone(),
+            })
+            .collect();
         Ok(VideoDetail {
             video,
             transcription,
             trimmed_path: data.trimmed_file.as_ref().map(abs).filter(|p| Path::new(p).exists()),
             trim_start: data.trim_start,
             trim_end: data.trim_end,
-            thumbnail_options: data.thumbnail_options.iter().map(abs).collect(),
+            thumbnail_options,
+            renders,
+            selected_source: data.selected_or_first().cloned(),
             selected_thumbnail: data.selected_thumbnail.as_ref().map(abs),
             review: data.review,
         })
@@ -1031,13 +1099,14 @@ impl Library {
                 trimmed_file: Some(trimmed_name),
                 trim_start: Some(start),
                 trim_end: Some(end),
-                selected_thumbnail: thumb_names.first().cloned(),
+                selected_source: thumb_names.first().cloned(),
                 thumbnail_options: thumb_names,
                 review: Review {
                     title: None,
                     description: None,
                     preacher: old.review.preacher,
                 },
+                ..Default::default()
             };
             manifest::save_video_data(&video_dir, &data)?;
             let e = g.entry_mut(id)?;
@@ -1131,7 +1200,10 @@ impl Library {
         g.save()
     }
 
-    pub fn save_review(&self, id: &str, review: Review, selected_thumbnail: Option<String>) -> Result<(), String> {
+    /// Save the review screen's edits. `selected_source` is a thumbnail
+    /// source id; one that's no longer an option (e.g. regenerated meanwhile)
+    /// is ignored rather than losing the text edits.
+    pub fn save_review(&self, id: &str, review: Review, selected_source: Option<String>) -> Result<(), String> {
         self.with_entry(id, |g, paths| {
             if g.running.as_ref().is_some_and(|r| r.id == id) {
                 return Err("This video is being processed".into());
@@ -1139,10 +1211,10 @@ impl Library {
             let dir = paths.ensure_video_dir(id)?;
             let mut data = manifest::load_video_data(&dir);
             data.review = review;
-            // A selection that's no longer a file here (e.g. an overlay render
-            // replaced it mid-edit) is ignored rather than losing the text edits.
-            if let Some(name) = selected_thumbnail.and_then(|sel| file_in_dir(&dir, &sel).ok()) {
-                data.selected_thumbnail = Some(name);
+            if let Some(source) = selected_source.as_deref().and_then(source_id) {
+                if data.thumbnail_options.contains(&source) {
+                    data.selected_source = Some(source);
+                }
             }
             manifest::save_video_data(&dir, &data)
         })
@@ -1221,7 +1293,8 @@ impl Library {
             let _ = std::fs::remove_dir_all(&staging);
             let mut data = manifest::load_video_data(&dir);
             data.thumbnail_options = names.clone();
-            data.selected_thumbnail = names.first().cloned();
+            data.selected_source = names.first().cloned();
+            data.renders.clear();
             manifest::save_video_data(&dir, &data)?;
             Ok(names.iter().map(|n| path_string(&dir.join(n))).collect())
         }
@@ -1255,7 +1328,8 @@ impl Library {
             if !data.thumbnail_options.contains(&name) {
                 data.thumbnail_options.insert(0, name.clone());
             }
-            data.selected_thumbnail = Some(name.clone());
+            // The selection is by id, so adding a source never moves it; the
+            // review screen selects the new one itself.
             manifest::save_video_data(&dir, &data)?;
             Ok(path_string(&dir.join(name)))
         }
@@ -1264,54 +1338,72 @@ impl Library {
         result
     }
 
-    /// Persist a thumbnail rendered in the webview (template system) into the
-    /// video's library folder and select it, mirroring `custom_thumbnail` so
-    /// the choice survives a restart.
+    /// Persist a template render of one thumbnail source, replacing that
+    /// source's previous render. Never changes the selection. Allowed while
+    /// the video uploads (the review screen stays usable), refused while it's
+    /// queued or processing, which replaces every thumbnail.
     pub async fn save_rendered_thumbnail(
         self: &Arc<Self>,
         id: &str,
+        source: &str,
+        render_key: &str,
         png_bytes: Vec<u8>,
-        filename: String,
     ) -> Result<String, String> {
-        let (paths, _entry, _data) = self.begin_op(id)?;
-        let result = async {
-            let dir = paths.ensure_video_dir(id)?;
-            let name = rendered_file_name(&filename)?;
-            let out_path = dir.join(&name);
-            crate::thumbnail::save_png_as_jpeg(&png_bytes, &out_path)?;
-
-            let _g = self.inner();
-            let mut data = manifest::load_video_data(&dir);
-
-            // Each render pass writes fresh timestamped files (the webview
-            // caches images by path) and saves them one at a time. Drop files
-            // from earlier passes, but not this pass's siblings.
-            let batch = render_batch(&name);
-            let superseded: Vec<String> = data
-                .thumbnail_options
-                .iter()
-                .filter(|n| n.starts_with(RENDERED_PREFIX) && render_batch(n) != batch)
-                .cloned()
-                .collect();
-            for old in &superseded {
-                let _ = std::fs::remove_file(dir.join(old));
-            }
-            data.thumbnail_options.retain(|n| !superseded.contains(n));
-
-            if !data.thumbnail_options.contains(&name) {
-                data.thumbnail_options.insert(0, name.clone());
-            }
-            data.selected_thumbnail = Some(name.clone());
-            manifest::save_video_data(&dir, &data)?;
-            Ok(path_string(&dir.join(name)))
+        if !valid_render_key(render_key) {
+            return Err("Invalid render key".into());
         }
-        .await;
-        self.end_op(id);
-        result
+        let source = source_id(source).ok_or_else(|| format!("Invalid thumbnail: {}", source))?;
+        let dir = self.with_entry(id, |g, paths| {
+            g.require_render_allowed(id)?;
+            let dir = paths.ensure_video_dir(id)?;
+            if !manifest::load_video_data(&dir).thumbnail_options.contains(&source) {
+                return Err("That thumbnail is no longer one of this video's options".into());
+            }
+            Ok(dir)
+        })?;
+
+        // Named here, never by the webview. Written under a temp name (swept
+        // on the next open if we crash) so cleanup can't take it before it's
+        // recorded.
+        let name = format!("{}{}.jpg", RENDERED_PREFIX, uuid::Uuid::new_v4().simple());
+        let tmp = dir.join(format!("{}{}", name, fsutil::TMP_MARKER));
+        let out = tmp.clone();
+        blocking(move || crate::thumbnail::save_png_as_jpeg(&png_bytes, &out)).await??;
+
+        let committed = self.with_entry(id, |g, _| {
+            // Processing may have started (or the options changed) meanwhile.
+            g.require_render_allowed(id)?;
+            let mut data = manifest::load_video_data(&dir);
+            if !data.thumbnail_options.contains(&source) {
+                return Err("That thumbnail is no longer one of this video's options".into());
+            }
+            std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("Failed to save thumbnail: {}", e))?;
+            data.renders.retain(|r| r.source != source);
+            data.renders.push(Render {
+                source: source.clone(),
+                file: name.clone(),
+                render_key: render_key.to_string(),
+            });
+            // The replaced render's file is deleted by the save.
+            manifest::save_video_data(&dir, &data)
+        });
+        if let Err(e) = committed {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(path_string(&dir.join(name)))
     }
 
-    /// Everything an upload needs, with the video marked busy.
-    pub fn begin_upload(&self, id: &str, thumbnail: Option<String>) -> Result<UploadJob, String> {
+    /// Everything an upload needs, with the video marked busy. The thumbnail
+    /// is `thumbnail_source`'s render when its key is `render_key` (what the
+    /// review screen showed), else the source itself; with no source given,
+    /// the selected one's render.
+    pub fn begin_upload(
+        &self,
+        id: &str,
+        thumbnail_source: Option<String>,
+        render_key: Option<String>,
+    ) -> Result<UploadJob, String> {
         let (paths, entry, data) = self.begin_op(id)?;
         let prepare = || -> Result<UploadJob, String> {
             let dir = paths.video_dir(id)?;
@@ -1319,10 +1411,7 @@ impl Library {
                 Some(p) => p,
                 None => paths.original(&entry.file_name)?,
             };
-            let thumbnail_path = match thumbnail {
-                Some(t) => Some(dir.join(file_in_dir(&dir, &t)?)),
-                None => None,
-            };
+            let thumbnail_path = resolve_thumbnail(&dir, &data, thumbnail_source.as_deref(), render_key.as_deref())?;
             let segments = manifest::load_transcript(&dir)
                 .filter(|t| t.file_hash == entry.fingerprint.hash)
                 .map(|t| t.transcription.segments);
@@ -1502,30 +1591,49 @@ pub struct UploadJob {
     pub file_hash: String,
 }
 
-/// Filename prefix for thumbnails rendered by the template system.
-const RENDERED_PREFIX: &str = "thumbnail_rendered_";
-
-/// Name for a rendered thumbnail: a plain file name in the video's folder,
-/// always with the rendered prefix (so cleanup can find it) and .jpg (it is
-/// re-encoded as JPEG).
-fn rendered_file_name(name: &str) -> Result<String, String> {
-    let name = name.trim();
-    if !super::is_valid_file_name(name) {
-        return Err(format!("Invalid thumbnail filename: {}", name));
-    }
-    let stem = Path::new(name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let stem = stem.strip_prefix(RENDERED_PREFIX).unwrap_or(&stem);
-    Ok(format!("{}{}.jpg", RENDERED_PREFIX, stem))
+/// A thumbnail source id from what the webview sent: a file name, or a path
+/// whose file name is used.
+fn source_id(s: &str) -> Option<String> {
+    Path::new(s)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| super::is_valid_file_name(n))
 }
 
-/// The render pass a rendered thumbnail belongs to: the timestamp after the
-/// last underscore ("thumbnail_rendered_3_1729530000000.jpg" → "1729530000000").
-fn render_batch(name: &str) -> &str {
-    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
-    stem.rsplit_once('_').map_or(stem, |(_, b)| b)
+fn valid_render_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 128 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The plain crop written next to a generated option
+/// ("thumbnail_option_3.jpg" → "thumbnail_option_3_raw.jpg").
+fn raw_variant(id: &str) -> Option<String> {
+    let stem = id.strip_suffix(".jpg")?;
+    let n = stem.strip_prefix("thumbnail_option_")?;
+    n.bytes().all(|b| b.is_ascii_digit()).then(|| format!("{}_raw.jpg", stem))
+}
+
+/// Which file to send to YouTube as the thumbnail (see `begin_upload`).
+fn resolve_thumbnail(
+    dir: &Path,
+    data: &VideoData,
+    source: Option<&str>,
+    render_key: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let source = match source {
+        Some(s) => {
+            let id = source_id(s).filter(|id| data.thumbnail_options.contains(id));
+            Some(id.ok_or_else(|| format!("{} isn't one of this video's thumbnails", s))?)
+        }
+        None => data.selected_or_first().cloned(),
+    };
+    let Some(source) = source else { return Ok(None) };
+    let render = data
+        .render_for(&source)
+        .filter(|r| render_key.is_none_or(|k| k == r.render_key))
+        .map(|r| dir.join(&r.file))
+        .filter(|p| p.is_file());
+    let path = render.unwrap_or_else(|| dir.join(&source));
+    Ok(path.is_file().then_some(path))
 }
 
 /// Resolve a path the frontend sent back to a file directly inside `dir`.
@@ -1664,14 +1772,14 @@ mod tests {
         };
         assert!(lib.work_in_progress().is_none());
 
-        let job = lib.begin_upload(&id, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).unwrap();
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Uploading);
         assert_eq!(v.upload_progress, Some(0));
         assert!(v.busy);
         assert_eq!(lib.work_in_progress().as_deref(), Some("a YouTube upload"));
         // A second upload, a reset or a trash can't start meanwhile.
-        assert!(lib.begin_upload(&id, None).is_err());
+        assert!(lib.begin_upload(&id, None, None).is_err());
         assert!(lib.reset(&id).is_err());
 
         lib.set_upload_progress(&id, 42);
@@ -1686,7 +1794,7 @@ mod tests {
         assert!(lib.work_in_progress().is_none());
 
         // A failed upload goes back to how it was, with nothing recorded.
-        let job = lib.begin_upload(&id, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).unwrap();
         lib.finish_upload(&id, &job.file_hash, None);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Done);
@@ -1694,16 +1802,166 @@ mod tests {
         assert!(!v.busy);
     }
 
-    #[test]
-    fn rendered_names_are_safe_and_batched() {
-        assert_eq!(rendered_file_name("thumbnail_rendered_1_123.jpg").unwrap(), "thumbnail_rendered_1_123.jpg");
-        assert_eq!(rendered_file_name("x_9.png").unwrap(), "thumbnail_rendered_x_9.jpg");
-        for bad in ["..", "../x.jpg", "a/b.jpg", ".hidden.jpg", ""] {
-            assert!(rendered_file_name(bad).is_err(), "{bad}");
+    /// A writable library with one processed video that has two generated
+    /// thumbnail options.
+    fn processed_library() -> (tempfile::TempDir, Arc<Library>, String, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.mp4"), b"video").unwrap();
+        let lib = Library::new(root.to_string_lossy().to_string());
+        lib.open_blocking(false);
+        let (id, dir) = {
+            let mut g = lib.inner();
+            let fp = fsutil::fingerprint(&root.join("a.mp4")).unwrap();
+            let mut e = Entry::new("a.mp4".into(), fp, Some(60.0));
+            e.status = EntryStatus::ReadyForReview;
+            let id = e.id.clone();
+            g.manifest.entries.push(e);
+            g.last.present.insert(id.clone());
+            g.scanned = true;
+            let dir = g.paths.as_ref().unwrap().ensure_video_dir(&id).unwrap();
+            (id, dir)
+        };
+        for f in ["thumbnail_option_1.jpg", "thumbnail_option_1_raw.jpg", "thumbnail_option_2.jpg"] {
+            std::fs::write(dir.join(f), b"jpg").unwrap();
         }
-        assert_eq!(render_batch("thumbnail_rendered_3_1729530000000.jpg"), "1729530000000");
-        assert_eq!(render_batch("thumbnail_rendered_10_1729530000000.jpg"), render_batch("thumbnail_rendered_1_1729530000000.jpg"));
-        assert_ne!(render_batch("thumbnail_rendered_1_1.jpg"), render_batch("thumbnail_rendered_1_2.jpg"));
+        let data = VideoData {
+            thumbnail_options: vec!["thumbnail_option_1.jpg".into(), "thumbnail_option_2.jpg".into()],
+            selected_source: Some("thumbnail_option_2.jpg".into()),
+            ..Default::default()
+        };
+        manifest::save_video_data(&dir, &data).unwrap();
+        (tmp, lib, id, dir)
+    }
+
+    fn png() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(4, 4).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    fn rendered_files(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(RENDERED_PREFIX))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn renders_replace_per_source_and_keep_the_selection() {
+        let (_t, lib, id, dir) = processed_library();
+        let first = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k1", png()).await.unwrap();
+        lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k1", png()).await.unwrap();
+        // Re-rendering a source replaces its render and deletes the old file.
+        let second = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap();
+        assert!(!Path::new(&first).exists());
+        assert!(Path::new(&second).exists());
+        assert_eq!(rendered_files(&dir).len(), 2);
+
+        let d = lib.detail(&id).unwrap();
+        assert_eq!(d.thumbnail_options.len(), 2, "renders never become options");
+        assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
+        let r1 = d.renders.iter().find(|r| r.source == "thumbnail_option_1.jpg").unwrap();
+        assert_eq!(r1.render_key, "k2");
+        assert_eq!(r1.path, second);
+        // Generated options render from their plain crop.
+        assert!(d.thumbnail_options[0].render_from.ends_with("thumbnail_option_1_raw.jpg"));
+        assert!(d.thumbnail_options[1].render_from.ends_with("thumbnail_option_2.jpg"));
+        // video.json's selected_thumbnail (read by v0.4.0) is the selected render.
+        let sel = d.selected_thumbnail.unwrap();
+        assert!(Path::new(&sel).file_name().unwrap().to_string_lossy().starts_with(RENDERED_PREFIX));
+
+        // Reopening shows the same renders and options: nothing stacks.
+        let again = lib.detail(&id).unwrap();
+        assert_eq!(again.thumbnail_options.len(), 2);
+        assert_eq!(again.renders.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn adding_a_source_keeps_selection_and_renders() {
+        let (_t, lib, id, dir) = processed_library();
+        lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
+        // What custom_thumbnail does: a new source at the front.
+        std::fs::write(dir.join("custom_thumbnail_1.jpg"), b"jpg").unwrap();
+        let mut data = manifest::load_video_data(&dir);
+        data.thumbnail_options.insert(0, "custom_thumbnail_1.jpg".into());
+        manifest::save_video_data(&dir, &data).unwrap();
+
+        let d = lib.detail(&id).unwrap();
+        assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
+        assert_eq!(d.renders.len(), 1);
+        assert_eq!(d.renders[0].source, "thumbnail_option_2.jpg");
+        // Dropping an unselected source keeps the selection too.
+        let mut data = manifest::load_video_data(&dir);
+        data.thumbnail_options.retain(|o| o != "thumbnail_option_1.jpg");
+        manifest::save_video_data(&dir, &data).unwrap();
+        assert_eq!(lib.detail(&id).unwrap().selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
+    }
+
+    #[tokio::test]
+    async fn renders_are_allowed_during_upload_but_not_processing() {
+        let (_t, lib, id, _dir) = processed_library();
+        let _job = lib.begin_upload(&id, None, None).unwrap();
+        lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k", png()).await.unwrap();
+        lib.finish_upload(&id, "h", None);
+
+        lib.inner().queue.push_back(id.clone());
+        let err = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap_err();
+        assert!(err.contains("processed"), "{err}");
+        lib.inner().queue.clear();
+
+        // Not one of the options, or a key that isn't plain ASCII.
+        assert!(lib.save_rendered_thumbnail(&id, "../../x.jpg", "k", png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "other.jpg", "k", png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k/../", png()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_uses_the_current_render_or_the_source() {
+        let (_t, lib, id, dir) = processed_library();
+        let render = lib.save_rendered_thumbnail(&id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
+
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("k".into())).unwrap();
+        assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
+        lib.finish_upload(&id, "h", None);
+
+        // A stale key falls back to the source itself.
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("old".into())).unwrap();
+        assert_eq!(job.thumbnail_path, Some(dir.join("thumbnail_option_2.jpg")));
+        lib.finish_upload(&id, "h", None);
+
+        // No source given: the selected one's render.
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
+        lib.finish_upload(&id, "h", None);
+
+        assert!(lib.begin_upload(&id, Some("/etc/passwd".into()), None).is_err());
+        assert!(!lib.inner().busy.contains(&id), "a refused upload doesn't stay busy");
+    }
+
+    #[test]
+    fn save_review_selects_by_source_id() {
+        let (_t, lib, id, _dir) = processed_library();
+        let review = Review { title: Some("T".into()), ..Default::default() };
+        lib.save_review(&id, review.clone(), Some("thumbnail_option_1.jpg".into())).unwrap();
+        assert_eq!(lib.detail(&id).unwrap().selected_source.as_deref(), Some("thumbnail_option_1.jpg"));
+        // An unknown source keeps the old selection but saves the text.
+        lib.save_review(&id, Review { title: Some("U".into()), ..Default::default() }, Some("gone.jpg".into())).unwrap();
+        let d = lib.detail(&id).unwrap();
+        assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_1.jpg"));
+        assert_eq!(d.review.title.as_deref(), Some("U"));
+    }
+
+    #[test]
+    fn raw_variants() {
+        assert_eq!(raw_variant("thumbnail_option_3.jpg").as_deref(), Some("thumbnail_option_3_raw.jpg"));
+        assert_eq!(raw_variant("thumbnail_option_3_raw.jpg"), None);
+        assert_eq!(raw_variant("custom_thumbnail_1.jpg"), None);
     }
 
     #[test]

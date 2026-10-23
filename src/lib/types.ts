@@ -107,9 +107,30 @@ export interface VideoDetail extends LibraryVideo {
   trimmed_path: string | null;
   trim_start: number | null;
   trim_end: number | null;
-  thumbnail_options: string[];
+  thumbnail_options: ThumbnailOption[];
+  /** Stored template renders, at most one per source. */
+  renders: ThumbnailRender[];
+  /** The selected source's id. */
+  selected_source: string | null;
   selected_thumbnail: string | null;
   review: Review;
+}
+
+/** A thumbnail source: a generated crop or a custom one. */
+export interface ThumbnailOption {
+  /** Its file name; stable, so renders and the selection are keyed by it. */
+  id: string;
+  path: string;
+  /** The image the template draws over. */
+  render_from: string;
+  /** Changes when the image is regenerated. */
+  version: string;
+}
+
+export interface ThumbnailRender {
+  source: string;
+  path: string;
+  render_key: string;
 }
 
 export type ProcessingStage =

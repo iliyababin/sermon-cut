@@ -155,6 +155,20 @@ pub struct Review {
     pub preacher: Option<String>,
 }
 
+/// File name prefix of thumbnails rendered with the template (title,
+/// speaker and logo drawn over a source image).
+pub const RENDERED_PREFIX: &str = "thumbnail_rendered_";
+
+/// A template render of one thumbnail source. `render_key` is computed by
+/// the webview from everything that went into it (template version, title,
+/// speaker, layout, source), so an unchanged render is reused, not redone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Render {
+    pub source: String,
+    pub file: String,
+    pub render_key: String,
+}
+
 /// videos/<id>/video.json: what processing made, plus review edits.
 /// File names are relative to the video's folder.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -165,12 +179,76 @@ pub struct VideoData {
     pub trim_start: Option<f64>,
     #[serde(default)]
     pub trim_end: Option<f64>,
+    /// Thumbnail sources (generated crops and custom ones). The file name is
+    /// the source's id. Never holds renders.
     #[serde(default)]
     pub thumbnail_options: Vec<String>,
+    /// The chosen thumbnail as a file, derived from `selected_source` and
+    /// `renders` on every load and save. Kept for v0.4.0, which reads it.
     #[serde(default)]
     pub selected_thumbnail: Option<String>,
     #[serde(default)]
+    pub selected_source: Option<String>,
+    #[serde(default)]
+    pub renders: Vec<Render>,
+    #[serde(default)]
     pub review: Review,
+}
+
+impl VideoData {
+    pub fn render_for(&self, source: &str) -> Option<&Render> {
+        self.renders.iter().find(|r| r.source == source)
+    }
+
+    /// The selected source, or the first one.
+    pub fn selected_or_first(&self) -> Option<&String> {
+        self.selected_source.as_ref().or(self.thumbnail_options.first())
+    }
+
+    /// Make the data consistent: renders out of the options (v0.4.0 stacked
+    /// them there on every reopen), one render per existing source, a
+    /// selection that names a source, and `selected_thumbnail` derived.
+    /// In memory only; `save_video_data` deletes the files dropped here.
+    pub fn fix_up(&mut self, dir: &Path) {
+        let mut seen = HashSet::new();
+        self.thumbnail_options
+            .retain(|f| is_valid_file_name(f) && !f.starts_with(RENDERED_PREFIX) && seen.insert(f.clone()));
+
+        let options: HashSet<&String> = self.thumbnail_options.iter().collect();
+        let mut renders: Vec<Render> = Vec::new();
+        for r in self.renders.drain(..) {
+            if options.contains(&r.source) && is_valid_file_name(&r.file) && r.file.starts_with(RENDERED_PREFIX) {
+                renders.retain(|x| x.source != r.source);
+                renders.push(r);
+            }
+        }
+        self.renders = renders;
+
+        if self.selected_source.as_ref().is_some_and(|s| !options.contains(s)) {
+            self.selected_source = None;
+        }
+        if self.selected_source.is_none() {
+            // Written by v0.4.0: its selection is a file name, which may be a
+            // source (kept) or a render of an unknown source (dropped).
+            self.selected_source = self
+                .selected_thumbnail
+                .as_ref()
+                .filter(|s| options.contains(s))
+                .or(self.thumbnail_options.first())
+                .cloned();
+        }
+        self.selected_thumbnail = self.derived_selection(dir);
+    }
+
+    /// The file a v0.4.0 reader (and the library card) should show: the
+    /// selected source's render if there is one, else the source.
+    fn derived_selection(&self, dir: &Path) -> Option<String> {
+        let source = self.selected_or_first()?;
+        match self.render_for(source) {
+            Some(r) if dir.join(&r.file).is_file() => Some(r.file.clone()),
+            _ => Some(source.clone()),
+        }
+    }
 }
 
 pub fn load_video_data(dir: &Path) -> VideoData {
@@ -185,10 +263,10 @@ pub fn load_video_data(dir: &Path) -> VideoData {
     if data.trimmed_file.as_deref().is_some_and(|f| !is_valid_file_name(f)) {
         data.trimmed_file = None;
     }
-    data.thumbnail_options.retain(|f| is_valid_file_name(f));
     if data.selected_thumbnail.as_deref().is_some_and(|f| !is_valid_file_name(f)) {
         data.selected_thumbnail = None;
     }
+    data.fix_up(dir);
     truncate(&mut data.review.title);
     truncate(&mut data.review.preacher);
     if data.review.description.as_ref().is_some_and(|d| d.len() > 20_000) {
@@ -197,8 +275,22 @@ pub fn load_video_data(dir: &Path) -> VideoData {
     data
 }
 
+/// Save video.json, then delete rendered thumbnails it no longer refers to
+/// (replaced renders, and the ones v0.4.0 stacked up).
 pub fn save_video_data(dir: &Path, data: &VideoData) -> Result<(), String> {
-    fsutil::write_json_atomic(&dir.join("video.json"), data)
+    let mut data = data.clone();
+    data.fix_up(dir);
+    fsutil::write_json_atomic(&dir.join("video.json"), &data)?;
+    let keep: HashSet<&str> = data.renders.iter().map(|r| r.file.as_str()).collect();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(RENDERED_PREFIX) && !keep.contains(name.as_str()) && e.path().is_file() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// videos/<id>/transcript.json. Tied to the file's hash so a replaced file
@@ -331,6 +423,84 @@ mod tests {
         let d = load_video_data(tmp.path());
         assert_eq!(d.trimmed_file, None);
         assert_eq!(d.thumbnail_options, vec!["a.jpg".to_string()]);
-        assert_eq!(d.selected_thumbnail, None);
+        // The bad selection is dropped; the first source is used instead.
+        assert_eq!(d.selected_source.as_deref(), Some("a.jpg"));
+        assert_eq!(d.selected_thumbnail.as_deref(), Some("a.jpg"));
+    }
+
+    #[test]
+    fn stacked_renders_heal() {
+        // What v0.4.0 left after a few reopens: every render pass inserted
+        // at the front of the options, and a render selected.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let stacked = [
+            "thumbnail_rendered_1_200.jpg",
+            "thumbnail_rendered_2_200.jpg",
+            "thumbnail_rendered_1_100.jpg",
+            "thumbnail_option_1.jpg",
+            "thumbnail_option_2.jpg",
+        ];
+        for f in stacked {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let json = serde_json::json!({
+            "thumbnail_options": stacked,
+            "selected_thumbnail": "thumbnail_rendered_1_200.jpg",
+            "review": {"title": "T"},
+        });
+        std::fs::write(dir.join("video.json"), json.to_string()).unwrap();
+
+        let d = load_video_data(dir);
+        assert_eq!(d.thumbnail_options, vec!["thumbnail_option_1.jpg", "thumbnail_option_2.jpg"]);
+        assert!(d.renders.is_empty());
+        assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_1.jpg"));
+        assert_eq!(d.selected_thumbnail.as_deref(), Some("thumbnail_option_1.jpg"));
+        assert_eq!(d.review.title.as_deref(), Some("T"));
+
+        // Saving deletes the stacked files, and the next load is stable.
+        save_video_data(dir, &d).unwrap();
+        for f in &stacked[..3] {
+            assert!(!dir.join(f).exists(), "{f}");
+        }
+        assert!(dir.join("thumbnail_option_1.jpg").exists());
+        let again = load_video_data(dir);
+        assert_eq!(again.thumbnail_options.len(), 2);
+    }
+
+    #[test]
+    fn v040_selection_of_a_source_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = serde_json::json!({
+            "thumbnail_options": ["thumbnail_option_1.jpg", "thumbnail_option_2.jpg"],
+            "selected_thumbnail": "thumbnail_option_2.jpg",
+        });
+        std::fs::write(tmp.path().join("video.json"), json.to_string()).unwrap();
+        let d = load_video_data(tmp.path());
+        assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
+    }
+
+    #[test]
+    fn selection_derives_from_render() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("thumbnail_rendered_abc.jpg"), b"x").unwrap();
+        let mut d = VideoData {
+            thumbnail_options: vec!["a.jpg".into(), "b.jpg".into()],
+            selected_source: Some("b.jpg".into()),
+            renders: vec![
+                Render { source: "b.jpg".into(), file: "thumbnail_rendered_abc.jpg".into(), render_key: "k".into() },
+                // Its source is gone: dropped.
+                Render { source: "gone.jpg".into(), file: "thumbnail_rendered_x.jpg".into(), render_key: "k".into() },
+            ],
+            ..Default::default()
+        };
+        d.fix_up(dir);
+        assert_eq!(d.renders.len(), 1);
+        assert_eq!(d.selected_thumbnail.as_deref(), Some("thumbnail_rendered_abc.jpg"));
+        // A render whose file is missing falls back to the source.
+        std::fs::remove_file(dir.join("thumbnail_rendered_abc.jpg")).unwrap();
+        d.fix_up(dir);
+        assert_eq!(d.selected_thumbnail.as_deref(), Some("b.jpg"));
     }
 }

@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   regenerateThumbnails,
+  getVideo,
   revealVideo,
   youtubeGetAuthStatus,
   youtubeUploadVideo,
@@ -12,11 +13,12 @@ import {
 } from "@/lib/tauri";
 import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
 import { getDefaultTemplate } from "@/templates";
-import { splitTitleIntoLines, rawThumbnailVariant } from "@/lib/utils";
+import { splitTitleIntoLines } from "@/lib/utils";
+import { renderKey } from "./review/renderKey";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
-import type { VideoDetail, YouTubeAuthStatus, Chapter } from "@/lib/types";
+import type { VideoDetail, YouTubeAuthStatus, Chapter, ThumbnailOption, ThumbnailRender } from "@/lib/types";
 import { LocalImage } from "./LocalImage";
 import { ThumbnailEditor } from "./ThumbnailEditor";
 import {
@@ -47,6 +49,17 @@ interface ReviewScreenProps {
 }
 
 const AUTOSAVE_MS = 1000;
+const RENDER_DEBOUNCE_MS = 1500;
+
+type RenderMap = Record<string, { path: string; key: string }>;
+
+function rendersById(renders: ThumbnailRender[]): RenderMap {
+  return Object.fromEntries(renders.map((r) => [r.source, { path: r.path, key: r.render_key }]));
+}
+
+function fileName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
+}
 
 export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
   // Metadata editing: saved edits first, then the AI's suggestions
@@ -63,96 +76,70 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
   const startTime = video.trim_start ?? video.transcription?.sermon_start ?? 0;
   const endTime = video.trim_end ?? video.transcription?.sermon_end ?? video.duration ?? 0;
 
-  // Thumbnails
-  const [thumbnailOptions, setThumbnailOptions] = useState<string[]>(video.thumbnail_options);
-  const [selectedThumbnail, setSelectedThumbnail] = useState(
-    video.selected_thumbnail ?? video.thumbnail_options[0] ?? null
+  // Thumbnails: sources by id, plus a stored template render per source.
+  const [thumbnailOptions, setThumbnailOptions] = useState<ThumbnailOption[]>(video.thumbnail_options);
+  const [selectedSource, setSelectedSource] = useState<string | null>(
+    video.selected_source ?? video.thumbnail_options[0]?.id ?? null
   );
+  const [renders, setRenders] = useState<RenderMap>(() => rendersById(video.renders));
   const [isRegeneratingThumbnails, setIsRegeneratingThumbnails] = useState(false);
 
-  // Template overlays: the webview draws title/speaker/logo over the raw crops
-  // and the result is saved back into the video's library folder.
-  const [renderedPaths, setRenderedPaths] = useState<string[]>([]);
+  // The template draws title/speaker/logo over each source; the result is
+  // saved into the video's library folder. A render is current when its key
+  // matches what it would be rendered with now; only stale ones are redone.
   const [singleLine, setSingleLine] = useState(false);
-  const [isRenderingOverlays, setIsRenderingOverlays] = useState(false);
   const [renderProgress, setRenderProgress] = useState("");
-  const lastRenderKey = useRef("");
+  const titleLines = useMemo(
+    () => (singleLine ? [title.trim()] : splitTitleIntoLines(title)).filter((l) => l),
+    [title, singleLine]
+  );
+  const canRender = titleLines.length > 0 && preacher.trim() !== "";
+  const keys = useMemo(() => {
+    const inputs = { titleLines, preacher, singleLine };
+    return Object.fromEntries(thumbnailOptions.map((o) => [o.id, renderKey(o, inputs)]));
+  }, [thumbnailOptions, titleLines, preacher, singleLine]);
+  const staleOptions = canRender ? thumbnailOptions.filter((o) => renders[o.id]?.key !== keys[o.id]) : [];
+  const staleIds = staleOptions.map((o) => o.id).join("|");
 
-  // Re-render overlays when the crops, title, speaker or layout change.
-  // Debounced so typing in the title field doesn't kick off a render per
-  // keystroke.
   useEffect(() => {
-    const titleLines = singleLine ? [title.trim()] : splitTitleIntoLines(title);
-    const renderKey = `${thumbnailOptions.join(",")}|${titleLines.join(",")}|${preacher}|${singleLine}`;
-
-    if (
-      renderKey === lastRenderKey.current ||
-      thumbnailOptions.length === 0 ||
-      titleLines.length === 0 ||
-      !preacher.trim()
-    ) {
-      return;
-    }
-
+    if (staleOptions.length === 0) return;
     let cancelled = false;
+    const inputs = { titleLines, preacher };
+    const todo = staleOptions.map((o) => ({ option: o, key: keys[o.id] }));
 
-    const timeout = setTimeout(() => {
-      async function renderOverlays() {
-        setIsRenderingOverlays(true);
-        setRenderProgress("Preparing overlays...");
-
-        const renderStamp = Date.now();
-        try {
-          const template = getDefaultTemplate();
-          const results = await renderThumbnailBatch(
-            template,
-            thumbnailOptions.map(rawThumbnailVariant),
-            titleLines,
-            preacher,
-            (current, total) => {
-              if (!cancelled) {
-                setRenderProgress(`Rendering overlays ${current}/${total}...`);
-              }
-            },
-          );
-
+    // Debounced so typing in the title field doesn't start a render per
+    // keystroke; right away when nothing has been rendered yet.
+    const delay = Object.keys(renders).length === 0 ? 0 : RENDER_DEBOUNCE_MS;
+    const timeout = setTimeout(async () => {
+      try {
+        const template = getDefaultTemplate();
+        for (let i = 0; i < todo.length; i++) {
           if (cancelled) return;
-
-          const paths: string[] = [];
-          for (const result of results) {
-            const savedPath = await saveRenderedThumbnail(
-              video.id,
-              result.imageData,
-              `thumbnail_rendered_${result.index + 1}_${renderStamp}.jpg`,
-            );
-            paths.push(savedPath);
-          }
-
-          if (!cancelled) {
-            lastRenderKey.current = renderKey;
-            setRenderedPaths(paths);
-            if (paths.length > 0) {
-              setSelectedThumbnail(paths[0]);
-            }
-          }
-        } catch (err) {
-          console.error("Failed to render overlays:", err);
-        } finally {
-          if (!cancelled) {
-            setIsRenderingOverlays(false);
-            setRenderProgress("");
-          }
+          setRenderProgress(`Updating thumbnails ${i + 1}/${todo.length}...`);
+          const { option, key } = todo[i];
+          const [result] = await renderThumbnailBatch(template, [option.render_from], inputs.titleLines, inputs.preacher);
+          if (cancelled) return;
+          const path = await saveRenderedThumbnail(video.id, option.id, key, result.imageData);
+          if (cancelled) return;
+          setRenders((prev) => ({ ...prev, [option.id]: { path, key } }));
         }
+      } catch (err) {
+        console.error("Failed to render thumbnails:", err);
+      } finally {
+        if (!cancelled) setRenderProgress("");
       }
-
-      renderOverlays();
-    }, 2000);
+    }, delay);
 
     return () => {
       cancelled = true;
       clearTimeout(timeout);
     };
-  }, [thumbnailOptions, title, preacher, singleLine, video.id]);
+    // staleIds + keys capture everything a render depends on.
+  }, [staleIds, keys, video.id]);
+
+  const shownPath = (o: ThumbnailOption) => renders[o.id]?.path ?? o.path;
+  const selectedOption = thumbnailOptions.find((o) => o.id === selectedSource) ?? thumbnailOptions[0] ?? null;
+
   const [isEditorOpen, setIsEditorOpen] = useState(false);
 
   // Upload state
@@ -173,8 +160,8 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
   const [saveError, setSaveError] = useState<string | null>(null);
 
   // Autosave edits (debounced), and flush whatever is pending on close.
-  const latest = useRef({ title, description, preacher, selectedThumbnail });
-  latest.current = { title, description, preacher, selectedThumbnail };
+  const latest = useRef({ title, description, preacher, selectedSource });
+  latest.current = { title, description, preacher, selectedSource };
   const dirty = useRef(false);
   const firstRender = useRef(true);
 
@@ -185,7 +172,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     return saveReview(
       video.id,
       { title: v.title, description: v.description, preacher: v.preacher },
-      v.selectedThumbnail
+      v.selectedSource
     )
       .then(() => setSaveError(null))
       .catch((err) => setSaveError(errorMessage(err, "Couldn't save your changes")));
@@ -199,7 +186,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     dirty.current = true;
     const timer = setTimeout(flush, AUTOSAVE_MS);
     return () => clearTimeout(timer);
-  }, [title, description, preacher, selectedThumbnail]);
+  }, [title, description, preacher, selectedSource]);
 
   useEffect(() => () => void flush(), []);
 
@@ -237,16 +224,19 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     };
   }, []);
 
+  // Take the thumbnails as the library now has them.
+  const reloadThumbnails = async (select?: string) => {
+    const fresh = await getVideo(video.id);
+    setThumbnailOptions(fresh.thumbnail_options);
+    setRenders(rendersById(fresh.renders));
+    setSelectedSource(select ?? fresh.selected_source ?? fresh.thumbnail_options[0]?.id ?? null);
+  };
+
   const handleRegenerateThumbnails = async () => {
     try {
       setIsRegeneratingThumbnails(true);
-      const newOptions = await regenerateThumbnails(video.id);
-      setThumbnailOptions(newOptions);
-      setRenderedPaths([]); // overlays re-render off the new crops
-      lastRenderKey.current = "";
-      if (newOptions.length > 0) {
-        setSelectedThumbnail(newOptions[0]);
-      }
+      await regenerateThumbnails(video.id);
+      await reloadThumbnails();
     } catch (err) {
       console.error("Failed to regenerate thumbnails:", err);
     } finally {
@@ -254,17 +244,13 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     }
   };
 
-  const handleSelectThumbnail = (path: string) => {
-    setSelectedThumbnail(path);
-  };
-
-  const handleThumbnailEditorSave = (newPath: string) => {
-    // Add to options if not already there
-    if (!thumbnailOptions.includes(newPath)) {
-      setThumbnailOptions((prev) => [newPath, ...prev]);
-    }
-    setSelectedThumbnail(newPath);
+  const handleThumbnailEditorSave = async (newPath: string) => {
     setIsEditorOpen(false);
+    try {
+      await reloadThumbnails(fileName(newPath));
+    } catch (err) {
+      setSaveError(errorMessage(err));
+    }
   };
 
   const handleOpenFolder = async () => {
@@ -327,11 +313,13 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       // Add social links footer
       fullDescription += `\n\n---\n${SOCIAL_LINKS}`;
 
+      const source = selectedOption?.id;
       const url = await youtubeUploadVideo(
         video.id,
         title,
         fullDescription,
-        selectedThumbnail || undefined,
+        source,
+        source ? keys[source] : undefined,
         "public",
         startTime,   // trim start for caption adjustment
         endTime      // trim end for caption adjustment
@@ -465,9 +453,9 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
           {/* Video Preview */}
           <div className="bg-card border border-border rounded-lg overflow-hidden">
             <div className="aspect-video bg-black flex items-center justify-center">
-              {selectedThumbnail ? (
+              {selectedOption ? (
                 <LocalImage
-                  path={selectedThumbnail}
+                  path={shownPath(selectedOption)}
                   alt="Selected thumbnail"
                   className="w-full h-full object-cover"
                 />
@@ -522,7 +510,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
                 Title on a single line
               </label>
 
-              {isRenderingOverlays && (
+              {renderProgress && (
                 <div className="mb-3 p-2 bg-muted rounded-lg flex items-center gap-2">
                   <Loader2 className="w-3 h-3 animate-spin" />
                   <span className="text-xs text-muted-foreground">{renderProgress}</span>
@@ -530,22 +518,22 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
               )}
 
               <div className="grid grid-cols-3 gap-2">
-                {(renderedPaths.length > 0 ? renderedPaths : thumbnailOptions).map((path, index) => (
+                {thumbnailOptions.map((option, index) => (
                   <button
-                    key={path}
-                    onClick={() => handleSelectThumbnail(path)}
+                    key={option.id}
+                    onClick={() => setSelectedSource(option.id)}
                     className={`relative aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
-                      selectedThumbnail === path
+                      selectedOption?.id === option.id
                         ? "border-primary ring-2 ring-primary/30"
                         : "border-transparent hover:border-muted-foreground/30"
                     }`}
                   >
                     <LocalImage
-                      path={path}
+                      path={shownPath(option)}
                       alt={`Thumbnail option ${index + 1}`}
                       className="w-full h-full object-cover"
                     />
-                    {selectedThumbnail === path && (
+                    {selectedOption?.id === option.id && (
                       <div className="absolute top-1 right-1 bg-primary text-primary-foreground rounded-full p-0.5">
                         <CheckCircle className="w-3 h-3" />
                       </div>
@@ -660,8 +648,8 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       {isEditorOpen && (
         <ThumbnailEditor
           videoId={video.id}
-          thumbnailOptions={thumbnailOptions}
-          selectedThumbnail={selectedThumbnail}
+          thumbnailOptions={thumbnailOptions.map((o) => o.path)}
+          selectedThumbnail={selectedOption?.path ?? null}
           onSave={handleThumbnailEditorSave}
           onClose={() => setIsEditorOpen(false)}
         />

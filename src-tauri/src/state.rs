@@ -251,6 +251,7 @@ struct PersistedState {
     notices: Vec<String>,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub fn state_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))

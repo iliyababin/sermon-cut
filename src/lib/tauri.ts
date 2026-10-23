@@ -6,6 +6,7 @@ import type {
   YouTubeAuthStatus,
   CropRect,
   PlaylistInfo,
+  UploadPrivacy,
   LibraryView,
   VideoDetail,
 } from "./types";
@@ -56,9 +57,9 @@ export async function forgetVideo(videoId: string): Promise<void> {
 export async function saveReview(
   videoId: string,
   review: { title: string; description: string; preacher: string },
-  selectedThumbnail: string | null
+  selectedSource: string | null
 ): Promise<void> {
-  return invoke("save_review", { videoId, ...review, selectedThumbnail });
+  return invoke("save_review", { videoId, ...review, selectedSource });
 }
 
 export async function revealVideo(videoId: string): Promise<void> {
@@ -160,8 +161,9 @@ export async function youtubeUploadVideo(
   videoId: string,
   title: string,
   description: string,
-  thumbnailPath?: string,
-  privacy?: "public" | "unlisted" | "private",
+  thumbnailSource?: string,
+  renderKey?: string,
+  privacy?: UploadPrivacy,
   startTime?: number,
   endTime?: number,
   playlistId?: string
@@ -170,7 +172,8 @@ export async function youtubeUploadVideo(
     videoId,
     title,
     description,
-    thumbnailPath,
+    thumbnailSource,
+    renderKey,
     privacy,
     startTime,
     endTime,
@@ -204,15 +207,18 @@ export function errorMessage(err: unknown, fallback = "Something went wrong"): s
   return String(err || fallback);
 }
 
+/** Save a template render of one thumbnail source; resolves with its path. */
 export async function saveRenderedThumbnail(
   videoId: string,
+  source: string,
+  renderKey: string,
   imageData: Uint8Array,
-  filename: string,
 ): Promise<string> {
   return invoke("save_rendered_thumbnail", {
     videoId,
+    source,
+    renderKey,
     imageData: Array.from(imageData),
-    filename,
   });
 }
 

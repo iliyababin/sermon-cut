@@ -10,6 +10,9 @@ const SCCY_SVG_LOGO = `<svg viewBox="0 0 130 100" xmlns="http://www.w3.org/2000/
   <text x="87" y="80" font-family="'Montserrat', sans-serif" font-size="39" font-weight="500" fill="white" text-anchor="middle" dominant-baseline="middle">Y</text>
 </svg>`;
 
+/** Bump whenever the template's look changes, so stored renders are redone. */
+export const TEMPLATE_VERSION = 1;
+
 export const sccyDefault: TemplateConfig = {
   id: "sccy-default",
   name: "SCCY Sermon",

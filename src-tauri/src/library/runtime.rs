@@ -1502,7 +1502,7 @@ impl Library {
     // Queue
 
     pub async fn enqueue(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        let (path, expected) = {
+        let (root, path, expected) = {
             let g = self.inner();
             g.require_not_updating()?;
             let paths = g.writable()?;
@@ -1523,7 +1523,7 @@ impl Library {
                     (MAX_TRANSCRIBE_SECS / 60.0) as u32
                 ));
             }
-            (paths.original(&e.file_name)?, e.fingerprint.clone())
+            (paths.root.clone(), paths.original(&e.file_name)?, e.fingerprint.clone())
         };
 
         // Quick re-check now (size + mtime); the job re-hashes before and after.
@@ -1531,9 +1531,21 @@ impl Library {
         if meta.len() != expected.size || fsutil::mtime_ms(&meta) != expected.mtime_ms {
             return Err(FILE_CHANGED.into());
         }
+        self.add_to_queue(id, &root, &expected)
+    }
 
+    /// The second half of `enqueue`, after the file was checked without the
+    /// lock: everything may have changed meanwhile (the library switched,
+    /// went read-only, the entry went or its file changed), so look again.
+    fn add_to_queue(&self, id: &str, root: &Path, expected: &Fingerprint) -> Result<(), String> {
         let mut g = self.inner();
         g.require_not_updating()?;
+        if g.writable()?.root != root {
+            return Err("The library folder changed. Try again.".into());
+        }
+        if !fingerprint_matches(&g.entry(id)?.fingerprint, expected) {
+            return Err(FILE_CHANGED.into());
+        }
         if g.is_busy(id) {
             return Err("This video is already queued or processing".into());
         }
@@ -3789,6 +3801,29 @@ mod tests {
         assert_eq!(d.video.status, ViewStatus::ReadyForReview);
         assert!(!dir.join("trimmed.mp4").exists());
         assert_eq!(d.trim_start, None);
+    }
+
+    #[tokio::test]
+    async fn a_queue_request_is_checked_again_after_the_file_check() {
+        let (_t, lib, id, _dir) = processed_library();
+        let root = lib.root().unwrap();
+        let fp = lib.inner().entry(&id).unwrap().fingerprint.clone();
+
+        // The library switched while the file was being looked at.
+        let other = tempfile::tempdir().unwrap();
+        lib.switch(other.path().to_string_lossy().to_string()).await.unwrap();
+        assert!(lib.add_to_queue(&id, &root, &fp).is_err());
+        assert!(lib.inner().queue.is_empty() && lib.inner().manifest.queue.is_empty());
+
+        // Read-only, or the entry gone.
+        let (_t, lib, id, _dir) = processed_library();
+        let root = lib.root().unwrap();
+        lib.inner().mode = Mode::ReadOnly("locked:Office iMac".into());
+        assert!(lib.add_to_queue(&id, &root, &fp).is_err());
+        lib.inner().mode = Mode::Writable;
+        lib.inner().manifest.entries.clear();
+        assert!(lib.add_to_queue(&id, &root, &fp).is_err());
+        assert!(lib.inner().queue.is_empty());
     }
 
     #[test]

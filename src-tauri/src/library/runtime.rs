@@ -1438,7 +1438,9 @@ impl Library {
         }
     }
 
-    pub fn finish_upload(&self, id: &str, file_hash: &str, url: Option<&str>) {
+    /// End an upload; with a URL it succeeded and is recorded, with the
+    /// privacy and playlist it was uploaded with.
+    pub fn finish_upload(&self, id: &str, job: &UploadJob, url: Option<&str>, options: &UploadOptions) {
         let mut g = self.inner();
         g.busy.remove(id);
         g.uploads.remove(id);
@@ -1447,7 +1449,9 @@ impl Library {
             e.uploads.push(UploadRecord {
                 url: url.to_string(),
                 uploaded_at: chrono::Utc::now().to_rfc3339(),
-                file_hash: file_hash.to_string(),
+                file_hash: job.file_hash.clone(),
+                privacy: Some(options.privacy.clone()),
+                playlist_id: options.playlist_id.clone(),
             });
             e.status = EntryStatus::Done;
             e.error = None;
@@ -1581,6 +1585,35 @@ impl Library {
                 let _ = tx.send(true);
             }
         }
+    }
+}
+
+/// Where and how a video goes on YouTube.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadOptions {
+    pub privacy: String,
+    pub playlist_id: Option<String>,
+}
+
+impl UploadOptions {
+    /// The review screen's choices, with the settings filling in what it
+    /// didn't send. An empty playlist means "none" (not the default one).
+    pub fn resolve(
+        settings: &crate::state::Settings,
+        privacy: Option<String>,
+        playlist_id: Option<String>,
+    ) -> Result<Self, String> {
+        let privacy = privacy.unwrap_or_else(|| settings.upload_privacy.clone());
+        if !crate::state::UPLOAD_PRIVACIES.contains(&privacy.as_str()) {
+            return Err(format!("Unknown privacy setting: {}", privacy));
+        }
+        let playlist_id = match playlist_id {
+            Some(explicit) => Some(explicit),
+            None => settings.youtube_playlist_id.clone(),
+        }
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+        Ok(UploadOptions { privacy, playlist_id })
     }
 }
 
@@ -1786,7 +1819,7 @@ mod tests {
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.upload_progress, Some(42));
 
-        lib.finish_upload(&id, &job.file_hash, Some("https://youtube.com/watch?v=x"));
+        lib.finish_upload(&id, &job, Some("https://youtube.com/watch?v=x"), &public());
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Done);
         assert_eq!(v.upload_progress, None);
@@ -1795,11 +1828,42 @@ mod tests {
 
         // A failed upload goes back to how it was, with nothing recorded.
         let job = lib.begin_upload(&id, None, None).unwrap();
-        lib.finish_upload(&id, &job.file_hash, None);
+        lib.finish_upload(&id, &job, None, &public());
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Done);
         assert_eq!(v.uploads.len(), 1);
         assert!(!v.busy);
+    }
+
+    fn public() -> UploadOptions {
+        UploadOptions { privacy: "public".into(), playlist_id: None }
+    }
+
+    #[test]
+    fn upload_options_fill_in_from_settings() {
+        let mut settings = crate::state::Settings::default();
+        settings.upload_privacy = "unlisted".into();
+        settings.youtube_playlist_id = Some("PLdefault".into());
+        let o = UploadOptions::resolve(&settings, None, None).unwrap();
+        assert_eq!(o, UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PLdefault".into()) });
+        let o = UploadOptions::resolve(&settings, Some("private".into()), Some("PLother".into())).unwrap();
+        assert_eq!(o, UploadOptions { privacy: "private".into(), playlist_id: Some("PLother".into()) });
+        // "No playlist" chosen on the review screen beats the default.
+        assert_eq!(UploadOptions::resolve(&settings, None, Some("".into())).unwrap().playlist_id, None);
+        assert!(UploadOptions::resolve(&settings, Some("secret".into()), None).is_err());
+        // First time: public.
+        assert_eq!(UploadOptions::resolve(&crate::state::Settings::default(), None, None).unwrap().privacy, "public");
+    }
+
+    #[test]
+    fn upload_record_keeps_privacy_and_playlist() {
+        let (_t, lib, id, _dir) = processed_library();
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        let options = UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PL1".into()) };
+        lib.finish_upload(&id, &job, Some("https://youtube.com/watch?v=y"), &options);
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.uploads[0].privacy.as_deref(), Some("unlisted"));
+        assert_eq!(v.uploads[0].playlist_id.as_deref(), Some("PL1"));
     }
 
     /// A writable library with one processed video that has two generated
@@ -1906,9 +1970,9 @@ mod tests {
     #[tokio::test]
     async fn renders_are_allowed_during_upload_but_not_processing() {
         let (_t, lib, id, _dir) = processed_library();
-        let _job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).unwrap();
         lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k", png()).await.unwrap();
-        lib.finish_upload(&id, "h", None);
+        lib.finish_upload(&id, &job, None, &public());
 
         lib.inner().queue.push_back(id.clone());
         let err = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap_err();
@@ -1928,17 +1992,17 @@ mod tests {
 
         let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("k".into())).unwrap();
         assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
-        lib.finish_upload(&id, "h", None);
+        lib.finish_upload(&id, &job, None, &public());
 
         // A stale key falls back to the source itself.
         let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("old".into())).unwrap();
         assert_eq!(job.thumbnail_path, Some(dir.join("thumbnail_option_2.jpg")));
-        lib.finish_upload(&id, "h", None);
+        lib.finish_upload(&id, &job, None, &public());
 
         // No source given: the selected one's render.
         let job = lib.begin_upload(&id, None, None).unwrap();
         assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
-        lib.finish_upload(&id, "h", None);
+        lib.finish_upload(&id, &job, None, &public());
 
         assert!(lib.begin_upload(&id, Some("/etc/passwd".into()), None).is_err());
         assert!(!lib.inner().busy.contains(&id), "a refused upload doesn't stay busy");

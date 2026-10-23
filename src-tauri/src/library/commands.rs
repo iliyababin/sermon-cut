@@ -1,7 +1,7 @@
 //! Tauri commands for the library screen, review screen and downloads.
 
 use super::manifest::Review;
-use super::runtime::{AppStateHandle, Library, LibraryView, VideoDetail};
+use super::runtime::{AppStateHandle, Library, LibraryView, UploadOptions, VideoDetail};
 use crate::thumbnail::CropRect;
 use std::path::Path;
 use std::sync::Arc;
@@ -238,12 +238,25 @@ pub async fn youtube_upload_video(
 ) -> Result<String, String> {
     use crate::youtube;
 
+    // Privacy and playlist as chosen next to Upload; the settings fill in
+    // anything not sent.
+    let options = UploadOptions::resolve(&state.lock().await.settings, privacy, playlist_id)?;
     let job = lib.begin_upload(&video_id, thumbnail_source, render_key)?;
     changed(&app_handle);
 
     let result: Result<String, String> = async {
-        let privacy = privacy.unwrap_or_else(|| "unlisted".to_string());
         let access_token = crate::commands::fresh_access_token(&state, &app_handle).await?;
+
+        // The upload is starting: offer the same privacy next time.
+        {
+            let mut s = state.lock().await;
+            if s.settings.upload_privacy != options.privacy {
+                s.settings.upload_privacy = options.privacy.clone();
+                if let Err(e) = s.save() {
+                    eprintln!("[warn] Failed to save state: {}", e);
+                }
+            }
+        }
 
         let on_progress = |percent: u32, status: &str| {
             lib.set_upload_progress(&video_id, percent);
@@ -254,7 +267,7 @@ pub async fn youtube_upload_video(
             &job.video_path.to_string_lossy(),
             &title,
             &description,
-            &privacy,
+            &options.privacy,
             &on_progress,
         )
         .await?;
@@ -277,13 +290,8 @@ pub async fn youtube_upload_video(
             }
         }
 
-        // An explicit playlist from the review screen wins over the setting.
-        let playlist = match playlist_id.filter(|p| !p.is_empty()) {
-            Some(explicit) => Some(explicit),
-            None => state.lock().await.settings.youtube_playlist_id.clone(),
-        };
-        if let Some(playlist_id) = playlist.filter(|p| !p.is_empty()) {
-            if let Err(e) = youtube::add_to_playlist(&access_token, &playlist_id, &uploaded_id).await {
+        if let Some(playlist_id) = &options.playlist_id {
+            if let Err(e) = youtube::add_to_playlist(&access_token, playlist_id, &uploaded_id).await {
                 println!("[youtube] Warning: Failed to add to playlist: {}", e);
             }
         }
@@ -292,7 +300,7 @@ pub async fn youtube_upload_video(
     }
     .await;
 
-    lib.finish_upload(&video_id, &job.file_hash, result.as_deref().ok());
+    lib.finish_upload(&video_id, &job, result.as_deref().ok(), &options);
     // Final word for any screen showing this upload, including a review
     // screen reopened after the one that started it went away.
     match &result {

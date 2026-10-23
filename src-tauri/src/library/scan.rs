@@ -418,6 +418,8 @@ mod tests {
             url: "https://youtube.com/watch?v=x".into(),
             uploaded_at: "t".into(),
             file_hash: "h1".into(),
+            privacy: None,
+            playlist_id: None,
         });
         let mut entries = vec![e];
         let r = reconcile(&mut entries, &[ready("a.mp4", 20, 2, "h2")], &HashSet::new());

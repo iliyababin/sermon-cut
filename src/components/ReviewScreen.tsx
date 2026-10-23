@@ -4,6 +4,8 @@ import {
   getVideo,
   revealVideo,
   youtubeGetAuthStatus,
+  youtubeListPlaylists,
+  getSettings,
   youtubeUploadVideo,
   processVideo,
   resetVideo,
@@ -19,7 +21,15 @@ import { canStartUpload, initialReviewState, reviewReducer } from "./review/revi
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
-import type { VideoDetail, YouTubeAuthStatus, Chapter, ThumbnailOption, ThumbnailRender } from "@/lib/types";
+import type {
+  VideoDetail,
+  YouTubeAuthStatus,
+  Chapter,
+  ThumbnailOption,
+  ThumbnailRender,
+  PlaylistInfo,
+  UploadPrivacy,
+} from "@/lib/types";
 import { LocalImage } from "./LocalImage";
 import { ThumbnailEditor } from "./ThumbnailEditor";
 import {
@@ -158,6 +168,13 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
   const phase = review.phase;
   const uploadReady = thumbnailsReady && preacher.trim() !== "";
 
+  // Privacy and playlist for this upload, starting from the last privacy
+  // used and the default playlist in Settings. "" means no playlist.
+  const [privacy, setPrivacy] = useState<UploadPrivacy>("public");
+  const [playlistId, setPlaylistId] = useState("");
+  const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
+  const choicesTouched = useRef(false);
+
   // Reprocessing state
   const [isReprocessing, setIsReprocessing] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -193,9 +210,23 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
 
   useEffect(() => () => void flush(), []);
 
-  // Load YouTube auth status
+  // Load YouTube auth status, the upload defaults and the playlists
   useEffect(() => {
-    youtubeGetAuthStatus().then(setYoutubeAuth).catch(console.error);
+    youtubeGetAuthStatus()
+      .then((status) => {
+        setYoutubeAuth(status);
+        if (status.is_authenticated) {
+          youtubeListPlaylists().then(setPlaylists).catch(console.error);
+        }
+      })
+      .catch(console.error);
+    getSettings()
+      .then((s) => {
+        if (choicesTouched.current) return;
+        setPrivacy(s.upload_privacy);
+        setPlaylistId(s.youtube_playlist_id ?? "");
+      })
+      .catch(console.error);
   }, []);
 
   // Listen for upload progress
@@ -339,9 +370,10 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
           fullDescription,
           source,
           source ? keys[source] : undefined,
-          "public",
+          privacy,
           startTime,   // trim start for caption adjustment
-          endTime      // trim end for caption adjustment
+          endTime,     // trim end for caption adjustment
+          playlistId
         );
         // The "done" event reports this too; the machine counts it once.
         dispatch({ type: "succeeded", url });
@@ -389,16 +421,51 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
             Reprocess
           </button>
           {youtubeAuth?.is_authenticated && phase.kind !== "done" && (
-            <button
-              onClick={handleUpload}
-              disabled={!canStartUpload(phase) || !uploadReady}
-              title={!preacher.trim() ? "Speaker name is required" : undefined}
-              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-colors"
-            >
-              {phase.kind === "uploading" ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  {phase.progress}%
+            <>
+              <select
+                aria-label="Privacy"
+                value={privacy}
+                disabled={!canStartUpload(phase)}
+                onChange={(e) => {
+                  choicesTouched.current = true;
+                  setPrivacy(e.target.value as UploadPrivacy);
+                }}
+                className="px-3 py-2 border border-input rounded-lg bg-background text-sm disabled:opacity-50"
+              >
+                <option value="public">Public</option>
+                <option value="unlisted">Unlisted</option>
+                <option value="private">Private</option>
+              </select>
+              <select
+                aria-label="Playlist"
+                value={playlistId}
+                disabled={!canStartUpload(phase)}
+                onChange={(e) => {
+                  choicesTouched.current = true;
+                  setPlaylistId(e.target.value);
+                }}
+                className="px-3 py-2 border border-input rounded-lg bg-background text-sm max-w-48 disabled:opacity-50"
+              >
+                <option value="">No playlist</option>
+                {playlistId && !playlists.some((p) => p.id === playlistId) && (
+                  <option value={playlistId}>Default playlist</option>
+                )}
+                {playlists.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.title}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={handleUpload}
+                disabled={!canStartUpload(phase) || !uploadReady}
+                title={!preacher.trim() ? "Speaker name is required" : undefined}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-colors"
+              >
+                {phase.kind === "uploading" ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {phase.progress}%
                 </>
               ) : !thumbnailsReady ? (
                 <>
@@ -412,6 +479,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
                 </>
               )}
             </button>
+            </>
           )}
         </div>
       </div>

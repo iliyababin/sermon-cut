@@ -50,6 +50,8 @@ export interface UploadRecord {
   url: string;
   uploaded_at: string;
   file_hash: string;
+  privacy?: UploadPrivacy | null;
+  playlist_id?: string | null;
 }
 
 /** A video in the library folder. */

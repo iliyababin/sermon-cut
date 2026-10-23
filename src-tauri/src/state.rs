@@ -113,6 +113,9 @@ fn default_upload_privacy() -> String {
     "public".to_string()
 }
 
+/// YouTube's privacy statuses, as the API spells them.
+pub const UPLOAD_PRIVACIES: [&str; 3] = ["public", "unlisted", "private"];
+
 /// What the webview sees: no tokens, just whether (and as whom) YouTube is
 /// signed in.
 #[derive(Debug, Clone, Serialize)]

@@ -66,6 +66,10 @@ pub struct UploadRecord {
     /// Fingerprint hash of the file that was uploaded, so a replaced file
     /// can still show "a previous version was uploaded".
     pub file_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_id: Option<String>,
 }
 
 /// One video in library.json.

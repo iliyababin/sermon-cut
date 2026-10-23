@@ -76,6 +76,13 @@ beforeEach(() => {
         return Promise.resolve({ is_authenticated: true, channel_name: "Youth", channel_id: "UC1" });
       case "youtube_upload_video":
         return new Promise(() => {}); // still uploading
+      case "get_settings":
+        return Promise.resolve({ upload_privacy: "unlisted", youtube_playlist_id: "PL1" });
+      case "youtube_list_playlists":
+        return Promise.resolve([
+          { id: "PL1", title: "Sermons" },
+          { id: "PL2", title: "Youth Nights" },
+        ]);
       default:
         return Promise.resolve(null);
     }
@@ -130,5 +137,34 @@ describe("ReviewScreen", () => {
     fireEvent.change(screen.getByDisplayValue(TITLE), { target: { value: "New title" } });
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     await waitFor(() => expect(onBack).toHaveBeenCalledTimes(1));
+  });
+
+  it("starts from the last privacy and the default playlist", async () => {
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    const privacy = (await screen.findByLabelText("Privacy")) as HTMLSelectElement;
+    const playlist = screen.getByLabelText("Playlist") as HTMLSelectElement;
+    await waitFor(() => expect(privacy.value).toBe("unlisted"));
+    await waitFor(() => expect(playlist.value).toBe("PL1"));
+    await screen.findByRole("option", { name: "Youth Nights" });
+    fireEvent.click(screen.getByRole("button", { name: /upload/i }));
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
+    const args = calls("youtube_upload_video")[0][1] as Record<string, unknown>;
+    expect(args.privacy).toBe("unlisted");
+    expect(args.playlistId).toBe("PL1");
+  });
+
+  it("uploads with the privacy and playlist chosen next to Upload", async () => {
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    const privacy = (await screen.findByLabelText("Privacy")) as HTMLSelectElement;
+    await screen.findByRole("option", { name: "Youth Nights" });
+    await waitFor(() => expect(privacy.value).toBe("unlisted"));
+    fireEvent.change(privacy, { target: { value: "private" } });
+    fireEvent.change(screen.getByLabelText("Playlist"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /upload/i }));
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
+    const args = calls("youtube_upload_video")[0][1] as Record<string, unknown>;
+    expect(args.privacy).toBe("private");
+    // "No playlist" is sent as such, so the default isn't used instead.
+    expect(args.playlistId).toBe("");
   });
 });

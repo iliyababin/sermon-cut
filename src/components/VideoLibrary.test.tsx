@@ -1,0 +1,83 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { LibraryVideo, LibraryView } from "@/lib/types";
+
+const invoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: unknown) => invoke(cmd, args),
+  convertFileSrc: (p: string) => `asset://${p}`,
+}));
+vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn() }));
+vi.mock("@tauri-apps/plugin-shell", () => ({ open: vi.fn() }));
+
+import { VideoLibrary } from "./VideoLibrary";
+
+function video(id: string, over: Partial<LibraryVideo> = {}): LibraryVideo {
+  return {
+    id,
+    file_name: `${id}.mp4`,
+    file_path: `/lib/${id}.mp4`,
+    title: id,
+    status: "new",
+    error: null,
+    duration: 60,
+    size: 1,
+    channel: null,
+    source_url: null,
+    hidden: false,
+    uploads: [],
+    added_at: "2026-01-01T00:00:00Z",
+    thumbnail: null,
+    processing_stage: null,
+    processing_progress: null,
+    processing_message: null,
+    upload_progress: null,
+    busy: false,
+    queue_position: null,
+    queue_length: null,
+    ...over,
+  };
+}
+
+let library: LibraryView;
+
+beforeEach(() => {
+  library = {
+    folder: "/lib",
+    available: true,
+    writable: true,
+    message: null,
+    locked_by: null,
+    tool_problem: null,
+    downloads: [],
+    notices: [],
+    max_transcribe_secs: 7200,
+    videos: [
+      video("queued", { status: "queued", queue_position: 2, queue_length: 3, added_at: "2026-01-05T00:00:00Z" }),
+      video("newer", { status: "ready_for_review", added_at: "2026-01-04T00:00:00Z" }),
+      video("older", { status: "ready_for_review", added_at: "2026-01-02T00:00:00Z" }),
+      video("hidden", { status: "ready_for_review", hidden: true, added_at: "2026-01-01T00:00:00Z" }),
+    ],
+  };
+  invoke.mockReset();
+  invoke.mockImplementation((cmd: string) =>
+    cmd === "get_library" || cmd === "rescan_library" ? Promise.resolve(library) : Promise.resolve(null)
+  );
+});
+
+afterEach(cleanup);
+
+describe("VideoLibrary", () => {
+  it("shows a queued video's place in line", async () => {
+    render(<VideoLibrary onVideoSelect={() => {}} />);
+    await screen.findByText("Queued (2 of 3)");
+  });
+
+  it("Review next opens the oldest video waiting for review", async () => {
+    const onVideoSelect = vi.fn();
+    render(<VideoLibrary onVideoSelect={onVideoSelect} />);
+    fireEvent.click(await screen.findByRole("button", { name: /review next/i }));
+    expect(onVideoSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "older" }));
+  });
+});

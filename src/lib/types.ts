@@ -92,6 +92,10 @@ export interface LibraryVideo {
   /** Percent of a YouTube upload in progress. */
   upload_progress: number | null;
   busy: boolean;
+  /** For a queued video, its place in line, counting the one being
+   * processed as the first ("2 of 3"). */
+  queue_position: number | null;
+  queue_length: number | null;
 }
 
 export interface DownloadItem {

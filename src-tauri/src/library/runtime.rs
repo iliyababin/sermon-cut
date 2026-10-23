@@ -137,6 +137,10 @@ pub struct LibraryVideo {
     pub upload_progress: Option<u32>,
     /// Whether Hide/Trash/Reset are allowed right now.
     pub busy: bool,
+    /// For a queued video, its place in line ("2 of 3"), counting the
+    /// video being processed now as the first.
+    pub queue_position: Option<usize>,
+    pub queue_length: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -414,6 +418,8 @@ impl Inner {
             _ => None,
         };
         let running = self.running.as_ref().filter(|r| r.id == e.id);
+        let ahead = usize::from(self.running.is_some());
+        let queue_position = self.queue.iter().position(|q| *q == e.id).map(|i| i + 1 + ahead);
         LibraryVideo {
             id: e.id.clone(),
             file_name: e.file_name.clone(),
@@ -440,6 +446,8 @@ impl Inner {
             processing_message: running.map(|r| r.message.clone()),
             upload_progress: self.uploads.get(&e.id).map(|u| u.percent),
             busy: self.is_busy(&e.id),
+            queue_position,
+            queue_length: queue_position.map(|_| self.queue.len() + ahead),
         }
     }
 
@@ -469,6 +477,8 @@ impl Inner {
             processing_message: None,
             upload_progress: None,
             busy: true,
+            queue_position: None,
+            queue_length: None,
         }
     }
 
@@ -2582,6 +2592,32 @@ mod tests {
         assert!(lib.save_rendered_thumbnail(&id, "../../x.jpg", "k", png()).await.is_err());
         assert!(lib.save_rendered_thumbnail(&id, "other.jpg", "k", png()).await.is_err());
         assert!(lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k/../", png()).await.is_err());
+    }
+
+    #[test]
+    fn queued_videos_know_their_place_in_line() {
+        let (_t, lib, id, _dir) = processed_library();
+        let view = |id: &str| lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!((view(&id).queue_position, view(&id).queue_length), (None, None));
+        {
+            let mut g = lib.inner();
+            g.running = Some(Running {
+                id: "other".into(),
+                stage: ProcessingStage::Transcribing,
+                progress: 0.0,
+                message: String::new(),
+                cancel: CancellationToken::new(),
+                previous: EntryStatus::New,
+            });
+            g.queue.push_back("ahead".into());
+            g.queue.push_back(id.clone());
+        }
+        let v = view(&id);
+        assert_eq!(v.status, ViewStatus::Queued);
+        assert_eq!((v.queue_position, v.queue_length), (Some(3), Some(3)));
+        lib.inner().running = None;
+        let v = view(&id);
+        assert_eq!((v.queue_position, v.queue_length), (Some(2), Some(2)));
     }
 
     #[tokio::test]

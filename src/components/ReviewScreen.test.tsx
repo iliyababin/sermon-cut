@@ -50,6 +50,8 @@ function video(overrides: Partial<VideoDetail> = {}): VideoDetail {
     processing_message: null,
     upload_progress: null,
     busy: false,
+    queue_position: null,
+    queue_length: null,
     transcription: null,
     trimmed_path: "/v/trimmed.mp4",
     trim_start: 0,

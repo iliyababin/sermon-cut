@@ -133,8 +133,13 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
     });
     const unlistenUpload = listen<UploadProgress>("youtube-upload-progress", (event) => {
       const { video_id, progress, status } = event.payload;
-      setUploads((prev) => ({ ...prev, [video_id]: progress }));
-      if (status === "done" || status === "error") refresh();
+      if (status === "done" || status === "error" || status === "cancelled") {
+        // Finished: the card shows the stored result from here on.
+        setUploads(({ [video_id]: _, ...rest }) => rest);
+        refresh();
+      } else {
+        setUploads((prev) => ({ ...prev, [video_id]: progress }));
+      }
     });
     return () => {
       unlistenChanged.then((fn) => fn());
@@ -201,6 +206,10 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
   const videos = library.videos.filter((v) => showHidden || !v.hidden);
   const sharedNames = duplicateFileNames(library.videos);
   const maxMinutes = Math.round(library.max_transcribe_secs / 60);
+  // The video waiting longest for review.
+  const nextToReview = library.videos
+    .filter((v) => v.status === "ready_for_review" && !v.hidden)
+    .sort((a, b) => a.added_at.localeCompare(b.added_at))[0];
 
   return (
     <div className="p-6">
@@ -212,6 +221,16 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
           </p>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
+          {nextToReview && (
+            <button
+              onClick={() => onVideoSelect(nextToReview)}
+              title={`Open "${nextToReview.title}", the video waiting longest`}
+              className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
+            >
+              <Eye className="w-5 h-5" />
+              Review next
+            </button>
+          )}
           {hiddenCount > 0 && (
             <button
               onClick={() => setShowHidden(!showHidden)}
@@ -469,7 +488,11 @@ function VideoCard(props: VideoCardProps) {
               {formatDuration(video.duration)}
             </span>
           ) : null}
-          <StatusBadge status={video.status} stage={live?.stage ?? video.processing_stage} />
+          <StatusBadge
+            status={video.status}
+            stage={live?.stage ?? video.processing_stage}
+            queue={video.queue_position && video.queue_length ? [video.queue_position, video.queue_length] : undefined}
+          />
           {video.hidden && <span className="text-xs">Hidden</span>}
         </div>
 
@@ -664,9 +687,23 @@ const STATUS: Record<LibraryStatus, { label: string; className: string; icon: "c
   missing: { label: "Missing", className: "bg-muted text-muted-foreground", icon: "alert" },
 };
 
-function StatusBadge({ status, stage }: { status: LibraryStatus; stage?: ProcessingStage | null }) {
+function StatusBadge({
+  status,
+  stage,
+  queue,
+}: {
+  status: LibraryStatus;
+  stage?: ProcessingStage | null;
+  /** Place in line and its length, for a queued video. */
+  queue?: [number, number];
+}) {
   const config = STATUS[status];
-  const label = status === "processing" ? getProcessingLabel(stage ?? undefined) : config.label;
+  const label =
+    status === "processing"
+      ? getProcessingLabel(stage ?? undefined)
+      : status === "queued" && queue
+        ? `Queued (${queue[0]} of ${queue[1]})`
+        : config.label;
   const icon = {
     clock: <Clock className="w-4 h-4" />,
     check: <CheckCircle className="w-4 h-4" />,

@@ -103,6 +103,50 @@ pub struct Settings {
     pub youtube_auth: Option<YouTubeAuth>,
     #[serde(default)]
     pub youtube_playlist_id: Option<String>,
+    /// Privacy of the last upload, offered again next time. Server-owned:
+    /// only an upload changes it.
+    #[serde(default = "default_upload_privacy")]
+    pub upload_privacy: String,
+}
+
+fn default_upload_privacy() -> String {
+    "public".to_string()
+}
+
+/// What the webview sees: no tokens, just whether (and as whom) YouTube is
+/// signed in.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettingsView {
+    pub download_quality: String,
+    pub output_folder: String,
+    pub modal_api_url: String,
+    pub modal_api_key: Option<String>,
+    pub logo_path: Option<String>,
+    pub youtube_playlist_id: Option<String>,
+    pub upload_privacy: String,
+    pub youtube_signed_in: bool,
+    pub youtube_channel_name: Option<String>,
+}
+
+/// What the webview may change: only the user-editable fields, each one
+/// optional so a save touches just what was edited. Sign-in, privacy and
+/// anything else the app manages itself can't be sent at all. For the
+/// optional settings, an empty string clears them.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsPatch {
+    #[serde(default)]
+    pub download_quality: Option<String>,
+    #[serde(default)]
+    pub output_folder: Option<String>,
+    #[serde(default)]
+    pub modal_api_url: Option<String>,
+    #[serde(default)]
+    pub modal_api_key: Option<String>,
+    #[serde(default)]
+    pub logo_path: Option<String>,
+    #[serde(default)]
+    pub youtube_playlist_id: Option<String>,
 }
 
 /// The transcription server (backend/app.py, deployed on Modal).
@@ -130,11 +174,51 @@ impl Default for Settings {
             logo_path: None,
             youtube_auth: None,
             youtube_playlist_id: None,
+            upload_privacy: default_upload_privacy(),
         }
     }
 }
 
 impl Settings {
+    pub fn view(&self) -> SettingsView {
+        let auth = self.youtube_auth.as_ref();
+        SettingsView {
+            download_quality: self.download_quality.clone(),
+            output_folder: self.output_folder.clone(),
+            modal_api_url: self.modal_api_url.clone(),
+            modal_api_key: self.modal_api_key.clone(),
+            logo_path: self.logo_path.clone(),
+            youtube_playlist_id: self.youtube_playlist_id.clone(),
+            upload_privacy: self.upload_privacy.clone(),
+            youtube_signed_in: auth.is_some_and(|a| a.access_token.is_some() || a.refresh_token.is_some()),
+            youtube_channel_name: auth.and_then(|a| a.channel_name.clone()),
+        }
+    }
+
+    /// Apply the fields present in `patch`, leaving everything else alone.
+    /// The folder is applied separately (it needs the library switched).
+    pub fn apply(&mut self, patch: &SettingsPatch) {
+        fn optional(v: &str) -> Option<String> {
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.to_string())
+        }
+        if let Some(v) = &patch.download_quality {
+            self.download_quality = v.clone();
+        }
+        if let Some(v) = &patch.modal_api_url {
+            self.modal_api_url = v.trim().to_string();
+        }
+        if let Some(v) = &patch.modal_api_key {
+            self.modal_api_key = optional(v);
+        }
+        if let Some(v) = &patch.logo_path {
+            self.logo_path = optional(v);
+        }
+        if let Some(v) = &patch.youtube_playlist_id {
+            self.youtube_playlist_id = optional(v);
+        }
+    }
+
     pub fn library_folder(&self) -> String {
         if self.output_folder.trim().is_empty() {
             default_library_dir()
@@ -152,6 +236,9 @@ pub struct AppState {
     pub legacy_videos: serde_json::Map<String, serde_json::Value>,
     /// One-time messages for the library screen.
     pub notices: Vec<String>,
+    /// The newest settings save applied this run; older ones are ignored so
+    /// saves that arrive out of order can't undo a later edit.
+    pub settings_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,8 +257,17 @@ pub fn state_dir() -> PathBuf {
         .join("sermon-cut")
 }
 
+#[cfg(not(test))]
 fn get_state_file_path() -> PathBuf {
     state_dir().join("state.json")
+}
+
+/// Tests must never touch the real state.json.
+#[cfg(test)]
+fn get_state_file_path() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("sermon-cut-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("state.json")
 }
 
 impl AppState {
@@ -189,6 +285,7 @@ impl AppState {
                         settings,
                         legacy_videos: persisted.videos,
                         notices: persisted.notices,
+                        settings_seq: 0,
                     };
                 }
                 Err(e) => {
@@ -242,5 +339,71 @@ impl AppState {
         std::fs::copy(&path, &backup)
             .map(|_| ())
             .map_err(|e| format!("Failed to back up state.json: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed_in() -> Settings {
+        Settings {
+            youtube_auth: Some(YouTubeAuth {
+                access_token: Some("ya29.secret".into()),
+                refresh_token: Some("1//refresh".into()),
+                expires_at: Some(1),
+                channel_name: Some("Youth".into()),
+                channel_id: Some("UC1".into()),
+            }),
+            upload_privacy: "unlisted".into(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn patch_never_touches_server_owned_fields() {
+        let mut s = signed_in();
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "download_quality": "720p",
+            "modal_api_key": "",
+            "logo_path": "/x/logo.png",
+        }))
+        .unwrap();
+        s.apply(&patch);
+        assert_eq!(s.download_quality, "720p");
+        assert_eq!(s.modal_api_key, None);
+        assert_eq!(s.logo_path.as_deref(), Some("/x/logo.png"));
+        let auth = s.youtube_auth.as_ref().unwrap();
+        assert_eq!(auth.refresh_token.as_deref(), Some("1//refresh"));
+        assert_eq!(s.upload_privacy, "unlisted");
+    }
+
+    #[test]
+    fn patch_rejects_server_owned_fields() {
+        for field in ["youtube_auth", "upload_privacy", "recent_preachers", "auto_process_since"] {
+            let json = serde_json::json!({ field: null });
+            assert!(serde_json::from_value::<SettingsPatch>(json).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn view_has_no_tokens() {
+        let view = serde_json::to_string(&signed_in().view()).unwrap();
+        assert!(!view.contains("token"), "{view}");
+        assert!(!view.contains("secret") && !view.contains("refresh"), "{view}");
+        assert!(view.contains("\"youtube_signed_in\":true"));
+        assert!(view.contains("Youth"));
+    }
+
+    #[test]
+    fn old_state_files_default_to_public() {
+        let s: Settings = serde_json::from_value(serde_json::json!({
+            "download_quality": "best",
+            "output_folder": "",
+            "modal_api_url": "x",
+            "modal_api_key": null,
+        }))
+        .unwrap();
+        assert_eq!(s.upload_privacy, "public");
     }
 }

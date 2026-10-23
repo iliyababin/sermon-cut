@@ -548,16 +548,23 @@ impl Library {
         g.scanned = false;
     }
 
+    /// Whether the library could move to `configured` right now.
+    pub fn check_switch(&self, configured: &str) -> Result<(), String> {
+        let g = self.inner();
+        if g.configured == configured {
+            return Ok(());
+        }
+        if g.running.is_some() || !g.queue.is_empty() || !g.downloads.is_empty() || !g.busy.is_empty() {
+            return Err("Wait for processing, downloads and uploads to finish before changing the library folder.".into());
+        }
+        Ok(())
+    }
+
     /// Point the library at a different folder (Settings).
     pub async fn switch(self: &Arc<Self>, configured: String) -> Result<(), String> {
-        {
-            let g = self.inner();
-            if g.configured == configured {
-                return Ok(());
-            }
-            if g.running.is_some() || !g.queue.is_empty() || !g.downloads.is_empty() || !g.busy.is_empty() {
-                return Err("Wait for processing, downloads and uploads to finish before changing the library folder.".into());
-            }
+        self.check_switch(&configured)?;
+        if self.inner().configured == configured {
+            return Ok(());
         }
         let _scan = self.scan_lock.lock().await;
         let lib = self.clone();

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   VideoInfo,
   Settings,
+  SettingsPatch,
   YouTubeAuthStatus,
   CropRect,
   PlaylistInfo,
@@ -103,8 +104,18 @@ export async function getSettings(): Promise<Settings> {
   return invoke("get_settings");
 }
 
-export async function saveSettings(settings: Settings): Promise<void> {
-  return invoke("save_settings", { settings });
+// Increases with every save, also across a reload of the webview, so the
+// backend can drop a save that arrives after a newer one.
+let lastSettingsSeq = 0;
+
+export function nextSettingsSeq(): number {
+  lastSettingsSeq = Math.max(Date.now(), lastSettingsSeq + 1);
+  return lastSettingsSeq;
+}
+
+/** Save only the given fields. Resolves with the settings as they now are. */
+export async function saveSettings(patch: SettingsPatch): Promise<Settings> {
+  return invoke("save_settings", { patch, seq: nextSettingsSeq() });
 }
 
 export async function resetState(): Promise<void> {

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { getSettings, saveSettings, getAppDataDir, resetState, clearLibraryData, checkLibraryFolder, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists, errorMessage } from "@/lib/tauri";
 import type { Settings as SettingsType, YouTubeAuthStatus, PlaylistInfo } from "@/lib/types";
+import { settingsPatch } from "@/lib/settingsPatch";
 import { Save, Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle, RefreshCw, Download } from "lucide-react";
 import { useUpdater } from "@/hooks/useUpdater";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -9,6 +10,8 @@ import { LocalImage } from "./LocalImage";
 
 export function Settings() {
   const [settings, setSettings] = useState<SettingsType | null>(null);
+  // As last loaded or saved; a save sends only what differs from it.
+  const [savedSettings, setSavedSettings] = useState<SettingsType | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -50,6 +53,7 @@ export function Settings() {
         getAppDataDir(),
       ]);
       setSettings(loadedSettings);
+      setSavedSettings(loadedSettings);
       setAppDataDir(dataDir);
     } catch (err) {
       console.error("Failed to load settings:", err);
@@ -93,6 +97,7 @@ export function Settings() {
       if (status.is_authenticated) {
         loadPlaylists();
       }
+      await reloadSignIn();
     } catch (err) {
       console.error("Failed to sign in to YouTube:", err);
       setYoutubeError(err instanceof Error ? err.message : String(err));
@@ -106,6 +111,7 @@ export function Settings() {
       setYoutubeLoading(true);
       await youtubeSignOut();
       setYoutubeAuth({ is_authenticated: false, channel_name: null, channel_id: null });
+      await reloadSignIn();
     } catch (err) {
       console.error("Failed to sign out of YouTube:", err);
     } finally {
@@ -113,18 +119,44 @@ export function Settings() {
     }
   }
 
+  // Sign-in changed on the backend: refresh what's shown about it without
+  // dropping unsaved edits.
+  async function reloadSignIn() {
+    try {
+      const fresh = await getSettings();
+      const signIn = {
+        youtube_signed_in: fresh.youtube_signed_in,
+        youtube_channel_name: fresh.youtube_channel_name,
+      };
+      setSavedSettings((s) => (s ? { ...s, ...signIn } : fresh));
+      setSettings((s) => (s ? { ...s, ...signIn } : fresh));
+    } catch (err) {
+      console.error("Failed to reload settings:", err);
+    }
+  }
+
   async function handleSave() {
-    if (!settings) return;
+    if (!settings || !savedSettings) return;
 
     try {
       setSaving(true);
       setSaveError(null);
-      await saveSettings(settings);
+      const updated = await saveSettings(settingsPatch(savedSettings, settings));
+      setSavedSettings(updated);
+      setSettings(updated);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       console.error("Failed to save settings:", err);
       setSaveError(errorMessage(err, "Failed to save settings"));
+      // A refused folder change was put back; show what's really in effect.
+      try {
+        const current = await getSettings();
+        setSavedSettings(current);
+        setSettings((s) => (s ? { ...s, output_folder: current.output_folder } : current));
+      } catch {
+        // Keep the edits on screen.
+      }
     } finally {
       setSaving(false);
     }

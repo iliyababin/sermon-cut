@@ -1,5 +1,5 @@
 use crate::library::commands::LibraryHandle;
-use crate::state::{AppState, Settings, VideoInfo};
+use crate::state::{AppState, Settings, SettingsPatch, SettingsView, VideoInfo};
 use crate::youtube_dl;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,27 +26,89 @@ pub async fn get_video_info(url: String) -> Result<VideoInfo, String> {
 }
 
 #[tauri::command]
-pub async fn get_settings(state: State<'_, AppStateHandle>) -> Result<Settings, String> {
-    let state = state.lock().await;
-    Ok(state.settings.clone())
+pub async fn get_settings(state: State<'_, AppStateHandle>) -> Result<SettingsView, String> {
+    Ok(state.lock().await.settings.view())
 }
 
+/// Apply the edited settings. `seq` increases with every save the webview
+/// makes; a save older than one already applied is ignored. Returns the
+/// settings as they now are.
 #[tauri::command]
 pub async fn save_settings(
     state: State<'_, AppStateHandle>,
     lib: State<'_, LibraryHandle>,
     app_handle: AppHandle,
-    settings: Settings,
-) -> Result<(), String> {
-    // Switching folders fails while anything is running; keep the old settings then.
-    lib.switch(settings.library_folder()).await?;
+    patch: SettingsPatch,
+    seq: u64,
+) -> Result<SettingsView, String> {
+    let library = lib.inner().clone();
+    let result = apply_settings_patch(
+        &state,
+        patch,
+        seq,
+        |folder| lib.check_switch(folder),
+        |folder| async move { library.switch(folder).await },
+    )
+    .await;
+    let settings = state.lock().await.settings.clone();
     allow_user_paths(&app_handle, lib.root().as_deref(), &settings);
-    let mut state = state.lock().await;
-    state.settings = settings;
-    state.save()?;
-    drop(state);
     let _ = tauri::Emitter::emit(&app_handle, "library-changed", ());
-    Ok(())
+    result
+}
+
+/// The settings save, apart from Tauri. A new library folder is checked
+/// first, saved, and only then switched to; if the switch fails the old
+/// folder is saved back, so state.json never points at a folder the app
+/// isn't using.
+pub async fn apply_settings_patch<C, S, F>(
+    state: &AppStateHandle,
+    patch: SettingsPatch,
+    seq: u64,
+    check_switch: C,
+    switch: S,
+) -> Result<SettingsView, String>
+where
+    C: FnOnce(&str) -> Result<(), String>,
+    S: FnOnce(String) -> F,
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    let (old_folder, new_folder) = {
+        let mut s = state.lock().await;
+        if seq <= s.settings_seq {
+            return Ok(s.settings.view());
+        }
+        s.settings_seq = seq;
+
+        let mut next = s.settings.clone();
+        next.apply(&patch);
+        let new_folder = patch
+            .output_folder
+            .as_ref()
+            .map(|f| f.trim().to_string())
+            .filter(|f| *f != s.settings.output_folder);
+        if let Some(folder) = &new_folder {
+            next.output_folder = folder.clone();
+            check_switch(&next.library_folder())?;
+        }
+        let previous = std::mem::replace(&mut s.settings, next);
+        if let Err(e) = s.save() {
+            s.settings = previous;
+            return Err(e);
+        }
+        (previous.output_folder, new_folder.map(|_| s.settings.library_folder()))
+    };
+
+    if let Some(target) = new_folder {
+        if let Err(e) = switch(target).await {
+            let mut s = state.lock().await;
+            s.settings.output_folder = old_folder;
+            if let Err(save_err) = s.save() {
+                eprintln!("[settings] Failed to restore the library folder: {}", save_err);
+            }
+            return Err(e);
+        }
+    }
+    Ok(state.lock().await.settings.view())
 }
 
 /// Reset settings to their defaults (signs out of YouTube). Never touches
@@ -62,7 +124,10 @@ pub async fn reset_state(
     allow_user_paths(&app_handle, lib.root().as_deref(), &settings);
     let mut state = state.lock().await;
     state.settings = settings;
-    state.save()
+    let result = state.save();
+    drop(state);
+    let _ = tauri::Emitter::emit(&app_handle, "library-changed", ());
+    result
 }
 
 #[tauri::command]
@@ -369,4 +434,98 @@ pub async fn copy_file(source: String, destination: String) -> Result<(), String
     std::fs::copy(&source, &destination)
         .map_err(|e| format!("Failed to copy {} to {}: {}", source, destination, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::YouTubeAuth;
+
+    fn state_with_auth() -> AppStateHandle {
+        let mut s = AppState::default();
+        s.settings.output_folder = "/old".into();
+        s.settings.upload_privacy = "private".into();
+        s.settings.youtube_auth = Some(YouTubeAuth {
+            refresh_token: Some("r".into()),
+            ..Default::default()
+        });
+        Arc::new(Mutex::new(s))
+    }
+
+    fn patch(json: serde_json::Value) -> SettingsPatch {
+        serde_json::from_value(json).unwrap()
+    }
+
+    async fn ok_switch(_: String) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn patch_keeps_sign_in() {
+        let state = state_with_auth();
+        let view = apply_settings_patch(&state, patch(serde_json::json!({"download_quality": "720p"})), 1, |_| Ok(()), ok_switch)
+            .await
+            .unwrap();
+        assert_eq!(view.download_quality, "720p");
+        assert!(view.youtube_signed_in);
+        let s = state.lock().await;
+        assert!(s.settings.youtube_auth.is_some());
+        assert_eq!(s.settings.upload_privacy, "private");
+    }
+
+    #[tokio::test]
+    async fn stale_seq_is_ignored() {
+        let state = state_with_auth();
+        apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "new"})), 5, |_| Ok(()), ok_switch)
+            .await
+            .unwrap();
+        let view = apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "old"})), 4, |_| Ok(()), ok_switch)
+            .await
+            .unwrap();
+        assert_eq!(view.modal_api_url, "new");
+        assert_eq!(state.lock().await.settings.modal_api_url, "new");
+    }
+
+    #[tokio::test]
+    async fn failed_switch_restores_the_folder() {
+        let state = state_with_auth();
+        let seen = std::sync::Mutex::new(None::<String>);
+        let err = apply_settings_patch(
+            &state,
+            patch(serde_json::json!({"output_folder": "/new", "download_quality": "480p"})),
+            1,
+            |_| Ok(()),
+            |folder| {
+                // The new folder was saved before switching.
+                *seen.lock().unwrap() = Some(folder);
+                async { Err("busy".to_string()) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "busy");
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("/new"));
+        let s = state.lock().await;
+        assert_eq!(s.settings.output_folder, "/old");
+        // Other edits in the same save still apply.
+        assert_eq!(s.settings.download_quality, "480p");
+    }
+
+    #[tokio::test]
+    async fn refused_switch_saves_nothing() {
+        let state = state_with_auth();
+        let err = apply_settings_patch(
+            &state,
+            patch(serde_json::json!({"output_folder": "/new", "download_quality": "480p"})),
+            1,
+            |_| Err("wait".to_string()),
+            |_| async { panic!("must not switch") },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "wait");
+        let s = state.lock().await;
+        assert_eq!(s.settings.output_folder, "/old");
+        assert_eq!(s.settings.download_quality, "best");
+    }
 }

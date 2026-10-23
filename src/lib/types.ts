@@ -141,28 +141,36 @@ export interface TranscriptionResult {
   suggested_chapters: Chapter[] | null;
 }
 
-export interface YouTubeAuth {
-  access_token: string | null;
-  refresh_token: string | null;
-  expires_at: number | null;
-  channel_name: string | null;
-  channel_id: string | null;
-}
-
 export interface YouTubeAuthStatus {
   is_authenticated: boolean;
   channel_name: string | null;
   channel_id: string | null;
 }
 
+export type UploadPrivacy = "public" | "unlisted" | "private";
+
+/** Settings as the app shows them. Sign-in tokens never leave the backend. */
 export interface Settings {
   download_quality: string;
   output_folder: string;
   modal_api_url: string;
   modal_api_key: string | null;
   logo_path: string | null;
-  youtube_auth: YouTubeAuth | null;
   youtube_playlist_id: string | null;
+  upload_privacy: UploadPrivacy;
+  youtube_signed_in: boolean;
+  youtube_channel_name: string | null;
+}
+
+/** The settings a save may change. Absent fields are left alone; for the
+ * optional ones an empty string clears them. */
+export interface SettingsPatch {
+  download_quality?: string;
+  output_folder?: string;
+  modal_api_url?: string;
+  modal_api_key?: string;
+  logo_path?: string;
+  youtube_playlist_id?: string;
 }
 
 export interface PlaylistInfo {

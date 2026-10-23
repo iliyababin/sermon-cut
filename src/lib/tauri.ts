@@ -231,6 +231,10 @@ export async function youtubeUploadVideo(
 export const UPLOAD_CHECK_FAILED =
   "Couldn't check the earlier upload with YouTube, so nothing was sent. Check the internet connection and try again.";
 
+/** YouTube has the whole video but didn't finish the upload; the attempt
+ * is kept, and can be forgotten (UploadError::Unfinished). */
+export const UPLOAD_UNFINISHED = "YouTube has the whole video but hasn't finished the upload. Try again in a few minutes.";
+
 /** Forget the video's earlier upload attempt, so the next upload starts a
  * new one (it may duplicate the earlier upload if that had finished). */
 export async function forgetUploadSession(videoId: string): Promise<void> {

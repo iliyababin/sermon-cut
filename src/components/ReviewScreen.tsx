@@ -234,7 +234,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     dispatch,
     phase,
     handleUpload,
-    checkFailures,
+    canForgetEarlier,
     forgetError,
     setForgetError,
     handleForgetEarlier,
@@ -395,7 +395,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         updatingMetadata={updatingMetadata}
         metadataNotice={metadataNotice}
         handleUpdateMetadata={handleUpdateMetadata}
-        checkFailures={checkFailures}
+        canForgetEarlier={canForgetEarlier}
         handleForgetEarlier={handleForgetEarlier}
         trimmedHere={trimmedHere}
         trimPanel={trimPanel}

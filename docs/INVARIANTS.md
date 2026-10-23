@@ -49,12 +49,14 @@ this file in the same commit and say why.
 ## Uploads
 
 8. An upload session is discarded only on a definite answer from YouTube
-   (308 with a mismatch, 404, 410). Errors, timeouts and unknown answers keep
+   (308 with a mismatch, 404, 410, or a 308 with every byte but no video
+   when settled, asked twice: a broken session). Errors, timeouts and unknown answers keep
    it. A finished session (200/201) is recorded, never re-uploaded. The one
    exception is a session URI that isn't YouTube's upload server
    (`UploadSession::is_trusted`): it is dropped without being contacted.
    The other is the user's choice: when the check keeps failing (e.g. the
-   session is another account's), the review offers "Forget the earlier
+   session is another account's), or YouTube has every byte but didn't
+   finish (`UploadError::Unfinished`), the review offers "Forget the earlier
    upload attempt" after a warning that it may make a duplicate
    (`Library::forget_upload_session`).
 9. Sessions are settled in one place: when the next upload begins

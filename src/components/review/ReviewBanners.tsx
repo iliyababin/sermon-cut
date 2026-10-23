@@ -16,7 +16,7 @@ interface ReviewBannersProps {
   updatingMetadata: boolean;
   metadataNotice: string | null;
   handleUpdateMetadata: () => void;
-  checkFailures: number;
+  canForgetEarlier: boolean;
   handleForgetEarlier: () => void;
   trimmedHere: boolean;
   trimPanel: RefObject<HTMLDivElement | null>;
@@ -41,7 +41,7 @@ export function ReviewBanners({
   updatingMetadata,
   metadataNotice,
   handleUpdateMetadata,
-  checkFailures,
+  canForgetEarlier,
   handleForgetEarlier,
   trimmedHere,
   trimPanel,
@@ -161,7 +161,7 @@ export function ReviewBanners({
             <span className="text-destructive">{phase.message}</span>
           </div>
           <div className="flex items-center gap-2">
-            {checkFailures >= 2 && (
+            {canForgetEarlier && (
               <button
                 onClick={handleForgetEarlier}
                 disabled={!uploadReady}

@@ -32,6 +32,12 @@ pub enum UploadError {
     /// A stored session couldn't be checked with YouTube (offline, a server
     /// error, a 401 after a refresh). It is kept and nothing was sent.
     CheckFailed(String),
+    /// YouTube has every byte of this upload but didn't finish it, even when
+    /// asked again. The session is kept: the next upload asks once more.
+    Unfinished,
+    /// A stored session still had every byte but no video when the next
+    /// upload asked (twice): it's broken, and was dropped.
+    NeverFinished,
     /// Reading the video or thumbnail failed.
     File(String),
     /// YouTube answered something the app doesn't understand.
@@ -52,6 +58,8 @@ impl std::fmt::Display for UploadError {
             UploadError::Cancelled => write!(f, "cancelled"),
             UploadError::CancelledMaybeFinished => write!(f, "cancelled; it may have finished"),
             UploadError::CheckFailed(e) => write!(f, "couldn't check the earlier upload: {}", e),
+            UploadError::Unfinished => write!(f, "the server has the whole file but didn't finish the upload"),
+            UploadError::NeverFinished => write!(f, "the stored session has the whole file but never finished"),
             UploadError::File(e) => write!(f, "file: {}", e),
             UploadError::Protocol(e) => write!(f, "protocol: {}", e),
             UploadError::Other(e) => write!(f, "{}", e),
@@ -64,6 +72,10 @@ pub const CANCELLED_MAYBE_FINISHED: &str =
     "Upload cancelled, but it may have finished just before. Uploading again checks with YouTube first.";
 pub const CHECK_FAILED: &str =
     "Couldn't check the earlier upload with YouTube, so nothing was sent. Check the internet connection and try again.";
+pub const UNFINISHED: &str =
+    "YouTube has the whole video but hasn't finished the upload. Try again in a few minutes.";
+pub const NEVER_FINISHED: &str =
+    "YouTube had the whole video from an earlier attempt but never finished it, so that attempt was dropped. Check YouTube Studio for it; uploading again starts a new upload.";
 pub const SIGN_IN_AGAIN: &str = "Please sign in to YouTube again (Settings → YouTube).";
 
 /// The `reason` of the first error in a Google API error body, or the
@@ -155,6 +167,8 @@ impl UploadError {
             UploadError::Cancelled => CANCELLED_MESSAGE.into(),
             UploadError::CancelledMaybeFinished => CANCELLED_MAYBE_FINISHED.into(),
             UploadError::CheckFailed(_) => CHECK_FAILED.into(),
+            UploadError::Unfinished => UNFINISHED.into(),
+            UploadError::NeverFinished => NEVER_FINISHED.into(),
             UploadError::File(e) => format!("Couldn't read the file: {}", e),
             UploadError::Protocol(e) => format!("Unexpected reply from YouTube: {}", e),
             UploadError::Other(e) => e.clone(),
@@ -181,7 +195,7 @@ mod tests {
     fn the_webview_knows_the_messages_it_acts_on() {
         // src/lib/tauri.ts compares errors with these.
         let ts = include_str!("../../../src/lib/tauri.ts");
-        for message in [CHECK_FAILED, CANCELLED_MAYBE_FINISHED] {
+        for message in [CHECK_FAILED, CANCELLED_MAYBE_FINISHED, UNFINISHED] {
             assert!(ts.contains(&format!("\"{}\"", message)), "{message}");
         }
     }

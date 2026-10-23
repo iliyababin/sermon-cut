@@ -8,6 +8,7 @@ import {
   UPLOAD_CANCELLED,
   UPLOAD_CANCELLED_MAYBE_FINISHED,
   UPLOAD_CHECK_FAILED,
+  UPLOAD_UNFINISHED,
   youtubeUpdateMetadata,
   youtubeUploadVideo,
 } from "@/lib/tauri";
@@ -178,16 +179,22 @@ export function useUpload({
   const handleUpload = () => dispatch({ type: "upload", ready: uploadReady });
 
   // The earlier upload attempt can't be checked with YouTube, again and
-  // again (e.g. it was made from another account): offer to forget it.
+  // again (e.g. it was made from another account), or YouTube has all of
+  // it but didn't finish it: offer to forget it.
   const [checkFailures, setCheckFailures] = useState(0);
   useEffect(() => {
     if (phase.kind === "error") setCheckFailures((n) => (phase.message === UPLOAD_CHECK_FAILED ? n + 1 : 0));
     else if (phase.kind === "done") setCheckFailures(0);
   }, [phase]);
+  const unfinished = phase.kind === "error" && phase.message === UPLOAD_UNFINISHED;
+  const canForgetEarlier = checkFailures >= 2 || unfinished;
   const [forgetError, setForgetError] = useState<string | null>(null);
   const handleForgetEarlier = async () => {
+    const why = unfinished
+      ? "YouTube has the whole video from the earlier upload attempt but hasn't finished it."
+      : "Sermon Cut couldn't check the earlier upload attempt with YouTube (for example, it was made while signed in to another account).";
     const yes = await ask(
-      "Sermon Cut couldn't check the earlier upload attempt with YouTube (for example, it was made while signed in to another account).\n\nForget it and start a new upload? If that earlier upload did finish, this makes a second, duplicate video on YouTube.",
+      `${why}\n\nForget it and start a new upload? If that earlier upload did finish, this makes a second, duplicate video on YouTube.`,
       { title: "Forget the earlier upload attempt", kind: "warning", okLabel: "Forget and Upload Anew", cancelLabel: "Cancel" }
     );
     if (!yes) return;
@@ -232,7 +239,7 @@ export function useUpload({
     dispatch,
     phase,
     handleUpload,
-    checkFailures,
+    canForgetEarlier,
     forgetError,
     setForgetError,
     handleForgetEarlier,

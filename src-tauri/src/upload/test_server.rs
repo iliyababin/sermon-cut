@@ -49,6 +49,8 @@ pub struct Session {
     pub size: u64,
     pub data: Vec<u8>,
     pub video_id: String,
+    /// Has every byte but never makes the video: 308 instead of 200.
+    pub stuck: bool,
 }
 
 pub struct MockState {
@@ -81,6 +83,8 @@ pub struct MockState {
     /// Chunks that stalled mid-body (StallMidBody) once their first bytes
     /// were read.
     pub mid_body_stalls: u32,
+    /// Sessions created from now on are `stuck`.
+    pub stick_new_sessions: bool,
 }
 
 #[derive(Clone)]
@@ -125,6 +129,7 @@ impl MockServer {
             video_updates: Vec::new(),
             videos_status: 200,
             mid_body_stalls: 0,
+            stick_new_sessions: false,
         }));
         let server = MockServer { base, state, changed: Arc::new(tokio::sync::Notify::new()) };
         let s = server.clone();
@@ -168,7 +173,7 @@ impl MockServer {
             let id = format!("s{}", s.creates);
             s.sessions.insert(
                 id.clone(),
-                Session { size: data.len() as u64, data: data[..stored].to_vec(), video_id: video_id.into() },
+                Session { size: data.len() as u64, data: data[..stored].to_vec(), video_id: video_id.into(), stuck: false },
             );
             format!("{}/session/{}", s.base, id)
         })
@@ -249,7 +254,8 @@ impl MockServer {
                 s.content_types.push(req.headers.get("x-upload-content-type").cloned().unwrap_or_default());
                 let id = format!("s{}", s.creates);
                 let video_id = format!("vid{}", s.creates);
-                s.sessions.insert(id.clone(), Session { size, data: Vec::new(), video_id });
+                let stuck = s.stick_new_sessions;
+                s.sessions.insert(id.clone(), Session { size, data: Vec::new(), video_id, stuck });
                 Reply::Send(200, vec![("Location".into(), format!("{}/session/{}", s.base, id))], Vec::new())
             }
             ("PUT", p) if p.starts_with("/session/") => {
@@ -354,7 +360,7 @@ fn chunk_start(req: &Request) -> Option<u64> {
 
 /// 200 with the video when complete, else 308 with what's stored.
 fn session_state(sess: &Session) -> Reply {
-    if sess.data.len() as u64 == sess.size {
+    if sess.data.len() as u64 == sess.size && !sess.stuck {
         return json(200, &format!(r#"{{"id":"{}","snippet":{{"title":"t"}}}}"#, sess.video_id));
     }
     let headers = if sess.data.is_empty() {

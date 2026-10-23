@@ -195,6 +195,7 @@ impl Uploader<'_> {
 
         let mut failures = 0u32;
         let mut refreshed = false;
+        let mut asked_again = false;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(UploadError::Cancelled);
@@ -228,7 +229,12 @@ impl Uploader<'_> {
                     return Ok(Uploaded { video_id: id, earlier: None, before_cancel: false });
                 }
                 Ok(Step::Resume(n)) if n >= size => {
-                    return Err(UploadError::Protocol("YouTube has the whole file but didn't finish the upload".into()));
+                    // Every byte is there but no video: ask once more.
+                    if asked_again {
+                        return Err(UploadError::Unfinished);
+                    }
+                    asked_again = true;
+                    offset = None;
                 }
                 Ok(Step::Resume(n)) if sending && n <= confirmed => {
                     // A chunk went and nothing more was kept: a failure,
@@ -295,6 +301,9 @@ impl Uploader<'_> {
     /// - finished (200/201): record it; if it was for another file or other
     ///   metadata, say so instead of uploading;
     /// - 308: continue it if it's for this upload, otherwise drop it;
+    /// - 308 with every byte (asked twice): broken, so drop it, and fail
+    ///   with `NeverFinished` if it was this upload's (never a zero-length
+    ///   resume);
     /// - gone (404/410): drop it.
     ///
     /// Anything else (offline, server errors, a 401 after a refresh) keeps
@@ -316,6 +325,7 @@ impl Uploader<'_> {
         let matches = stored.reusable_for(current.file_hash, current.size, current.metadata_hash, chrono::Utc::now());
         let mut failures = 0u32;
         let mut refreshed = false;
+        let mut asked_again = false;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(UploadError::Cancelled);
@@ -330,6 +340,12 @@ impl Uploader<'_> {
                         println!("[upload] An earlier upload had finished: {}", id);
                     }
                     return Ok(Settled::Finished(Uploaded { video_id: id, earlier, before_cancel: false }));
+                }
+                Ok(Step::Resume(n)) if n >= stored.size && !asked_again => asked_again = true,
+                Ok(Step::Resume(n)) if n >= stored.size => {
+                    println!("[upload] Dropping a stored session that has every byte but never finished");
+                    store.save(None);
+                    return if matches { Err(UploadError::NeverFinished) } else { Ok(Settled::Fresh) };
                 }
                 Ok(Step::Resume(n)) if matches => return Ok(Settled::Resume(stored, n)),
                 Ok(Step::Resume(_)) => {

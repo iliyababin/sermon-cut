@@ -19,7 +19,7 @@ vi.mock("./ThumbnailEditor", () => ({ ThumbnailEditor: () => null }));
 
 import { ReviewScreen } from "./ReviewScreen";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { UPLOAD_CHECK_FAILED } from "@/lib/tauri";
+import { UPLOAD_CHECK_FAILED, UPLOAD_UNFINISHED } from "@/lib/tauri";
 
 const TITLE = "The Hope We Have";
 const PREACHER = "Pastor X";
@@ -173,6 +173,21 @@ describe("ReviewScreen", () => {
     expect(headers.headers["x-render-key"]).toBe(
       renderKey(options[0], { title: TITLE, preacher: PREACHER, singleLine: false, logo: "/me/logo.png" })
     );
+  });
+
+  it("offers to forget an upload YouTube has all of but didn't finish", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "youtube_upload_video" ? Promise.reject(UPLOAD_UNFINISHED) : base(cmd, args)
+    );
+    vi.mocked(ask).mockClear();
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    // Offered at once: asking again won't make YouTube finish it.
+    fireEvent.click(await screen.findByRole("button", { name: "Forget the earlier upload attempt" }));
+    await waitFor(() => expect(calls("forget_upload_session")).toHaveLength(1));
+    const warning = vi.mocked(ask).mock.calls.find(([text]) => String(text).includes("hasn't finished"));
+    expect(warning).toBeTruthy();
   });
 
   it("offers to forget an earlier upload attempt that keeps failing its check", async () => {

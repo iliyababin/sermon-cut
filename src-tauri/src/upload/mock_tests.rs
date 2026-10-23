@@ -458,6 +458,42 @@ async fn a_gone_session_is_dropped() {
     }
 }
 
+/// YouTube has every byte but never makes the video: asked once more, the
+/// upload fails and keeps the session; the next upload asks twice, then
+/// drops it, never sending a zero-length chunk. The one after starts anew.
+#[tokio::test]
+async fn a_session_that_has_everything_but_never_finishes_is_dropped() {
+    let h = Harness::new().await;
+    h.server.with(|s| s.stick_new_sessions = true);
+    let err = h.upload().await.unwrap_err();
+    assert_eq!(err, UploadError::Unfinished);
+    assert_eq!(err.user_message(), error::UNFINISHED);
+    assert!(h.store.load().is_some(), "kept for the next upload to check");
+    let (puts, queries) = h.server.with(|s| (s.chunk_puts, s.queries));
+    assert_eq!((puts, queries), (4, 1));
+
+    let err = h.upload().await.unwrap_err();
+    assert_eq!(err, UploadError::NeverFinished);
+    assert_eq!(h.store.load(), None, "dropped");
+    assert_eq!(h.server.with(|s| (s.chunk_puts, s.queries, s.creates)), (puts, queries + 2, 1), "nothing sent");
+
+    h.server.with(|s| s.stick_new_sessions = false);
+    assert_eq!(h.upload().await.unwrap(), "vid2");
+}
+
+/// A stored session for something else that has every byte is dropped
+/// the same way, and a fresh upload goes ahead.
+#[tokio::test]
+async fn a_stuck_session_for_something_else_is_dropped_for_a_fresh_one() {
+    let h = Harness::new().await;
+    let uri = h.server.add_session(&h.data, h.data.len(), "vidA");
+    h.server.with(|s| s.sessions.get_mut("s1").unwrap().stuck = true);
+    let s = h.matching_session(uri);
+    h.store.save(Some(&UploadSession { metadata_hash: "old title".into(), ..s }));
+    assert_eq!(h.upload().await.unwrap(), "vid2");
+    assert_eq!(h.server.with(|s| s.queries), 2);
+}
+
 #[tokio::test]
 async fn an_unanswered_check_keeps_the_session_and_sends_nothing() {
     // Server errors, then a 401 that a refresh doesn't fix.

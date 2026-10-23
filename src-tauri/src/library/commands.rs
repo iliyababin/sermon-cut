@@ -6,7 +6,7 @@ use crate::upload::client::{video_metadata, VideoUpload};
 use crate::upload::{self, AfterUpload, Thumbnail, TokenSource, UploadConfig, UploadError, UploadOutcome, UploadWarning};
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::thumbnail::CropRect;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
@@ -538,15 +538,80 @@ pub async fn check_library_folder(path: String) -> Result<Vec<String>, String> {
     Ok(folder_warnings(Path::new(&path), dirs::home_dir().as_deref()))
 }
 
-pub fn folder_warnings(path: &Path, home: Option<&Path>) -> Vec<String> {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut warnings = Vec::new();
-    let under = |rel: &str| home.is_some_and(|h| path.starts_with(h.join(rel)));
+/// Shown in Settings for iCloud Drive, Dropbox, Google Drive and OneDrive.
+pub const CLOUD_WARNING: &str = "Cloud folders can offload videos to save space — keep this folder downloaded (in Finder, choose “Keep Downloaded”). Two computers using it at once can also create conflicting copies of the library's tracking file.";
 
-    if under("Library/Mobile Documents") {
-        warnings.push("This is in iCloud Drive. iCloud can swap videos for online-only placeholders and create conflicting copies of the library's tracking file. A local folder such as Movies is safer.".into());
-    } else if under("Library/CloudStorage") || under("Dropbox") || under("Google Drive") || under("OneDrive") {
-        warnings.push("This is a cloud folder (Dropbox, Google Drive or OneDrive). Videos may be online-only placeholders until they download, and two computers using it at once can create conflicting copies.".into());
+/// Why a folder can't become the library, if it can't. Only for a newly
+/// chosen folder: a library already set up somewhere refused here keeps
+/// opening. `app_dirs` are the app's own folders (settings, tools), which
+/// the library may neither be inside nor contain.
+pub fn library_folder_refusal(folder: &Path, home: Option<&Path>, app_dirs: &[PathBuf]) -> Option<String> {
+    let Some(path) = super::fsutil::resolve(folder) else {
+        return Some("Choose the library folder with Change…, or type its full path (such as /Users/you/Movies/Sermon Cut).".into());
+    };
+    let whole = |what: &str| {
+        Some(format!(
+            "{} can't be the library folder: Sermon Cut would treat everything in it as its own. Choose or make a folder inside it, such as Movies/Sermon Cut.",
+            what
+        ))
+    };
+    let system = |what: &str| Some(format!("{} belongs to macOS or its apps and can't hold the library. Choose a folder such as Movies/Sermon Cut.", what));
+    let is = |p: &str| path == Path::new(p);
+    if is("/") {
+        return whole("The whole disk");
+    }
+    if is("/Volumes") {
+        return whole("/Volumes (every connected drive)");
+    }
+    if is("/Users") {
+        return whole("/Users (every account's home folder)");
+    }
+    if path.starts_with("/System") || path.starts_with("/Applications") {
+        return system(&path.display().to_string());
+    }
+    for dir in app_dirs.iter().filter_map(|d| super::fsutil::resolve(d)) {
+        if path.starts_with(&dir) || dir.starts_with(&path) {
+            return Some(format!(
+                "{} holds Sermon Cut's own settings or tools, so it can't be the library folder. Choose a folder such as Movies/Sermon Cut.",
+                path.display()
+            ));
+        }
+    }
+    if let Some(home) = home.and_then(super::fsutil::resolve) {
+        if path == home {
+            return whole("Your home folder");
+        }
+        let library = home.join("Library");
+        // iCloud Drive, Dropbox, Google Drive…: a folder inside one is fine
+        // (with a warning), the cloud folder list itself isn't.
+        let in_cloud = ["CloudStorage", "Mobile Documents"]
+            .iter()
+            .any(|c| path.strip_prefix(library.join(c)).is_ok_and(|rest| rest.components().next().is_some()));
+        if path.starts_with(&library) && !in_cloud {
+            return system("Your Library folder");
+        }
+    }
+    None
+}
+
+/// `library_folder_refusal` with this Mac's folders, as an error.
+pub fn check_new_library_folder(folder: &str) -> Result<(), String> {
+    let mut app_dirs = vec![crate::state::state_dir()];
+    app_dirs.extend(crate::tools::tools_dir());
+    match library_folder_refusal(Path::new(folder), dirs::home_dir().as_deref(), &app_dirs) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+pub fn folder_warnings(path: &Path, home: Option<&Path>) -> Vec<String> {
+    let path = super::fsutil::resolve(path).unwrap_or_else(|| path.to_path_buf());
+    let home = home.map(|h| super::fsutil::resolve(h).unwrap_or_else(|| h.to_path_buf()));
+    let mut warnings = Vec::new();
+    let under = |rel: &str| home.as_ref().is_some_and(|h| path.starts_with(h.join(rel)));
+
+    if under("Library/Mobile Documents") || under("Library/CloudStorage") || under("Dropbox") || under("Google Drive") || under("OneDrive") {
+        warnings.push(CLOUD_WARNING.into());
     }
     if cfg!(target_os = "macos") && (under("Desktop") || under("Documents") || under("Downloads")) {
         warnings.push("macOS asks permission before apps can use Desktop, Documents or Downloads, and may ask again after each Sermon Cut update. Movies doesn't have this problem.".into());
@@ -612,6 +677,66 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn new_library_folders_follow_the_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let lib = home.join("Library");
+        let state = lib.join("Application Support/sermon-cut");
+        let tools = lib.join("Application Support/com.youthscc.sermon-cut/bin");
+        for d in [&state, &tools, &home.join("Movies"), &lib.join("CloudStorage/Dropbox"), &lib.join("Mobile Documents/com~apple~CloudDocs")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let app_dirs = vec![state.clone(), tools.clone()];
+        let refused = |p: &Path| library_folder_refusal(p, Some(&home), &app_dirs);
+
+        for bad in [
+            PathBuf::from("/"),
+            PathBuf::from("/Volumes"),
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Library"),
+            PathBuf::from("/Applications"),
+            PathBuf::from("/Applications/Sermon Cut.app"),
+            home.clone(),
+            lib.clone(),
+            lib.join("Caches/x"),
+            lib.join("CloudStorage"),
+            lib.join("Mobile Documents"),
+            state.clone(),
+            state.join("library"),
+            tools.parent().unwrap().to_path_buf(),
+            PathBuf::from("relative/folder"),
+        ] {
+            assert!(refused(&bad).is_some(), "{} should be refused", bad.display());
+        }
+        for good in [
+            home.join("Movies/Sermon Cut"),
+            home.join("Movies"),
+            PathBuf::from("/Volumes/USB"),
+            PathBuf::from("/Volumes/USB/Sermons"),
+            lib.join("CloudStorage/Dropbox/Sermons"),
+            lib.join("CloudStorage/Dropbox"),
+            lib.join("Mobile Documents/com~apple~CloudDocs/Sermons"),
+        ] {
+            assert_eq!(refused(&good), None, "{} should be allowed", good.display());
+        }
+        // Allowed cloud folders come with the warning.
+        let warnings = folder_warnings(&lib.join("CloudStorage/Dropbox/Sermons"), Some(&home));
+        assert_eq!(warnings, vec![CLOUD_WARNING.to_string()]);
+    }
+
+    #[test]
+    fn a_library_set_up_in_a_now_refused_folder_still_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(library_folder_refusal(&home, Some(&home), &[]).is_some());
+        let lib = Library::new(home.to_string_lossy().to_string());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(lib.reopen()).unwrap();
+        let view = lib.view(vec![]);
+        assert!(view.available && view.writable, "{:?}", view.message);
+    }
 
     #[test]
     fn warns_about_risky_folders() {

@@ -167,6 +167,9 @@ where
             .filter(|f| *f != s.settings.output_folder);
         if let Some(folder) = &new_folder {
             next.output_folder = folder.clone();
+            // Only a newly chosen folder is checked: one already in use
+            // keeps opening whatever the rules say now.
+            crate::library::commands::check_new_library_folder(&next.library_folder())?;
             check_switch(&next.library_folder())?;
         }
         let previous = std::mem::replace(&mut s.settings, next);
@@ -235,21 +238,45 @@ pub async fn read_image_base64(
     use base64::Engine;
     let path = check_path(&app_handle, &lib, &path, Access::Data)?;
 
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("Failed to read image: {}", e))?;
-
+    let bytes = crate::library::fsutil::read_limited(&path, MAX_IMAGE_BYTES).map_err(|e| match e {
+        crate::library::fsutil::ReadJsonError::TooLarge => "The image is too large (over 50 MB)".to_string(),
+        e => format!("Failed to read image: {}", e),
+    })?;
+    let mime = image_mime(&bytes).ok_or("That file isn't a JPEG, PNG, WebP, GIF or HEIC image")?;
     let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-    // Detect mime type from extension
-    let mime = if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".gif") {
-        "image/gif"
-    } else {
-        "image/jpeg"
-    };
-
     Ok(format!("data:{};base64,{}", mime, base64))
+}
+
+/// Largest image read for the webview.
+const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// An image's MIME type from its first bytes (never its name): JPEG, PNG,
+/// WebP, GIF or HEIC/HEIF. None for anything else.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        const HEIC: [&[u8; 4]; 6] = [b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"];
+        const HEIF: [&[u8; 4]; 2] = [b"mif1", b"msf1"];
+        let brand: &[u8; 4] = bytes[8..12].try_into().ok()?;
+        if HEIC.contains(&brand) {
+            return Some("image/heic");
+        }
+        if HEIF.contains(&brand) {
+            return Some("image/heif");
+        }
+    }
+    None
 }
 
 #[tauri::command]
@@ -774,6 +801,21 @@ mod tests {
     }
 
     #[test]
+    fn image_types_come_from_their_bytes() {
+        assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), Some("image/png"));
+        assert_eq!(image_mime(b"GIF89a\x01\0"), Some("image/gif"));
+        assert_eq!(image_mime(b"RIFF\x24\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(image_mime(b"\0\0\0\x18ftypheic\0\0\0\0"), Some("image/heic"));
+        assert_eq!(image_mime(b"\0\0\0\x18ftypmif1\0\0\0\0"), Some("image/heif"));
+        // A video, a text file or nothing at all isn't an image.
+        assert_eq!(image_mime(b"\0\0\0\x18ftypisom\0\0\0\0"), None);
+        assert_eq!(image_mime(b"{\"refresh_token\": \"x\"}"), None);
+        assert_eq!(image_mime(b"RIFF\x24\0\0\0WAVEfmt "), None);
+        assert_eq!(image_mime(b""), None);
+    }
+
+    #[test]
     fn the_checked_path_is_the_resolved_one() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("lib");
@@ -955,5 +997,30 @@ mod tests {
         let s = state.lock().await;
         assert_eq!(s.settings.output_folder, "/old");
         assert_eq!(s.settings.download_quality, "best");
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_folder_is_not_saved_but_a_refused_current_one_is_kept() {
+        let state = state_with_auth();
+        let err = apply_settings_patch(
+            &state,
+            patch(serde_json::json!({"output_folder": "/"})),
+            "e",
+            1,
+            |_| Ok(()),
+            |_| async { panic!("must not switch") },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("can't be the library folder"), "{err}");
+        assert_eq!(state.lock().await.settings.output_folder, "/old");
+
+        // Already set to a folder the rules now refuse: other edits still save.
+        state.lock().await.settings.output_folder = "/".into();
+        let view = apply_settings_patch(&state, patch(serde_json::json!({"output_folder": "/", "download_quality": "720p"})), "e", 2, |_| Ok(()), |_| async { panic!("must not switch") })
+            .await
+            .unwrap();
+        assert_eq!(view.download_quality, "720p");
+        assert_eq!(state.lock().await.settings.output_folder, "/");
     }
 }

@@ -272,7 +272,7 @@ mod tests {
             "thumbnail_path": root.join("thumbnails").join(format!("{}_thumbnail_option_1.jpg", id)).to_string_lossy(),
             "transcription": TranscriptionResult {
                 segments: vec![], full_text: "hi".into(), sermon_start: Some(10.0), sermon_end: Some(20.0),
-                suggested_title: Some("Sermon".into()), suggested_description: None, suggested_chapters: None,
+                suggested_title: Some("Sermon".into()), suggested_description: None, suggested_chapters: None, analysis_error: None,
             },
             "status": status, "download_progress": 100.0, "created_at": "",
             "trimmed_path": root.join("trimmed").join(format!("{}_trimmed.mp4", id)).to_string_lossy(),

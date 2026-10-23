@@ -1550,8 +1550,25 @@ impl Library {
                 let audio = staging.join("audio.ogg");
                 crate::ffmpeg::extract_audio(&video_path, &audio).await?;
 
-                self.set_progress(app, id, ProcessingStage::Transcribing, 25.0, "Transcribing audio with AI...");
-                let result = crate::modal::transcribe_audio(&path_string(&audio), &api_url, api_key.as_deref()).await;
+                // The server answers only when it's done, so show how long
+                // it has been going.
+                let started = std::time::Instant::now();
+                let audio_path = path_string(&audio);
+                let transcribe = crate::modal::transcribe_audio(&audio_path, &api_url, api_key.as_deref());
+                tokio::pin!(transcribe);
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+                let result = loop {
+                    tokio::select! {
+                        r = &mut transcribe => break r,
+                        _ = tick.tick() => self.set_progress(
+                            app,
+                            id,
+                            ProcessingStage::Transcribing,
+                            25.0,
+                            &crate::modal::transcribing_message(started.elapsed()),
+                        ),
+                    }
+                };
                 let _ = std::fs::remove_file(&audio);
                 let transcription = result?;
                 // The one output saved straight away rather than staged: it

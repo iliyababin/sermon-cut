@@ -98,6 +98,40 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ReviewScreen", () => {
+  it("asks for the start and end when the AI couldn't find the sermon", async () => {
+    const transcription = {
+      segments: [],
+      full_text: "",
+      sermon_start: null,
+      sermon_end: null,
+      suggested_title: null,
+      suggested_description: null,
+      suggested_chapters: null,
+    };
+    render(<ReviewScreen video={video({ transcription: { ...transcription, analysis_error: "overloaded" } })} onBack={() => {}} />);
+    expect(await screen.findByText(/Couldn't find the sermon automatically — set the start and end below/)).toBeTruthy();
+    cleanup();
+    render(<ReviewScreen video={video({ transcription })} onBack={() => {}} />);
+    await screen.findByRole("button", { name: /upload/i });
+    expect(screen.queryByText(/Couldn't find the sermon automatically/)).toBeNull();
+  });
+
+  it("times captions from where a new trim really starts", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "set_trim" ? Promise.resolve({ start: 4, end: 500 }) : base(cmd, args)
+    );
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    fireEvent.click(await screen.findByLabelText("Start +5 s"));
+    fireEvent.click(screen.getByLabelText("End −5 s"));
+    fireEvent.click(screen.getByText("Trim video"));
+    await screen.findByText(/Starts at 0:04.0/);
+    fireEvent.click(screen.getByRole("button", { name: /upload/i }));
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
+    const args = calls("youtube_upload_video")[0][1] as Record<string, unknown>;
+    expect([args.startTime, args.endTime]).toEqual([4, 500]);
+  });
+
   it("doesn't re-render thumbnails whose stored render is current", async () => {
     render(<ReviewScreen video={video()} onBack={() => {}} />);
     await screen.findByRole("button", { name: /upload/i });

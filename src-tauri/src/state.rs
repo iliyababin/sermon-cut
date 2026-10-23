@@ -73,6 +73,10 @@ pub struct TranscriptionResult {
     pub suggested_title: Option<String>,
     pub suggested_description: Option<String>,
     pub suggested_chapters: Option<Vec<Chapter>>,
+    /// Why the AI couldn't find the sermon (the transcript is fine); the
+    /// whole video is used, and the review screen asks for the start and end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

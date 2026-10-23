@@ -185,6 +185,8 @@ export interface TranscriptionResult {
   suggested_title: string | null;
   suggested_description: string | null;
   suggested_chapters: Chapter[] | null;
+  /** Why the AI couldn't find the sermon; the whole video was kept. */
+  analysis_error?: string | null;
 }
 
 export interface YouTubeAuthStatus {

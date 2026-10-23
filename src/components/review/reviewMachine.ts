@@ -125,3 +125,26 @@ export function reviewReducer(state: ReviewState, event: ReviewEvent): ReviewSta
       return phase.kind === "done" ? { ...state, phase: { kind: "editing" } } : state;
   }
 }
+
+export interface ShortcutKey {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  /** Focus is in a multi-line text field. */
+  inTextarea: boolean;
+  /** A dialog or the thumbnail editor is open. */
+  blocked: boolean;
+}
+
+/**
+ * The review screen's keyboard shortcuts: ⌘Enter (Ctrl+Enter) uploads and
+ * Esc goes back. Nothing happens while a dialog or the editor is open. In
+ * a textarea Esc does nothing (it isn't "leave" there), but ⌘Enter still
+ * uploads, since it never types a newline.
+ */
+export function reviewShortcut(e: ShortcutKey): "upload" | "back" | null {
+  if (e.blocked) return null;
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) return "upload";
+  if (e.key === "Escape" && !e.metaKey && !e.ctrlKey && !e.inTextarea) return "back";
+  return null;
+}

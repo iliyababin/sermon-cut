@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initialReviewState, reviewReducer, type ReviewEvent, type ReviewState } from "./reviewMachine";
+import { initialReviewState, reviewReducer, reviewShortcut, type ReviewEvent, type ReviewState, type ShortcutKey } from "./reviewMachine";
 
 const fresh = initialReviewState({ status: "ready_for_review", uploadProgress: null, uploads: [] });
 
@@ -106,5 +106,33 @@ describe("reviewMachine", () => {
     expect(run(fresh, { type: "failed", message: "x" })).toBe(fresh);
     expect(run(fresh, { type: "confirm" })).toBe(fresh);
     expect(run(fresh, { type: "uploadAgain" })).toBe(fresh);
+  });
+});
+
+describe("reviewShortcut", () => {
+  const key = (over: Partial<ShortcutKey>): ShortcutKey => ({
+    key: "",
+    metaKey: false,
+    ctrlKey: false,
+    inTextarea: false,
+    blocked: false,
+    ...over,
+  });
+
+  it("uploads on ⌘Enter or Ctrl+Enter, also from a textarea", () => {
+    expect(reviewShortcut(key({ key: "Enter", metaKey: true }))).toBe("upload");
+    expect(reviewShortcut(key({ key: "Enter", ctrlKey: true }))).toBe("upload");
+    expect(reviewShortcut(key({ key: "Enter", metaKey: true, inTextarea: true }))).toBe("upload");
+    expect(reviewShortcut(key({ key: "Enter" }))).toBeNull();
+  });
+
+  it("goes back on Esc, except from a textarea", () => {
+    expect(reviewShortcut(key({ key: "Escape" }))).toBe("back");
+    expect(reviewShortcut(key({ key: "Escape", inTextarea: true }))).toBeNull();
+  });
+
+  it("does nothing while a dialog or the editor is open", () => {
+    expect(reviewShortcut(key({ key: "Escape", blocked: true }))).toBeNull();
+    expect(reviewShortcut(key({ key: "Enter", metaKey: true, blocked: true }))).toBeNull();
   });
 });

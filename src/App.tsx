@@ -110,6 +110,7 @@ export default function App() {
               key={`${selectedVideo.id}-${reviewKey}`}
               video={selectedVideo}
               onBack={handleGoToLibrary}
+              active={currentView === "review"}
             />
           </div>
         )}

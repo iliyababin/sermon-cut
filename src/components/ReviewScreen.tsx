@@ -20,7 +20,7 @@ import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
 import { getDefaultTemplate } from "@/templates";
 import { splitTitleIntoLines } from "@/lib/utils";
 import { renderKey } from "./review/renderKey";
-import { canStartUpload, initialReviewState, reviewReducer } from "./review/reviewMachine";
+import { canStartUpload, initialReviewState, reviewReducer, reviewShortcut } from "./review/reviewMachine";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
@@ -61,6 +61,9 @@ const SOCIAL_LINKS = [
 interface ReviewScreenProps {
   video: VideoDetail;
   onBack: () => void;
+  /** Whether the screen is showing (it stays mounted while hidden); its
+   * keyboard shortcuts only work then. */
+  active?: boolean;
 }
 
 const AUTOSAVE_MS = 1000;
@@ -76,7 +79,7 @@ function fileName(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
 }
 
-export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
+export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps) {
   // Metadata editing: saved edits first, then the AI's suggestions
   const [title, setTitle] = useState(
     video.review.title ?? video.transcription?.suggested_title ?? video.title
@@ -188,18 +191,34 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
   latest.current = { title, description, preacher, selectedSource };
   const dirty = useRef(false);
   const firstRender = useRef(true);
+  // The save in flight, if any; flushing waits for it, so leaving never
+  // races a save that already started.
+  const saving = useRef<Promise<boolean>>(Promise.resolve(true));
 
-  const flush = () => {
-    if (!dirty.current) return Promise.resolve();
-    dirty.current = false;
-    const v = latest.current;
-    return saveReview(
-      video.id,
-      { title: v.title, description: v.description, preacher: v.preacher },
-      v.selectedSource
-    )
-      .then(() => setSaveError(null))
-      .catch((err) => setSaveError(errorMessage(err, "Couldn't save your changes")));
+  /** Save pending edits; resolves with whether everything is saved. */
+  const flush = (): Promise<boolean> => {
+    const run = saving.current.then((): boolean | Promise<boolean> => {
+      if (!dirty.current) return true;
+      dirty.current = false;
+      const v = latest.current;
+      return saveReview(
+        video.id,
+        { title: v.title, description: v.description, preacher: v.preacher },
+        v.selectedSource
+      )
+        .then(() => {
+          setSaveError(null);
+          return true;
+        })
+        .catch((err) => {
+          // Still unsaved: the next flush (e.g. Back) tries again.
+          dirty.current = true;
+          setSaveError(errorMessage(err, "Couldn't save your changes"));
+          return false;
+        });
+    });
+    saving.current = run;
+    return run;
   };
 
   useEffect(() => {
@@ -320,10 +339,10 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     }
   };
 
-  // Leave only once the edits are saved.
+  // Leave only once the edits are saved; if saving fails, stay so the
+  // error shows (Back again retries).
   const handleBack = async () => {
-    await flush();
-    onBack();
+    if (await flush()) onBack();
   };
 
   // "Upload again?" is asked when the machine says so, once.
@@ -398,6 +417,38 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
 
   const handleUpload = () => dispatch({ type: "upload", ready: uploadReady });
 
+  // ⌘Enter uploads, Esc goes back (see reviewShortcut).
+  const shortcutState = useRef({ blocked: false, canUpload: false, handleBack, handleUpload });
+  shortcutState.current = {
+    blocked: isEditorOpen || phase.kind === "confirming",
+    canUpload: !!youtubeAuth?.is_authenticated && canStartUpload(phase),
+    handleBack,
+    handleUpload,
+  };
+  useEffect(() => {
+    if (!active) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.repeat) return;
+      const s = shortcutState.current;
+      const action = reviewShortcut({
+        key: e.key,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        inTextarea: e.target instanceof HTMLTextAreaElement,
+        blocked: s.blocked,
+      });
+      if (action === "back") {
+        e.preventDefault();
+        void s.handleBack();
+      } else if (action === "upload" && s.canUpload) {
+        e.preventDefault();
+        s.handleUpload();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [active]);
+
   // The upload stops; its session is kept, so Upload continues it.
   const handleCancelUpload = () => {
     dispatch({ type: "cancelRequested" });
@@ -414,6 +465,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
           <button
             onClick={handleBack}
             aria-label="Back"
+            title="Back (Esc)"
             className="p-2 hover:bg-secondary rounded-lg transition-colors"
           >
             <ArrowLeft className="w-5 h-5" />
@@ -477,7 +529,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
               <button
                 onClick={handleUpload}
                 disabled={!canStartUpload(phase) || !uploadReady}
-                title={!preacher.trim() ? "Speaker name is required" : undefined}
+                title={!preacher.trim() ? "Speaker name is required" : "Upload (⌘Enter)"}
                 className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-colors"
               >
                 {phase.kind === "uploading" ? (
@@ -737,10 +789,11 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
               )}
 
               <div>
-                <label className="block text-sm font-medium mb-1">
+                <label htmlFor="review-description" className="block text-sm font-medium mb-1">
                   Description
                 </label>
                 <textarea
+                  id="review-description"
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   rows={4}

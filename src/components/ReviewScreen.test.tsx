@@ -139,6 +139,51 @@ describe("ReviewScreen", () => {
     await waitFor(() => expect(onBack).toHaveBeenCalledTimes(1));
   });
 
+  it("Esc saves the edits, then goes back", async () => {
+    const onBack = vi.fn(() => {
+      const saves = calls("save_review");
+      expect(saves).toHaveLength(1);
+      expect((saves[0][1] as Record<string, unknown>).title).toBe("Esc title");
+    });
+    render(<ReviewScreen video={video()} onBack={onBack} />);
+    fireEvent.change(screen.getByDisplayValue(TITLE), { target: { value: "Esc title" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(onBack).toHaveBeenCalledTimes(1));
+  });
+
+  it("ignores Esc in the description and while hidden", async () => {
+    const onBack = vi.fn();
+    const { rerender } = render(<ReviewScreen video={video()} onBack={onBack} />);
+    const description = screen.getByRole("textbox", { name: /description/i });
+    fireEvent.keyDown(description, { key: "Escape" });
+    rerender(<ReviewScreen video={video()} onBack={onBack} active={false} />);
+    fireEvent.keyDown(window, { key: "Escape" });
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(onBack).not.toHaveBeenCalled();
+  });
+
+  it("stays when the save fails, and Back retries it", async () => {
+    const base = invoke.getMockImplementation()!;
+    let fail = true;
+    invoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "save_review" && fail) {
+        fail = false;
+        return Promise.reject("disk full");
+      }
+      return base(cmd, args);
+    });
+    const onBack = vi.fn();
+    render(<ReviewScreen video={video()} onBack={onBack} />);
+    fireEvent.change(screen.getByDisplayValue(TITLE), { target: { value: "Again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await screen.findByText("disk full");
+    expect(onBack).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await waitFor(() => expect(onBack).toHaveBeenCalledTimes(1));
+    expect(calls("save_review")).toHaveLength(2);
+    expect((calls("save_review")[1][1] as Record<string, unknown>).title).toBe("Again");
+  });
+
   it("starts from the last privacy and the default playlist", async () => {
     render(<ReviewScreen video={video()} onBack={() => {}} />);
     const privacy = (await screen.findByLabelText("Privacy")) as HTMLSelectElement;

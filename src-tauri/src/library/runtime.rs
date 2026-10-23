@@ -129,6 +129,9 @@ struct Inner {
     running: Option<Running>,
     /// Entries with an upload, trash or thumbnail operation in flight.
     busy: HashSet<String>,
+    /// Busy entries whose folder is being deleted (a replaced file, a
+    /// reset, forget or trash): a review saved now would bring it back.
+    removing: HashSet<String>,
     /// Template renders being written (see `save_rendered_thumbnail`); the
     /// open-time sweep would delete their temp files.
     rendering: usize,
@@ -251,6 +254,7 @@ impl Inner {
             self.baseline_scan = false;
             stale = reconciled.replaced.clone();
             self.busy.extend(stale.iter().cloned());
+            self.removing.extend(stale.iter().cloned());
             if reconciled.changed {
                 self.save_logged();
             }
@@ -402,6 +406,7 @@ impl Library {
                 queue: VecDeque::new(),
                 running: None,
                 busy: HashSet::new(),
+                removing: HashSet::new(),
                 rendering: 0,
                 uploads: std::collections::HashMap::new(),
                 downloads: Vec::new(),
@@ -740,10 +745,10 @@ impl Library {
             return;
         }
         if let Some(paths) = paths {
-            let ids = stale.clone();
+            let (lib, ids) = (self.clone(), stale.clone());
             let _ = blocking(move || {
                 for id in &ids {
-                    if let Err(e) = manifest::remove_video_dir(&paths, id) {
+                    if let Err(e) = lib.remove_video_files(&paths, id) {
                         eprintln!("[library] {}", e);
                     }
                 }
@@ -753,6 +758,7 @@ impl Library {
         let mut g = self.inner();
         for id in &stale {
             g.busy.remove(id);
+            g.removing.remove(id);
         }
     }
 
@@ -777,6 +783,14 @@ impl Library {
             Ok(paths.clone())
         })?;
         Ok((BusyGuard { lib: self, id: id.to_string() }, paths))
+    }
+
+    /// Mark a video busy (see `mark_busy`) to delete its folder: until the
+    /// guard drops, a review can't be saved into it (`save_review`).
+    fn mark_removing(&self, id: &str, check: impl FnOnce(&Inner) -> Result<(), String>) -> Result<(BusyGuard<'_>, LibraryPaths), String> {
+        let marked = self.mark_busy(id, check)?;
+        self.inner().removing.insert(id.to_string());
+        Ok(marked)
     }
 
     /// Delete a video's folder under its lock. Blocking.
@@ -810,7 +824,7 @@ impl Library {
     /// Back to New: delete what processing made. Keeps upload history.
     /// Blocking (deletes files): call it from a blocking thread.
     pub fn reset(&self, id: &str) -> Result<(), String> {
-        let (_busy, paths) = self.mark_busy(id, |_| Ok(()))?;
+        let (_busy, paths) = self.mark_removing(id, |_| Ok(()))?;
         self.remove_video_files(&paths, id)?;
         let mut g = self.inner();
         let e = g.entry_mut(id).map_err(|_| ENTRY_GONE.to_string())?;
@@ -829,7 +843,7 @@ impl Library {
 
     /// Drop a video whose file is gone. Blocking (deletes files).
     pub fn forget(&self, id: &str) -> Result<(), String> {
-        let (_busy, paths) = self.mark_busy(id, |g| {
+        let (_busy, paths) = self.mark_removing(id, |g| {
             if g.present(id) {
                 return Err("The file is still in the library folder. Use Move to Trash or Hide instead.".into());
             }
@@ -851,7 +865,7 @@ impl Library {
         // A scan that listed the file just before it went would add it back
         // as a new video once the entry is gone.
         let _scan = self.scan_lock.lock().await;
-        let (_busy, paths) = self.mark_busy(id, |_| Ok(()))?;
+        let (_busy, paths) = self.mark_removing(id, |_| Ok(()))?;
         let path = paths.original(&self.inner().entry(id)?.file_name)?;
         let (lib, check, video) = (self.clone(), path.clone(), id.to_string());
         let result = blocking(move || -> Result<(), String> {
@@ -892,6 +906,11 @@ impl Library {
             // Processing replaces video.json, so edits made now would be lost.
             if g.queue.iter().any(|q| q == id) || g.running.as_ref().is_some_and(|r| r.id == id) {
                 return Err("This video is being processed".into());
+            }
+            // Its folder is being deleted (file replaced, reset, forget,
+            // trash), or was: the review on screen is of the old results.
+            if g.removing.contains(id) || g.entry(id)?.status == EntryStatus::New {
+                return Err("This video's results were cleared (its file was replaced or reset), so these edits weren't saved.".into());
             }
             Ok(paths.clone())
         })?;
@@ -1003,6 +1022,7 @@ impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
         let mut g = self.lib.inner();
         g.busy.remove(&self.id);
+        g.removing.remove(&self.id);
         g.uploads.remove(&self.id);
     }
 }
@@ -1503,6 +1523,55 @@ mod tests {
         assert!(!dir.exists());
         assert!(!lib.inner().busy.contains(&id));
         assert_eq!(lib.view(vec![]).videos[0].status, ViewStatus::New);
+    }
+
+    /// A replaced file's old folder goes under the video's lock, and a
+    /// review autosaved from the old results (during or after) can't bring
+    /// it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_files_folder_goes_under_its_lock_and_stays_gone() {
+        let (_t, lib, id, dir) = processed_library();
+        let review = || Review { title: Some("Old title".into()), ..Default::default() };
+        lib.save_review(&id, review(), None).unwrap();
+        let replaced = FileObs {
+            name: "a.mp4".into(),
+            size: 99,
+            mtime_ms: i64::MAX / 2,
+            state: ObsState::Ready,
+            hash: Some("re-exported".into()),
+            duration: Some(60.0),
+        };
+        let lock = lib.video_lock(&id);
+        let held = hold(&lock);
+        let scan = tokio::spawn({
+            let lib = lib.clone();
+            async move { lib.finish_scan(&[replaced]).await }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(dir.exists(), "not deleted while the video's lock is held");
+        assert!(lib.inner().removing.contains(&id));
+        drop(held);
+        // Refused while the folder is going (it would recreate it).
+        let during = lib.save_review(&id, review(), None);
+        scan.await.unwrap();
+        assert!(during.is_err() || !dir.exists());
+        assert!(!dir.exists());
+        assert!(!lib.inner().removing.contains(&id));
+        // And after: the entry is New again, with nothing to review.
+        assert!(lib.save_review(&id, review(), None).is_err());
+        assert!(!dir.exists(), "an autosave doesn't bring the old review back");
+    }
+
+    /// Reset, forget and trash refuse a review while their folder goes.
+    #[test]
+    fn a_review_is_refused_while_the_folder_is_being_removed() {
+        let (_t, lib, id, dir) = processed_library();
+        let (guard, _paths) = lib.mark_removing(&id, |_| Ok(())).unwrap();
+        assert!(lib.save_review(&id, Review::default(), None).is_err());
+        drop(guard);
+        assert!(!lib.inner().removing.contains(&id));
+        lib.save_review(&id, Review::default(), None).unwrap();
+        assert!(dir.exists());
     }
 
     pub(super) fn contents(dir: &Path) -> Vec<(String, String)> {

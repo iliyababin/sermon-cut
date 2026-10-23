@@ -385,7 +385,7 @@ impl Library {
     /// and thumbnail edits are refused), so the swap runs without the
     /// library lock. Once it has begun it runs to the end: a cancel then
     /// only says it came too late (see `cancel`). The review typed so far
-    /// is kept. `before_swap` runs once the commit can no longer be
+    /// is kept on a re-process. `before_swap` runs once the commit can no longer be
     /// cancelled (tests cancel there).
     async fn commit_job(
         &self,
@@ -396,7 +396,7 @@ impl Library {
         outputs: JobOutputs,
         before_swap: impl FnOnce(),
     ) -> Result<(), String> {
-        {
+        let keep_review = {
             let mut g = self.inner();
             g.writable()?;
             if g.entry(id)?.fingerprint.hash != hash {
@@ -407,7 +407,10 @@ impl Library {
                 return Err("Cancelled".into());
             }
             running.committing = true;
-        }
+            // A re-process keeps the review; a first processing (a new or
+            // replaced file, a reset) starts without an old one.
+            matches!(running.previous, EntryStatus::ReadyForReview | EntryStatus::Done)
+        };
         before_swap();
         let JobOutputs { trimmed_name, start, end, thumb_names, duration } = outputs;
         let (dir, staging) = (video_dir.to_path_buf(), staging.to_path_buf());
@@ -423,7 +426,7 @@ impl Library {
                 trim_end: Some(end),
                 selected_source: thumb_names.first().cloned(),
                 thumbnail_options: thumb_names,
-                review: old.review,
+                review: if keep_review { old.review } else { Review::default() },
                 ..Default::default()
             };
             swap_in_outputs(&dir, &staging, || manifest::save_video_data(&dir, &data))
@@ -1008,6 +1011,22 @@ mod tests {
         assert_eq!(d.review.title.as_deref(), Some("Typed earlier"), "review edits are kept");
         assert!(!dir.join(COMMIT_BACKUP).exists());
         assert!(lib.inner().manifest.queue.is_empty());
+    }
+
+    /// The first processing of a new or replaced file doesn't take a
+    /// review left in its folder (one of the old content's).
+    #[tokio::test]
+    async fn a_first_processing_starts_without_an_old_review() {
+        let (_t, lib, id, dir) = processed_library();
+        let mut data = manifest::load_video_data(&dir);
+        data.review.title = Some("Old content's title".into());
+        manifest::save_video_data(&dir, &data).unwrap();
+        lib.inner().entry_mut(&id).unwrap().status = EntryStatus::New;
+        let (staging, outputs, hash) = job_at_commit(&lib, &id).await;
+        lib.commit_job(&id, &dir, &staging.0, &hash, outputs, || {}).await.unwrap();
+        drop(staging);
+        lib.finish_job(&id, &Some(Ok(())));
+        assert_eq!(manifest::load_video_data(&dir).review.title, None);
     }
 
     #[tokio::test]

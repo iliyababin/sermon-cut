@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { LibraryVideo, LibraryView } from "@/lib/types";
 
 const invoke = vi.fn();
@@ -7,7 +7,13 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: unknown) => invoke(cmd, args),
   convertFileSrc: (p: string) => `asset://${p}`,
 }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
+const listeners = new Map<string, (e: unknown) => void>();
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (name: string, cb: (e: unknown) => void) => {
+    listeners.set(name, cb);
+    return Promise.resolve(() => {});
+  },
+}));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn() }));
 vi.mock("@tauri-apps/plugin-shell", () => ({ open: vi.fn() }));
 
@@ -78,6 +84,26 @@ describe("VideoLibrary", () => {
     expect(buttons).toHaveLength(1);
     fireEvent.click(buttons[0]);
     expect(invoke).toHaveBeenCalledWith("reveal_commit_backup", { videoId: "stuck" });
+  });
+
+  it("shows only the newest answer when an older one arrives late", async () => {
+    let answerScan: (v: LibraryView) => void = () => {};
+    const stale = { ...library, videos: [video("gone", { title: "Gone" })] };
+    const fresh = { ...library, videos: [video("current", { title: "Current" })] };
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "rescan_library"
+        ? new Promise((r) => (answerScan = r))
+        : cmd === "get_library"
+          ? Promise.resolve(fresh)
+          : Promise.resolve(null)
+    );
+    render(<VideoLibrary onVideoSelect={() => {}} />);
+    // The scan is slow; a refresh asked after it answers first.
+    await act(async () => listeners.get("library-changed")?.({}));
+    await screen.findByText("Current");
+    await act(async () => answerScan(stale));
+    expect(screen.getByText("Current")).toBeTruthy();
+    expect(screen.queryByText("Gone")).toBeNull();
   });
 
   it("shows a queued video's place in line", async () => {

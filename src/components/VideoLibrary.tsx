@@ -86,27 +86,35 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
   const [uploads, setUploads] = useState<Record<string, number>>({});
   const scanning = useRef(false);
 
-  const refresh = useCallback(async () => {
+  // Requests are numbered; an answer older than one already shown is
+  // dropped, so a slow scan can't put back a library that has moved on.
+  const requests = useRef(0);
+  const shown = useRef(0);
+  const load = useCallback(async (fetch: () => Promise<LibraryView>, failure: string) => {
+    const request = ++requests.current;
     try {
-      setLibrary(await getLibrary());
+      const view = await fetch();
+      if (request < shown.current) return;
+      shown.current = request;
+      setLibrary(view);
       setLoadError(null);
     } catch (err) {
-      setLoadError(errorMessage(err, "Failed to load the library"));
+      if (request < shown.current) return;
+      setLoadError(errorMessage(err, failure));
     }
   }, []);
+
+  const refresh = useCallback(() => load(getLibrary, "Failed to load the library"), [load]);
 
   const rescan = useCallback(async () => {
     if (scanning.current) return;
     scanning.current = true;
     try {
-      setLibrary(await rescanLibrary());
-      setLoadError(null);
-    } catch (err) {
-      setLoadError(errorMessage(err, "Failed to read the library folder"));
+      await load(rescanLibrary, "Failed to read the library folder");
     } finally {
       scanning.current = false;
     }
-  }, []);
+  }, [load]);
 
   // Look at the folder when shown, every few seconds while shown, and
   // whenever the window comes back to the front (e.g. after using Finder).

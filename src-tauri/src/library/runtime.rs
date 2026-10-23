@@ -1666,7 +1666,7 @@ impl Library {
         id: &str,
         source: &str,
         render_key: &str,
-        png_bytes: Vec<u8>,
+        image_bytes: Vec<u8>,
     ) -> Result<String, String> {
         if !valid_render_key(render_key) {
             return Err("Invalid render key".into());
@@ -1687,7 +1687,7 @@ impl Library {
         let name = format!("{}{}.jpg", RENDERED_PREFIX, uuid::Uuid::new_v4().simple());
         let tmp = dir.join(format!("{}{}", name, fsutil::TMP_MARKER));
         let out = tmp.clone();
-        blocking(move || crate::thumbnail::save_for_youtube(&png_bytes, &out)).await??;
+        blocking(move || crate::thumbnail::save_for_youtube(&image_bytes, &out)).await??;
 
         let committed = self.with_entry(id, |g, _| {
             // Processing may have started (or the options changed) meanwhile.

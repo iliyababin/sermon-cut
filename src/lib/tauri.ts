@@ -220,18 +220,21 @@ export function errorMessage(err: unknown, fallback = "Something went wrong"): s
   return String(err || fallback);
 }
 
-/** Save a template render of one thumbnail source; resolves with its path. */
+/** Save a template render (JPEG bytes) of one thumbnail source; resolves
+ * with its path. The bytes go as the raw invoke body, the rest as
+ * percent-encoded (so ASCII) headers. */
 export async function saveRenderedThumbnail(
   videoId: string,
   source: string,
   renderKey: string,
   imageData: Uint8Array,
 ): Promise<string> {
-  return invoke("save_rendered_thumbnail", {
-    videoId,
-    source,
-    renderKey,
-    imageData: Array.from(imageData),
+  return invoke("save_rendered_thumbnail", imageData, {
+    headers: {
+      "x-video-id": encodeURIComponent(videoId),
+      "x-source": encodeURIComponent(source),
+      "x-render-key": encodeURIComponent(renderKey),
+    },
   });
 }
 
@@ -245,7 +248,7 @@ export async function cropStandaloneThumbnail(
 
 /** Save a Thumbnail-tab render as a YouTube-ready JPEG; resolves with its path. */
 export async function saveStandaloneThumbnail(imageData: Uint8Array): Promise<string> {
-  return invoke("save_standalone_thumbnail", { imageData: Array.from(imageData) });
+  return invoke("save_standalone_thumbnail", imageData);
 }
 
 export async function copyFile(

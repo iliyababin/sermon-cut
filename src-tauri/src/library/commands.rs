@@ -123,21 +123,52 @@ pub async fn process_custom_thumbnail(
     result
 }
 
-/// Save a template render (PNG bytes) of one thumbnail source. Resolves
-/// with the saved file's path.
+/// Save a template render of one thumbnail source. The JPEG comes as the
+/// raw invoke body (no JSON number array); the video, source and render key
+/// come as percent-encoded headers. Resolves with the saved file's path.
 #[tauri::command]
 pub async fn save_rendered_thumbnail(
     lib: State<'_, LibraryHandle>,
     app_handle: AppHandle,
-    video_id: String,
-    source: String,
-    render_key: String,
-    image_data: Vec<u8>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<String, String> {
-    let result = lib.save_rendered_thumbnail(&video_id, &source, &render_key, image_data).await;
+    let video_id = header(request.headers(), "x-video-id")?;
+    let source = header(request.headers(), "x-source")?;
+    let render_key = header(request.headers(), "x-render-key")?;
+    let bytes = raw_image(request.body())?;
+    let result = lib.save_rendered_thumbnail(&video_id, &source, &render_key, bytes).await;
     // The card shows the selected render.
     changed(&app_handle);
     result
+}
+
+/// Largest image accepted over IPC.
+const MAX_RAW_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// A raw invoke body holding an image.
+pub fn raw_image(body: &tauri::ipc::InvokeBody) -> Result<Vec<u8>, String> {
+    match body {
+        tauri::ipc::InvokeBody::Raw(bytes) if bytes.is_empty() => Err("The image is empty".into()),
+        tauri::ipc::InvokeBody::Raw(bytes) if bytes.len() > MAX_RAW_IMAGE_BYTES => Err("The image is too large".into()),
+        tauri::ipc::InvokeBody::Raw(bytes) => Ok(bytes.clone()),
+        tauri::ipc::InvokeBody::Json(_) => Err("Expected the image as raw bytes".into()),
+    }
+}
+
+/// A required header: visible ASCII only, at most 512 bytes, then
+/// percent-decoded to UTF-8. Anything else is refused, never guessed at.
+pub fn header(headers: &tauri::http::HeaderMap, name: &str) -> Result<String, String> {
+    let value = headers.get(name).ok_or_else(|| format!("Missing {} header", name))?;
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 512 || !bytes.iter().all(|b| b.is_ascii_graphic()) {
+        return Err(format!("Invalid {} header", name));
+    }
+    let ascii = std::str::from_utf8(bytes).map_err(|_| format!("Invalid {} header", name))?;
+    let decoded = urlencoding::decode(ascii).map_err(|_| format!("Invalid {} header", name))?;
+    if decoded.is_empty() || decoded.chars().any(char::is_control) {
+        return Err(format!("Invalid {} header", name));
+    }
+    Ok(decoded.into_owned())
 }
 
 /// Show the trimmed video (or the original) in Finder.
@@ -385,6 +416,51 @@ pub fn folder_warnings(path: &Path, home: Option<&Path>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use tauri::http::{HeaderMap, HeaderValue};
+    use tauri::ipc::InvokeBody;
+
+    fn headers(pairs: &[(&'static str, &[u8])]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, HeaderValue::from_bytes(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn render_headers_are_ascii_and_percent_decoded() {
+        let h = headers(&[("x-source", b"custom_thumbnail_1.jpg"), ("x-video-id", b"Caf%C3%A9%20%27x%27")]);
+        assert_eq!(header(&h, "x-source").unwrap(), "custom_thumbnail_1.jpg");
+        assert_eq!(header(&h, "x-video-id").unwrap(), "Caf\u{e9} 'x'");
+    }
+
+    #[test]
+    fn bad_render_headers_are_refused() {
+        // Missing, empty, raw non-ASCII, spaces, control characters (raw
+        // or encoded), bad UTF-8 once decoded, and overlong.
+        assert!(header(&headers(&[]), "x-source").is_err());
+        let long = vec![b'a'; 513];
+        for bad in [
+            &b""[..],
+            "caf\u{e9}".as_bytes(),
+            b"a b",
+            b"a\tb",
+            b"a%0Ab",
+            b"%FF%FE",
+            &long[..],
+        ] {
+            let h = headers(&[("x-source", bad)]);
+            assert!(header(&h, "x-source").is_err(), "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn render_body_must_be_raw_bytes() {
+        assert_eq!(raw_image(&InvokeBody::Raw(vec![1, 2, 3])).unwrap(), vec![1, 2, 3]);
+        assert!(raw_image(&InvokeBody::Raw(vec![])).is_err());
+        assert!(raw_image(&InvokeBody::Json(serde_json::json!({"imageData": [1, 2]}))).is_err());
+    }
+
     use super::*;
 
     #[test]

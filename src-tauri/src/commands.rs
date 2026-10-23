@@ -449,8 +449,10 @@ pub async fn crop_standalone_thumbnail(
 #[tauri::command]
 pub async fn save_standalone_thumbnail(
     app_handle: AppHandle,
-    image_data: Vec<u8>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<String, String> {
+    // Raw invoke body, like save_rendered_thumbnail.
+    let image_data = crate::library::commands::raw_image(request.body())?;
     let path = standalone_dir(&app_handle)?.join(format!(
         "thumbnail_{}.jpg",
         chrono::Utc::now().timestamp_millis()

@@ -52,7 +52,7 @@ export interface RenderOptions {
   resolveUrl?: (path: string) => string;
 }
 
-/** Draw the template over each image and return the results as PNG bytes. */
+/** Draw the template over each image and return the results as JPEG bytes. */
 export async function renderThumbnailBatch(
   template: TemplateConfig,
   baseImagePaths: string[],
@@ -99,7 +99,8 @@ export async function renderThumbnailBatch(
       const blob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(
           (b) => (b ? resolve(b) : reject(new Error("toBlob failed"))),
-          "image/png",
+          "image/jpeg",
+          0.92,
         );
       });
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Video metadata from yt-dlp. Also the shape of videos in the pre-0.4
 /// state.json, which the library migration reads.
@@ -288,7 +288,7 @@ struct PersistedState {
     notices: Vec<String>,
 }
 
-#[cfg_attr(test, allow(dead_code))]
+/// Where state.json lives (named before the app had a bundle identifier).
 pub fn state_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -301,6 +301,10 @@ fn get_state_file_path() -> PathBuf {
 }
 
 /// Tests must never touch the real state.json.
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_file_name("state.json.bak")
+}
+
 #[cfg(test)]
 fn get_state_file_path() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("sermon-cut-test-{}", std::process::id()));
@@ -337,30 +341,44 @@ impl AppState {
     }
 
     pub fn load() -> Self {
-        let path = get_state_file_path();
+        Self::load_from(&get_state_file_path())
+    }
 
-        match std::fs::read(&path) {
+    /// Read state.json. An unreadable one is moved aside and the last good
+    /// copy (state.json.bak) is used instead, with a notice either way.
+    fn load_from(path: &Path) -> Self {
+        let backup = backup_path(path);
+        match std::fs::read(path) {
             Ok(contents) => match serde_json::from_slice::<PersistedState>(&contents) {
-                Ok(persisted) => {
-                    let mut settings = persisted.settings.unwrap_or_default();
-                    if settings.modal_api_url.trim_end_matches('/') == RETIRED_MODAL_API_URL {
-                        settings.modal_api_url = DEFAULT_MODAL_API_URL.to_string();
-                    }
-                    return AppState {
-                        settings,
-                        legacy_videos: persisted.videos,
-                        notices: persisted.notices,
-                        settings_seq: 0,
-                        preacher_draft: None,
-                    };
-                }
+                Ok(persisted) => return Self::from_persisted(persisted),
                 Err(e) => {
                     // Keep the unreadable file for recovery instead of
                     // overwriting it with defaults on the next save.
                     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
                     let aside = path.with_file_name(format!("state.json.corrupt-{}", stamp));
                     eprintln!("Failed to parse state file ({}); moved to {}", e, aside.display());
-                    let _ = std::fs::rename(&path, &aside);
+                    let _ = std::fs::rename(path, &aside);
+                    let restored = std::fs::read(&backup)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<PersistedState>(&b).ok());
+                    let (mut state, notice) = match restored {
+                        Some(persisted) => (
+                            Self::from_persisted(persisted),
+                            format!(
+                                "Sermon Cut's settings file was damaged, so the last good copy was used. The damaged file is kept at {}.",
+                                aside.display()
+                            ),
+                        ),
+                        None => (
+                            AppState::default(),
+                            format!(
+                                "Sermon Cut's settings file was damaged and couldn't be read, so settings are back to their defaults (you may need to sign in to YouTube again). The damaged file is kept at {}.",
+                                aside.display()
+                            ),
+                        ),
+                    };
+                    state.notices.push(notice);
+                    return state;
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -370,9 +388,28 @@ impl AppState {
         AppState::default()
     }
 
-    pub fn save(&self) -> Result<(), String> {
-        let path = get_state_file_path();
+    fn from_persisted(persisted: PersistedState) -> Self {
+        let mut settings = persisted.settings.unwrap_or_default();
+        if settings.modal_api_url.trim_end_matches('/') == RETIRED_MODAL_API_URL {
+            settings.modal_api_url = DEFAULT_MODAL_API_URL.to_string();
+        }
+        AppState {
+            settings,
+            legacy_videos: persisted.videos,
+            notices: persisted.notices,
+            settings_seq: 0,
+            preacher_draft: None,
+        }
+    }
 
+    pub fn save(&self) -> Result<(), String> {
+        self.save_to(&get_state_file_path())
+    }
+
+    /// Write state.json (owner-only: it holds the YouTube sign-in). The
+    /// file being replaced becomes state.json.bak, but only if it's good,
+    /// so a damaged file never overwrites the last good backup.
+    fn save_to(&self, path: &Path) -> Result<(), String> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -390,8 +427,17 @@ impl AppState {
             videos: self.legacy_videos.clone(),
             notices: self.notices.clone(),
         };
+        let bytes = serde_json::to_vec_pretty(&persisted).map_err(|e| format!("Failed to serialize: {}", e))?;
 
-        crate::library::fsutil::write_json_atomic(&path, &persisted)
+        if let Ok(current) = std::fs::read(path) {
+            if serde_json::from_slice::<PersistedState>(&current).is_ok() {
+                if let Err(e) = crate::library::fsutil::write_atomic_private(&backup_path(path), &current) {
+                    eprintln!("[warn] Failed to back up state.json: {}", e);
+                }
+            }
+        }
+        crate::library::fsutil::write_atomic_private(path, &bytes)
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
     }
 
     /// Before dropping the old videos from state.json, keep a copy of the
@@ -494,6 +540,73 @@ mod tests {
         state.note_preacher("v2", "Guest");
         state.note_preacher("v3", "Pastor Ann");
         assert_eq!(state.settings.recent_preachers, vec!["Pastor Ann", "Guest"]);
+    }
+
+    #[test]
+    fn state_file_is_private_and_backed_up_only_when_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let mut state = signed_in();
+        state.download_quality = "720p".into();
+        let app = AppState { settings: state, ..AppState::default() };
+        app.save_to(&path).unwrap();
+        // Nothing to back up the first time.
+        assert!(!backup_path(&path).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The token that expires is never written.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("ya29.secret") && text.contains("1//refresh"));
+
+        // The good file becomes the backup on the next save.
+        let mut next = AppState::load_from(&path);
+        assert_eq!(next.settings.download_quality, "720p");
+        next.settings.download_quality = "480p".into();
+        next.save_to(&path).unwrap();
+        let bak: PersistedState = serde_json::from_slice(&std::fs::read(backup_path(&path)).unwrap()).unwrap();
+        assert_eq!(bak.settings.unwrap().download_quality, "720p");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(backup_path(&path)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // A damaged file doesn't replace the backup...
+        std::fs::write(&path, b"{ not json").unwrap();
+        next.save_to(&path).unwrap();
+        let bak: PersistedState = serde_json::from_slice(&std::fs::read(backup_path(&path)).unwrap()).unwrap();
+        assert_eq!(bak.settings.unwrap().download_quality, "720p");
+    }
+
+    #[test]
+    fn damaged_state_file_falls_back_to_the_backup_with_a_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let mut app = AppState { settings: signed_in(), ..AppState::default() };
+        app.save_to(&path).unwrap();
+        app.settings.download_quality = "720p".into();
+        app.save_to(&path).unwrap(); // the first save is now the backup
+        std::fs::write(&path, b"garbage").unwrap();
+
+        let loaded = AppState::load_from(&path);
+        assert_eq!(loaded.settings.download_quality, "best");
+        assert!(loaded.settings.youtube_auth.is_some());
+        assert_eq!(loaded.notices.len(), 1);
+        assert!(loaded.notices[0].contains("last good copy"), "{}", loaded.notices[0]);
+        assert!(!path.exists());
+        assert!(std::fs::read_dir(tmp.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-")));
+
+        // No usable backup either: defaults, and the notice says so.
+        std::fs::write(&path, b"garbage").unwrap();
+        std::fs::write(backup_path(&path), b"also garbage").unwrap();
+        let loaded = AppState::load_from(&path);
+        assert!(loaded.settings.youtube_auth.is_none());
+        assert!(loaded.notices[0].contains("defaults"), "{}", loaded.notices[0]);
     }
 
     #[test]

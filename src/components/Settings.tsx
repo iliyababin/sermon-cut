@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { getSettings, saveSettings, nextSettingsSeq, getAppDataDir, resetState, clearLibraryData, checkLibraryFolder, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists, errorMessage } from "@/lib/tauri";
+import { getSettings, saveSettings, nextSettingsSeq, getAppFolders, openFolder, resetState, clearLibraryData, checkLibraryFolder, youtubeGetAuthStatus, youtubeSignIn, youtubeSignOut, youtubeListPlaylists, errorMessage } from "@/lib/tauri";
 import type { Settings as SettingsType, YouTubeAuthStatus, PlaylistInfo } from "@/lib/types";
 import { EDITABLE_SETTINGS, settingsPatch } from "@/lib/settingsPatch";
 import { Loader2, FolderOpen, CheckCircle, Image, X, Youtube, LogOut, AlertTriangle, RefreshCw, Download } from "lucide-react";
@@ -17,7 +17,7 @@ export function Settings() {
   const [settings, setSettings] = useState<SettingsType | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [appDataDir, setAppDataDir] = useState<string>("");
+  const [folders, setFolders] = useState<{ settings: string; tools: string | null } | null>(null);
   const [youtubeAuth, setYoutubeAuth] = useState<YouTubeAuthStatus | null>(null);
   const [youtubeLoading, setYoutubeLoading] = useState(false);
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
@@ -78,13 +78,13 @@ export function Settings() {
     try {
       setLoading(true);
       setLoadError(null);
-      const [loadedSettings, dataDir] = await Promise.all([
+      const [loadedSettings, appFolders] = await Promise.all([
         getSettings(),
-        getAppDataDir(),
+        getAppFolders(),
       ]);
       saved.current = loadedSettings;
       setSettings(loadedSettings);
-      setAppDataDir(dataDir);
+      setFolders(appFolders);
     } catch (err) {
       setLoadError(errorMessage(err, "Couldn't load the settings"));
     } finally {
@@ -557,10 +557,22 @@ export function Settings() {
               <span className="text-muted-foreground">Version</span>
               <span>{appVersion}</span>
             </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Data Directory</span>
-              <span className="font-mono text-xs">{appDataDir}</span>
-            </div>
+            {folders && (
+              <>
+                <FolderRow
+                  label="Settings folder"
+                  path={folders.settings}
+                  onOpen={() => openFolder(folders.settings).catch((err) => setActionError(errorMessage(err)))}
+                />
+                {folders.tools && (
+                  <FolderRow
+                    label="Tools folder"
+                    path={folders.tools}
+                    onOpen={() => openFolder(folders.tools!).catch((err) => setActionError(errorMessage(err)))}
+                  />
+                )}
+              </>
+            )}
           </div>
 
           <div className="mt-4">
@@ -702,6 +714,22 @@ export function Settings() {
           <div className="p-3 bg-destructive/10 text-destructive rounded-lg text-sm">{actionError}</div>
         )}
       </div>
+    </div>
+  );
+}
+
+function FolderRow({ label, path, onOpen }: { label: string; path: string; onOpen: () => void }) {
+  return (
+    <div className="flex justify-between items-center gap-4">
+      <span className="text-muted-foreground shrink-0">{label}</span>
+      <span className="flex items-center gap-2 min-w-0">
+        <span className="font-mono text-xs truncate" title={path}>
+          {path}
+        </span>
+        <button onClick={onOpen} title={`Open ${label.toLowerCase()}`} className="p-1 rounded hover:bg-secondary shrink-0">
+          <FolderOpen className="w-4 h-4" />
+        </button>
+      </span>
     </div>
   );
 }

@@ -191,7 +191,7 @@ pub async fn reveal_video(lib: State<'_, LibraryHandle>, video_id: String) -> Re
 #[tauri::command]
 pub async fn open_library_folder(lib: State<'_, LibraryHandle>) -> Result<(), String> {
     let root = lib.root().ok_or("The library folder isn't available")?;
-    crate::commands::open_folder(root.to_string_lossy().to_string()).await
+    crate::commands::open_folder_path(root.to_string_lossy().to_string())
 }
 
 fn reveal(path: &Path) -> Result<(), String> {

@@ -136,8 +136,9 @@ export async function resetState(): Promise<void> {
   return invoke("reset_state");
 }
 
-export async function getAppDataDir(): Promise<string> {
-  return invoke("get_app_data_dir");
+/** Where the app keeps its settings and its tools (ffmpeg, yt-dlp). */
+export async function getAppFolders(): Promise<{ settings: string; tools: string | null }> {
+  return invoke("get_app_folders");
 }
 
 export async function openFile(path: string): Promise<void> {

@@ -54,8 +54,8 @@ beforeEach(() => {
     switch (cmd) {
       case "get_settings":
         return Promise.resolve({ ...current });
-      case "get_app_data_dir":
-        return Promise.resolve("/data");
+      case "get_app_folders":
+        return Promise.resolve({ settings: "/data/sermon-cut", tools: "/data/com.youthscc.sermon-cut/bin" });
       case "youtube_get_auth_status":
         return Promise.resolve({ is_authenticated: false, channel_name: null, channel_id: null });
       case "check_library_folder":
@@ -137,5 +137,11 @@ describe("Settings autosave", () => {
     await screen.findByText("Saved");
     await new Promise((r) => setTimeout(r, 20));
     expect(quality.value).toBe("480p");
+  });
+
+  it("shows the settings and tools folders", async () => {
+    render(<Settings />);
+    await screen.findByText("/data/sermon-cut");
+    expect(screen.getByText("/data/com.youthscc.sermon-cut/bin")).toBeTruthy();
   });
 });

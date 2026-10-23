@@ -3,7 +3,7 @@ use crate::state::{AppState, Settings, SettingsPatch, SettingsView, VideoInfo};
 use crate::upload::{TokenSource, UploadError};
 use crate::youtube_dl;
 use futures::future::BoxFuture;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
@@ -19,6 +19,74 @@ pub fn allow_user_paths(app_handle: &AppHandle, library_root: Option<&Path>, set
     let scope = app_handle.asset_protocol_scope();
     if let Some(logo) = settings.logo_path.as_deref().filter(|p| !p.is_empty()) {
         let _ = scope.allow_file(logo);
+    }
+}
+
+/// `path` made absolute and free of symlinks, for a path that may not exist
+/// yet (e.g. a copy's destination): the deepest part that exists is
+/// canonicalised (resolving any symlink in it, even a dangling one, which
+/// then fails) and the rest appended. None for a relative path or one that
+/// climbs out with `..` past what exists.
+fn resolve_for_check(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    // symlink_metadata: a dangling symlink counts as existing, so it's
+    // canonicalised (and refused) rather than treated as a plain new name.
+    while std::fs::symlink_metadata(&existing).is_err() {
+        match existing.components().next_back()? {
+            Component::Normal(name) => rest.push(name.to_os_string()),
+            Component::CurDir => {}
+            _ => return None,
+        }
+        existing = existing.parent()?.to_path_buf();
+    }
+    let mut resolved = std::fs::canonicalize(&existing).ok()?;
+    for name in rest.into_iter().rev() {
+        resolved.push(name);
+    }
+    Some(resolved)
+}
+
+/// Whether `path` is inside one of `roots` once symlinks and `..` are
+/// resolved, so neither can lead out of them. Roots that don't exist yet
+/// are resolved the same way.
+pub fn is_within(path: &Path, roots: &[PathBuf]) -> bool {
+    let Some(resolved) = resolve_for_check(path) else {
+        return false;
+    };
+    roots
+        .iter()
+        .filter_map(|root| resolve_for_check(root))
+        .any(|root| resolved.starts_with(&root))
+}
+
+/// The folders the file commands below may touch: the library, the app's
+/// data, settings and tools folders, and the temp folder.
+fn allowed_roots(app_handle: &AppHandle, lib: &LibraryHandle) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.extend(lib.root());
+    roots.extend(app_handle.path().app_data_dir().ok());
+    roots.push(crate::state::state_dir());
+    roots.extend(crate::tools::tools_dir());
+    roots.push(std::env::temp_dir());
+    roots
+}
+
+/// Refuse a path outside the app's folders, unless the user picked it in an
+/// open/save dialog this session (the dialog adds picks to the fs scope).
+fn check_path(app_handle: &AppHandle, lib: &LibraryHandle, path: &str) -> Result<PathBuf, String> {
+    use tauri_plugin_fs::FsExt;
+    let p = Path::new(path);
+    let picked = app_handle
+        .try_fs_scope()
+        .is_some_and(|scope| scope.is_allowed(p));
+    if is_within(p, &allowed_roots(app_handle, lib)) || picked {
+        Ok(p.to_path_buf())
+    } else {
+        Err(format!("Sermon Cut can only use files in its own folders or ones you chose: {}", path))
     }
 }
 
@@ -132,16 +200,31 @@ pub async fn reset_state(
     result
 }
 
-#[tauri::command]
-pub async fn get_app_data_dir() -> Result<String, String> {
-    dirs::data_dir()
-        .map(|p| p.join("sermon-cut").to_string_lossy().to_string())
-        .ok_or_else(|| "Could not determine app data directory".to_string())
+/// Where the app keeps its own files, for the Settings screen.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppFolders {
+    /// state.json: settings and the YouTube sign-in.
+    pub settings: String,
+    /// ffmpeg, ffprobe and yt-dlp, as install.sh puts them.
+    pub tools: Option<String>,
 }
 
 #[tauri::command]
-pub async fn read_image_base64(path: String) -> Result<String, String> {
+pub async fn get_app_folders() -> Result<AppFolders, String> {
+    Ok(AppFolders {
+        settings: crate::state::state_dir().to_string_lossy().to_string(),
+        tools: crate::tools::tools_dir().map(|p| p.to_string_lossy().to_string()),
+    })
+}
+
+#[tauri::command]
+pub async fn read_image_base64(
+    app_handle: AppHandle,
+    lib: State<'_, LibraryHandle>,
+    path: String,
+) -> Result<String, String> {
     use base64::Engine;
+    check_path(&app_handle, &lib, &path)?;
 
     let bytes = std::fs::read(&path)
         .map_err(|e| format!("Failed to read image: {}", e))?;
@@ -161,7 +244,8 @@ pub async fn read_image_base64(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn open_file(path: String) -> Result<(), String> {
+pub async fn open_file(app_handle: AppHandle, lib: State<'_, LibraryHandle>, path: String) -> Result<(), String> {
+    check_path(&app_handle, &lib, &path)?;
     println!("[open_file] Opening file: {}", path);
 
     #[cfg(target_os = "linux")]
@@ -192,7 +276,14 @@ pub async fn open_file(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn open_folder(path: String) -> Result<(), String> {
+pub async fn open_folder(app_handle: AppHandle, lib: State<'_, LibraryHandle>, path: String) -> Result<(), String> {
+    check_path(&app_handle, &lib, &path)?;
+    open_folder_path(path)
+}
+
+/// Open a folder (or a file's folder) in the file manager, unchecked: for
+/// paths the backend chose itself.
+pub fn open_folder_path(path: String) -> Result<(), String> {
     println!("[open_folder] Requested path: {}", path);
 
     let folder_path = std::path::Path::new(&path);
@@ -465,9 +556,18 @@ pub async fn save_standalone_thumbnail(
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Copy a file, creating the destination's parent directory if needed.
+/// Copy a file, creating the destination's parent directory if needed. Both
+/// ends must be in the app's folders or picked in a dialog (the Thumbnail
+/// tab's Save As).
 #[tauri::command]
-pub async fn copy_file(source: String, destination: String) -> Result<(), String> {
+pub async fn copy_file(
+    app_handle: AppHandle,
+    lib: State<'_, LibraryHandle>,
+    source: String,
+    destination: String,
+) -> Result<(), String> {
+    check_path(&app_handle, &lib, &source)?;
+    check_path(&app_handle, &lib, &destination)?;
     if let Some(parent) = Path::new(&destination).parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create destination directory: {}", e))?;
@@ -499,6 +599,50 @@ mod tests {
 
     async fn ok_switch(_: String) -> Result<(), String> {
         Ok(())
+    }
+
+    #[test]
+    fn is_within_resolves_dots_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("sub/a.jpg"), b"x").unwrap();
+        std::fs::write(outside.join("secret"), b"x").unwrap();
+        let roots = vec![root.clone()];
+
+        assert!(is_within(&root.join("sub/a.jpg"), &roots));
+        assert!(is_within(&root, &roots));
+        // Not there yet (a copy's destination), in a folder not there yet.
+        assert!(is_within(&root.join("new/dir/b.jpg"), &roots));
+        assert!(!is_within(&outside.join("new.jpg"), &roots));
+        // `..` out of the root, existing or not.
+        assert!(!is_within(&root.join("sub/../../outside/secret"), &roots));
+        assert!(!is_within(&root.join("missing/../../outside/x"), &roots));
+        assert!(is_within(&root.join("sub/../sub/a.jpg"), &roots));
+        // Relative paths and look-alike prefixes.
+        assert!(!is_within(Path::new("lib/sub/a.jpg"), &roots));
+        std::fs::create_dir_all(tmp.path().join("lib2")).unwrap();
+        assert!(!is_within(&tmp.path().join("lib2/x"), &roots));
+        // No roots, nothing allowed.
+        assert!(!is_within(&root.join("sub/a.jpg"), &[]));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // A symlink inside the root that points out of it.
+            symlink(&outside, root.join("escape")).unwrap();
+            assert!(!is_within(&root.join("escape/secret"), &roots));
+            assert!(!is_within(&root.join("escape/new.jpg"), &roots));
+            // A dangling symlink as the destination itself.
+            symlink(outside.join("nope"), root.join("dangling")).unwrap();
+            assert!(!is_within(&root.join("dangling"), &roots));
+            // A root reached through a symlink still counts.
+            symlink(&root, tmp.path().join("alias")).unwrap();
+            assert!(is_within(&tmp.path().join("alias/sub/a.jpg"), &roots));
+            assert!(is_within(&root.join("sub/a.jpg"), &[tmp.path().join("alias")]));
+        }
     }
 
     #[tokio::test]

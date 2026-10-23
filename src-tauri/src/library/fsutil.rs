@@ -18,6 +18,30 @@ pub const TMP_MARKER: &str = ".tmp-";
 /// Write a file so that a crash leaves either the old or the new contents,
 /// never half of one: write a temp file, flush it, rename it over the target.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with(path, bytes, false)
+}
+
+/// `write_atomic` for a file only its owner may read (mode 600 on Unix),
+/// e.g. one holding sign-in tokens. The mode is set before the file has any
+/// contents.
+pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with(path, bytes, true)
+}
+
+fn create_file(path: &Path, private: bool) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    options.open(path)
+}
+
+fn write_atomic_with(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
@@ -33,7 +57,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     ));
 
     let result = (|| {
-        let mut file = File::create(&tmp)?;
+        let mut file = create_file(&tmp, private)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);

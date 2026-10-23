@@ -167,7 +167,7 @@ fn main() {
             commands::get_settings,
             commands::save_settings,
             commands::reset_state,
-            commands::get_app_data_dir,
+            commands::get_app_folders,
             commands::read_image_base64,
             commands::open_file,
             commands::open_folder,

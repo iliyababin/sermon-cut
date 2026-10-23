@@ -39,13 +39,19 @@ export function Settings() {
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<Field, string>>>({});
   const [savesInFlight, setSavesInFlight] = useState(0);
   const [savedOnce, setSavedOnce] = useState(false);
-  // As last loaded or saved; a save sends only what differs from it.
+  // As last confirmed by the backend (loaded or saved).
   const saved = useRef<SettingsType | null>(null);
+  // As last sent, per field; a save sends a field only if it differs from
+  // this. Diffing against `saved` instead would drop on→off→on while the
+  // "off" is still in flight: the "on" looks unchanged and is never sent.
+  const sent = useRef<SettingsType | null>(null);
   const edited = useRef<SettingsType | null>(null);
   // Fields waiting to be saved; null: until flushField (Enter or blur).
   const timers = useRef(new Map<Field, ReturnType<typeof setTimeout> | null>());
   // Per field: the newest save whose answer was taken.
   const newestApplied = useRef(new Map<Field, number>());
+  // Per field: the newest save sent.
+  const newestSent = useRef(new Map<Field, number>());
 
   useEffect(() => {
     edited.current = settings;
@@ -84,6 +90,9 @@ export function Settings() {
         getAppFolders(),
       ]);
       saved.current = loadedSettings;
+      sent.current = loadedSettings;
+      // Set now, not in the effect: a click can land before effects run.
+      edited.current = loadedSettings;
       setSettings(loadedSettings);
       setFolders(appFolders);
     } catch (err) {
@@ -97,7 +106,8 @@ export function Settings() {
    * flushField). */
   function edit<F extends Field>(field: F, value: SettingsType[F], delay = AUTOSAVE_DELAY_MS) {
     setSettings((s) => (s ? { ...s, [field]: value } : s));
-    if (edited.current) edited.current = { ...edited.current, [field]: value };
+    const base = edited.current ?? settings;
+    if (base) edited.current = { ...base, [field]: value };
     setFieldErrors(({ [field]: _, ...rest }) => rest as typeof fieldErrors);
     const previous = timers.current.get(field);
     if (previous) clearTimeout(previous);
@@ -127,12 +137,15 @@ export function Settings() {
   }
 
   async function saveField(field: Field) {
-    const base = saved.current;
+    const last = sent.current;
     const current = edited.current;
-    if (!base || !current) return;
-    const patch = settingsPatch(base, { ...base, [field]: current[field] });
+    if (!last || !current) return;
+    const patch = settingsPatch(last, { ...last, [field]: current[field] });
     if (Object.keys(patch).length === 0) return;
     const seq = nextSettingsSeq();
+    const value = current[field];
+    sent.current = { ...last, [field]: value };
+    newestSent.current.set(field, seq);
     setSavesInFlight((n) => n + 1);
     try {
       const updated = await saveSettings(patch, seq);
@@ -141,23 +154,24 @@ export function Settings() {
       // Each save owns its field. The answer's other fields may predate a
       // save of theirs that the backend applied first.
       saved.current = { ...(saved.current ?? updated), [field]: updated[field] };
+      if (newestSent.current.get(field) === seq && sent.current) {
+        sent.current = { ...sent.current, [field]: updated[field] };
+      }
       // Show the value as saved (e.g. trimmed), unless it was edited since.
-      const sent = current[field];
       setSettings((s) =>
-        s && s[field] === sent ? { ...s, [field]: updated[field] } : s
+        s && s[field] === value ? { ...s, [field]: updated[field] } : s
       );
       setSavedOnce(true);
     } catch (err) {
       setFieldErrors((e) => ({ ...e, [field]: errorMessage(err, "Couldn't save this setting") }));
-      if (field === "output_folder") {
-        // A refused folder change was put back; show the folder in use.
-        try {
-          const current = await getSettings();
-          saved.current = current;
-          setSettings((s) => (s ? { ...s, output_folder: current.output_folder } : current));
-        } catch {
-          // Keep the edit on screen.
-        }
+      // Roll back to the value last confirmed, unless a newer save of this
+      // field is on its way or the field was edited since (that edit is
+      // still to be saved).
+      if (newestSent.current.get(field) === seq && !timers.current.has(field) && saved.current) {
+        const confirmed = saved.current[field];
+        if (sent.current) sent.current = { ...sent.current, [field]: confirmed };
+        if (edited.current) edited.current = { ...edited.current, [field]: confirmed };
+        setSettings((s) => (s && s[field] === value ? { ...s, [field]: confirmed } : s));
       }
     } finally {
       setSavesInFlight((n) => n - 1);
@@ -233,6 +247,7 @@ export function Settings() {
     try {
       const fresh = await getSettings();
       saved.current = fresh;
+      sent.current = fresh;
       setSettings((s) => {
         if (!s) return fresh;
         const next = { ...fresh };

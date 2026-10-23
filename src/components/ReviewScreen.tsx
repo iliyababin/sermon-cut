@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useReducer, useRef } from "react";
 import {
   regenerateThumbnails,
   getVideo,
@@ -15,6 +15,7 @@ import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
 import { getDefaultTemplate } from "@/templates";
 import { splitTitleIntoLines } from "@/lib/utils";
 import { renderKey } from "./review/renderKey";
+import { canStartUpload, initialReviewState, reviewReducer } from "./review/reviewMachine";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
@@ -89,6 +90,8 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
   // matches what it would be rendered with now; only stale ones are redone.
   const [singleLine, setSingleLine] = useState(false);
   const [renderProgress, setRenderProgress] = useState("");
+  // A render that failed doesn't block uploading: the plain image is used.
+  const [renderError, setRenderError] = useState<string | null>(null);
   const titleLines = useMemo(
     () => (singleLine ? [title.trim()] : splitTitleIntoLines(title)).filter((l) => l),
     [title, singleLine]
@@ -112,6 +115,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     const delay = Object.keys(renders).length === 0 ? 0 : RENDER_DEBOUNCE_MS;
     const timeout = setTimeout(async () => {
       try {
+        setRenderError(null);
         const template = getDefaultTemplate();
         for (let i = 0; i < todo.length; i++) {
           if (cancelled) return;
@@ -125,6 +129,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
         }
       } catch (err) {
         console.error("Failed to render thumbnails:", err);
+        if (!cancelled) setRenderError(errorMessage(err, "Couldn't update the thumbnails"));
       } finally {
         if (!cancelled) setRenderProgress("");
       }
@@ -137,23 +142,21 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     // staleIds + keys capture everything a render depends on.
   }, [staleIds, keys, video.id]);
 
+  const thumbnailsReady = staleOptions.length === 0 || renderError !== null;
   const shownPath = (o: ThumbnailOption) => renders[o.id]?.path ?? o.path;
   const selectedOption = thumbnailOptions.find((o) => o.id === selectedSource) ?? thumbnailOptions[0] ?? null;
 
   const [isEditorOpen, setIsEditorOpen] = useState(false);
 
-  // Upload state
+  // Upload flow (see reviewMachine). The upload runs in the background; if
+  // this screen was reopened while one is going, it picks it up from the
+  // library's state.
   const [youtubeAuth, setYoutubeAuth] = useState<YouTubeAuthStatus | null>(null);
-  // The upload runs in the background; if this screen was reopened while one
-  // is going, pick it up from the library's state.
-  const [isUploading, setIsUploading] = useState(video.status === "uploading");
-  const [uploadProgress, setUploadProgress] = useState(video.upload_progress ?? 0);
-  const lastUpload = video.uploads[video.uploads.length - 1];
-  const [uploadedUrl, setUploadedUrl] = useState<string | null>(
-    video.status === "done" && lastUpload ? lastUpload.url : null
+  const [review, dispatch] = useReducer(reviewReducer, video, (v) =>
+    initialReviewState({ status: v.status, uploadProgress: v.upload_progress, uploads: v.uploads })
   );
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [uploadCount, setUploadCount] = useState(video.uploads.length);
+  const phase = review.phase;
+  const uploadReady = thumbnailsReady && preacher.trim() !== "";
 
   // Reprocessing state
   const [isReprocessing, setIsReprocessing] = useState(false);
@@ -207,15 +210,11 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       const e = event.payload;
       if (e.video_id !== video.id) return;
       if (e.status === "done" && e.url) {
-        setUploadedUrl(e.url);
-        setUploadCount((n) => n + 1);
-        setIsUploading(false);
+        dispatch({ type: "succeeded", url: e.url });
       } else if (e.status === "error") {
-        setUploadError(e.error || "Upload failed");
-        setIsUploading(false);
+        dispatch({ type: "failed", message: e.error || "Upload failed" });
       } else {
-        setIsUploading(true);
-        setUploadProgress((prev) => Math.max(prev, e.progress));
+        dispatch({ type: "progress", percent: e.progress });
       }
     });
 
@@ -283,56 +282,77 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
     }
   };
 
-  const handleUpload = async () => {
-    if (uploadCount > 0) {
-      const confirmed = await ask(
-        "This video has already been uploaded to YouTube. Upload it again as a new YouTube video?",
-        { title: "Upload again", kind: "warning", okLabel: "Upload Again", cancelLabel: "Cancel" }
-      );
-      if (!confirmed) return;
-    }
-
-    try {
-      await flush();
-      setIsUploading(true);
-      setUploadError(null);
-      setUploadProgress(0);
-
-      // Build description with chapters (adjusted for clip) and social links
-      let fullDescription = description;
-      const adjustedChapters = chapters.filter(
-        (ch) => ch.time >= startTime && ch.time <= endTime
-      );
-      if (adjustedChapters.length > 0) {
-        fullDescription += "\n\nChapters:\n";
-        fullDescription += adjustedChapters
-          .map((ch) => `${formatTime(ch.time - startTime)} ${ch.title}`)
-          .join("\n");
-      }
-
-      // Add social links footer
-      fullDescription += `\n\n---\n${SOCIAL_LINKS}`;
-
-      const source = selectedOption?.id;
-      const url = await youtubeUploadVideo(
-        video.id,
-        title,
-        fullDescription,
-        source,
-        source ? keys[source] : undefined,
-        "public",
-        startTime,   // trim start for caption adjustment
-        endTime      // trim end for caption adjustment
-      );
-      // The "done" event also sets this (and counts the upload).
-      setUploadedUrl(url);
-      setIsUploading(false);
-    } catch (err) {
-      console.error("Upload failed:", err);
-      setUploadError(errorMessage(err));
-      setIsUploading(false);
-    }
+  // Leave only once the edits are saved.
+  const handleBack = async () => {
+    await flush();
+    onBack();
   };
+
+  // "Upload again?" is asked when the machine says so, once.
+  useEffect(() => {
+    if (phase.kind !== "confirming") return;
+    let current = true;
+    ask("This video has already been uploaded to YouTube. Upload it again as a new YouTube video?", {
+      title: "Upload again",
+      kind: "warning",
+      okLabel: "Upload Again",
+      cancelLabel: "Cancel",
+    })
+      .then((yes) => current && dispatch({ type: yes ? "confirm" : "cancelConfirm" }))
+      .catch(() => current && dispatch({ type: "cancelConfirm" }));
+    return () => {
+      current = false;
+    };
+  }, [phase.kind]);
+
+  // Each upload the machine starts is sent exactly once: save the edits,
+  // then hand it to the backend.
+  const uploadRequest = phase.kind === "uploading" ? phase.request : null;
+  const startedRequest = useRef<number | null>(null);
+  useEffect(() => {
+    if (uploadRequest === null || startedRequest.current === uploadRequest) return;
+    startedRequest.current = uploadRequest;
+
+    (async () => {
+      try {
+        await flush();
+
+        // Build description with chapters (adjusted for clip) and social links
+        let fullDescription = description;
+        const adjustedChapters = chapters.filter(
+          (ch) => ch.time >= startTime && ch.time <= endTime
+        );
+        if (adjustedChapters.length > 0) {
+          fullDescription += "\n\nChapters:\n";
+          fullDescription += adjustedChapters
+            .map((ch) => `${formatTime(ch.time - startTime)} ${ch.title}`)
+            .join("\n");
+        }
+
+        // Add social links footer
+        fullDescription += `\n\n---\n${SOCIAL_LINKS}`;
+
+        const source = selectedOption?.id;
+        const url = await youtubeUploadVideo(
+          video.id,
+          title,
+          fullDescription,
+          source,
+          source ? keys[source] : undefined,
+          "public",
+          startTime,   // trim start for caption adjustment
+          endTime      // trim end for caption adjustment
+        );
+        // The "done" event reports this too; the machine counts it once.
+        dispatch({ type: "succeeded", url });
+      } catch (err) {
+        console.error("Upload failed:", err);
+        dispatch({ type: "failed", message: errorMessage(err) });
+      }
+    })();
+  }, [uploadRequest]);
+
+  const handleUpload = () => dispatch({ type: "upload", ready: uploadReady });
 
   const formatTime = formatTimeDisplay;
 
@@ -342,7 +362,8 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       <div className="p-4 border-b border-border flex items-center justify-between">
         <div className="flex items-center gap-4">
           <button
-            onClick={onBack}
+            onClick={handleBack}
+            aria-label="Back"
             className="p-2 hover:bg-secondary rounded-lg transition-colors"
           >
             <ArrowLeft className="w-5 h-5" />
@@ -367,17 +388,22 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
             )}
             Reprocess
           </button>
-          {youtubeAuth?.is_authenticated && !uploadedUrl && (
+          {youtubeAuth?.is_authenticated && phase.kind !== "done" && (
             <button
               onClick={handleUpload}
-              disabled={isUploading || !preacher.trim()}
+              disabled={!canStartUpload(phase) || !uploadReady}
               title={!preacher.trim() ? "Speaker name is required" : undefined}
               className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-colors"
             >
-              {isUploading ? (
+              {phase.kind === "uploading" ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  {uploadProgress}%
+                  {phase.progress}%
+                </>
+              ) : !thumbnailsReady ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Updating thumbnail…
                 </>
               ) : (
                 <>
@@ -391,7 +417,7 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       </div>
 
       {/* Upload Success Banner */}
-      {uploadedUrl && (
+      {phase.kind === "done" && (
         <div className="mx-4 mt-4 p-4 bg-green-100 dark:bg-green-900/30 rounded-lg">
           <div className="flex items-center justify-between">
             <div className="flex flex-col gap-2">
@@ -404,16 +430,13 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
             </div>
             <div className="flex items-center gap-2">
               <button
-                onClick={() => {
-                  setUploadedUrl(null);
-                  setUploadProgress(0);
-                }}
+                onClick={() => dispatch({ type: "uploadAgain" })}
                 className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors"
               >
                 Upload Again
               </button>
               <button
-                onClick={() => openUrl(uploadedUrl)}
+                onClick={() => openUrl(phase.url)}
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
               >
                 Open on YouTube
@@ -425,15 +448,16 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       )}
 
       {/* Upload Error Banner */}
-      {uploadError && (
+      {phase.kind === "error" && (
         <div className="mx-4 mt-4 p-4 bg-destructive/10 rounded-lg flex items-center justify-between">
           <div className="flex items-center gap-3">
             <AlertCircle className="w-6 h-6 text-destructive" />
-            <span className="text-destructive">{uploadError}</span>
+            <span className="text-destructive">{phase.message}</span>
           </div>
           <button
             onClick={handleUpload}
-            className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+            disabled={!uploadReady}
+            className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
           >
             Retry
           </button>
@@ -515,6 +539,11 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
                   <Loader2 className="w-3 h-3 animate-spin" />
                   <span className="text-xs text-muted-foreground">{renderProgress}</span>
                 </div>
+              )}
+              {renderError && !renderProgress && (
+                <p className="mb-3 text-xs text-destructive">
+                  {renderError}. Uploading uses the plain image.
+                </p>
               )}
 
               <div className="grid grid-cols-3 gap-2">

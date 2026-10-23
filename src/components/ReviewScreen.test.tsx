@@ -1,0 +1,134 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { VideoDetail } from "@/lib/types";
+import { renderKey } from "./review/renderKey";
+import { splitTitleIntoLines } from "@/lib/utils";
+
+const invoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: unknown) => invoke(cmd, args),
+  convertFileSrc: (p: string) => `asset://${p}`,
+}));
+vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn(() => Promise.resolve(true)) }));
+vi.mock("@tauri-apps/plugin-shell", () => ({ open: vi.fn() }));
+const renderThumbnailBatch = vi.fn();
+vi.mock("@/lib/thumbnailRenderer", () => ({
+  renderThumbnailBatch: (...args: unknown[]) => renderThumbnailBatch(...args),
+}));
+vi.mock("./ThumbnailEditor", () => ({ ThumbnailEditor: () => null }));
+
+import { ReviewScreen } from "./ReviewScreen";
+
+const TITLE = "The Hope We Have";
+const PREACHER = "Pastor X";
+const options = [
+  { id: "thumbnail_option_1.jpg", path: "/v/thumbnail_option_1.jpg", render_from: "/v/thumbnail_option_1_raw.jpg", version: "1" },
+  { id: "thumbnail_option_2.jpg", path: "/v/thumbnail_option_2.jpg", render_from: "/v/thumbnail_option_2_raw.jpg", version: "1" },
+];
+const currentKey = (o: (typeof options)[number]) =>
+  renderKey(o, { titleLines: splitTitleIntoLines(TITLE), preacher: PREACHER, singleLine: false });
+
+function video(overrides: Partial<VideoDetail> = {}): VideoDetail {
+  return {
+    id: "vid1",
+    file_name: "a.mp4",
+    file_path: "/lib/a.mp4",
+    title: "a",
+    status: "ready_for_review",
+    error: null,
+    duration: 600,
+    size: 1,
+    channel: null,
+    source_url: null,
+    hidden: false,
+    uploads: [],
+    added_at: "",
+    thumbnail: null,
+    processing_stage: null,
+    processing_progress: null,
+    processing_message: null,
+    upload_progress: null,
+    busy: false,
+    transcription: null,
+    trimmed_path: "/v/trimmed.mp4",
+    trim_start: 0,
+    trim_end: 600,
+    thumbnail_options: options,
+    // Already rendered with the current title and speaker.
+    renders: options.map((o) => ({ source: o.id, path: `/v/r_${o.id}`, render_key: currentKey(o) })),
+    selected_source: options[0].id,
+    selected_thumbnail: null,
+    review: { title: TITLE, description: "", preacher: PREACHER },
+    ...overrides,
+  };
+}
+
+function calls(cmd: string) {
+  return invoke.mock.calls.filter(([c]) => c === cmd);
+}
+
+beforeEach(() => {
+  invoke.mockReset();
+  invoke.mockImplementation((cmd: string) => {
+    switch (cmd) {
+      case "youtube_get_auth_status":
+        return Promise.resolve({ is_authenticated: true, channel_name: "Youth", channel_id: "UC1" });
+      case "youtube_upload_video":
+        return new Promise(() => {}); // still uploading
+      default:
+        return Promise.resolve(null);
+    }
+  });
+  renderThumbnailBatch.mockReset();
+  renderThumbnailBatch.mockResolvedValue([{ imageData: new Uint8Array([1]), index: 0 }]);
+});
+
+afterEach(cleanup);
+
+describe("ReviewScreen", () => {
+  it("doesn't re-render thumbnails whose stored render is current", async () => {
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    await screen.findByRole("button", { name: /upload/i });
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(renderThumbnailBatch).not.toHaveBeenCalled();
+    expect(calls("save_rendered_thumbnail")).toHaveLength(0);
+  });
+
+  it("sends one upload for a double-click", async () => {
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    const upload = await screen.findByRole("button", { name: /upload/i });
+    expect((upload as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(upload);
+    fireEvent.click(upload);
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(calls("youtube_upload_video")).toHaveLength(1);
+    const args = calls("youtube_upload_video")[0][1] as Record<string, unknown>;
+    expect(args.thumbnailSource).toBe(options[0].id);
+    expect(args.renderKey).toBe(currentKey(options[0]));
+  });
+
+  it("disables Upload while thumbnails are being updated", async () => {
+    renderThumbnailBatch.mockReturnValue(new Promise(() => {})); // never finishes
+    render(<ReviewScreen video={video({ renders: [] })} onBack={() => {}} />);
+    const upload = await screen.findByRole("button", { name: /updating thumbnail/i });
+    expect((upload as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(upload);
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(calls("youtube_upload_video")).toHaveLength(0);
+  });
+
+  it("saves edits before going back", async () => {
+    const onBack = vi.fn(() => {
+      // By the time the screen is left, the edit is saved.
+      const saves = calls("save_review");
+      expect(saves).toHaveLength(1);
+      expect((saves[0][1] as Record<string, unknown>).title).toBe("New title");
+    });
+    render(<ReviewScreen video={video()} onBack={onBack} />);
+    fireEvent.change(screen.getByDisplayValue(TITLE), { target: { value: "New title" } });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await waitFor(() => expect(onBack).toHaveBeenCalledTimes(1));
+  });
+});

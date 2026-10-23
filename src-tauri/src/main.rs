@@ -7,6 +7,8 @@ mod library;
 mod modal;
 mod notify;
 mod state;
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+mod test_hooks;
 mod thumbnail;
 mod tools;
 mod upload;
@@ -97,6 +99,8 @@ fn main() {
                     app.set_menu(menu)?;
                 }
                 tauri::async_runtime::spawn(tools::update_ytdlp_if_stale());
+                #[cfg(all(feature = "test-hooks", debug_assertions))]
+                test_hooks::spawn(handle.clone(), library.clone(), app_state.clone());
                 tauri::async_runtime::spawn({
                     let library = library.clone();
                     let app_state = app_state.clone();

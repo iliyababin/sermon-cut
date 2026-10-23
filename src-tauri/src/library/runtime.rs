@@ -2188,6 +2188,13 @@ impl Library {
         remaining
     }
 
+    /// Smoke-test hook: pretend an upload is running (nothing is sent).
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
+    pub fn hook_fake_upload(&self, id: &str) {
+        let active = ActiveUpload { percent: 0, cancel: CancellationToken::new() };
+        self.inner().uploads.insert(id.to_string(), active);
+    }
+
     /// What would be lost by quitting now, for the quit warning.
     pub fn work_in_progress(&self) -> Option<String> {
         self.inner().work_in_progress()

@@ -170,16 +170,16 @@ fn pick_and_save(
         let img = load_image(&mid.1)?;
         let fallback_crop = crop::calculate_fallback_crop(img.width(), img.height());
 
-        let mut cropped = crop_image(&img, &fallback_crop);
+        let cropped = crop_image(&img, &fallback_crop);
         // Crop-only variant for the template overlays (see the main loop).
         if count > 1 {
             let raw_path = output_dir.join(format!("{}thumbnail_option_1_raw.jpg", output_stem));
             save_jpeg(&cropped, &raw_path)?;
         }
-        grading::apply_color_grading(&mut cropped);
+        let graded = shrunk_and_graded(&cropped);
 
         let out_path = output_dir.join(format!("{}thumbnail_option_1.jpg", output_stem));
-        save_jpeg(&cropped, &out_path)?;
+        save_jpeg(&graded, &out_path)?;
 
         let abs = out_path
             .canonicalize()
@@ -203,16 +203,14 @@ fn pick_and_save(
             img.height(),
         );
 
-        // Save raw crop for editor use (multi-thumbnail mode)
+        // Cropped once. The plain crop, at full size for zooming in the
+        // editor, is what the template draws over (multi-thumbnail mode).
+        let cropped = crop_image(&img, &person_crop);
         if count > 1 {
-            let raw_cropped = crop_image(&img, &person_crop);
             let raw_path = output_dir.join(format!("{}thumbnail_option_{}_raw.jpg", output_stem, idx + 1));
-            save_jpeg(&raw_cropped, &raw_path)?;
+            save_jpeg(&cropped, &raw_path)?;
         }
-
-        // Crop → grade
-        let mut result = crop_image(&img, &person_crop);
-        grading::apply_color_grading(&mut result);
+        let result = shrunk_and_graded(&cropped);
 
         let out_name = if count > 1 {
             format!("{}thumbnail_option_{}.jpg", output_stem, idx + 1)
@@ -237,6 +235,14 @@ fn pick_and_save(
     }
 
     Ok(output_paths)
+}
+
+/// `img` scaled down to YouTube's 1280×720, then colour graded: grading is
+/// per pixel, so it's done on the smaller image.
+fn shrunk_and_graded(img: &RgbImage) -> RgbImage {
+    let mut out = fit::shrink(img).into_owned();
+    grading::apply_color_grading(&mut out);
+    out
 }
 
 /// Crop an `RgbImage` according to a `CropRect`.
@@ -289,16 +295,22 @@ pub async fn generate_thumbnail_options(
 }
 
 /// Process a custom image as a thumbnail: crop, and optionally colour grade.
-/// No logo: the template draws it.
+/// No logo: the template draws it. CPU work, so on a blocking thread.
 pub async fn process_custom_thumbnail(
     source_path: &str,
     output_dir: &Path,
     crop_rect: &CropRect,
     apply_color_grading_flag: bool,
 ) -> Result<String, String> {
-    let source = Path::new(source_path);
+    let (source, output_dir, crop_rect) = (PathBuf::from(source_path), output_dir.to_path_buf(), crop_rect.clone());
+    tokio::task::spawn_blocking(move || custom_thumbnail(&source, &output_dir, &crop_rect, apply_color_grading_flag))
+        .await
+        .map_err(|e| format!("Thumbnail task failed: {}", e))?
+}
+
+fn custom_thumbnail(source: &Path, output_dir: &Path, crop_rect: &CropRect, grade: bool) -> Result<String, String> {
     if !source.exists() {
-        return Err(format!("Source image not found: {}", source_path));
+        return Err(format!("Source image not found: {}", source.display()));
     }
 
     let timestamp = std::time::SystemTime::now()
@@ -307,10 +319,7 @@ pub async fn process_custom_thumbnail(
         .as_millis();
     let output_path = output_dir.join(format!("custom_thumbnail_{}.jpg", timestamp));
 
-    println!(
-        "[thumbnail] Processing custom thumbnail from: {}",
-        source_path
-    );
+    println!("[thumbnail] Processing custom thumbnail from: {}", source.display());
 
     // Upright, as the editor showed it: the crop is in that space.
     let decoded = decode::decode_file(source)?;
@@ -321,37 +330,30 @@ pub async fn process_custom_thumbnail(
     let x = crop_rect.x.clamp(0, (w - 1).max(0));
     let y = crop_rect.y.clamp(0, (h - 1).max(0));
     let clamped = CropRect { x, y, width: crop_rect.width.clamp(1, (w - x).max(1)), height: crop_rect.height.clamp(1, (h - y).max(1)) };
-
     println!(
         "[thumbnail] Cropping: x={}, y={}, w={}, h={}",
         clamped.x, clamped.y, clamped.width, clamped.height
     );
 
+    // Cropped once, scaled down to YouTube's size (a phone photo crop is far
+    // bigger), then sRGB with a transparent logo or graphic on white, then
+    // graded: the per-pixel work is done on the small image.
     let cropped = img.crop_imm(clamped.x as u32, clamped.y as u32, clamped.width as u32, clamped.height as u32);
-    // sRGB, and a transparent logo or graphic on white.
-    let mut result = decode::to_srgb_rgb8(&cropped, decoded.icc.as_deref(), decode::Background::White);
-
-    if apply_color_grading_flag {
-        println!("[thumbnail] Applying color grading");
+    let shrunk = fit::shrink_dynamic(&cropped);
+    let mut result = decode::to_srgb_rgb8(&shrunk, decoded.icc.as_deref(), decode::Background::White);
+    if grade {
         grading::apply_color_grading(&mut result);
     }
 
-    // Within YouTube's limits: a phone photo crop is far bigger than 1280×720.
     let jpeg = fit::encode_for_youtube(&result)?;
-    std::fs::write(&output_path, &jpeg)
-        .map_err(|e| format!("Failed to write {}: {}", output_path.display(), e))?;
-    println!(
-        "[thumbnail] Saved custom thumbnail to: {}",
-        output_path.display()
-    );
+    std::fs::write(&output_path, &jpeg).map_err(|e| format!("Failed to write {}: {}", output_path.display(), e))?;
+    println!("[thumbnail] Saved custom thumbnail to: {}", output_path.display());
 
     let absolute_path = output_path
         .canonicalize()
         .map_err(|e| format!("Failed to get absolute path: {}", e))?;
-
     Ok(absolute_path.to_string_lossy().to_string())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -391,5 +393,40 @@ mod tests {
         let img = image::open(&out).unwrap().to_rgb8();
         assert!(is_close(*img.get_pixel(1, 1), [255, 255, 255]), "{:?}", img.get_pixel(1, 1));
         assert!(is_close(*img.get_pixel(16, 9), [0, 0, 0]), "{:?}", img.get_pixel(16, 9));
+    }
+
+    #[tokio::test]
+    async fn a_short_clip_still_gets_a_thumbnail() {
+        if !crate::tools::ffmpeg_for_tests() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let video = tmp.path().join("clip.mp4");
+        let status = crate::tools::std_command("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=25", "-t", "8"])
+            .args(["-c:v", "mpeg4"])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let options = generate_thumbnail_options(&video, 0.0, 8.0, "T", &out, 10).await.unwrap();
+        assert_eq!(options.len(), 1, "one frame from a short clip");
+        let option = image::open(&options[0]).unwrap();
+        assert!(option.width() <= 1280 && option.height() <= 720);
+        // The plain crop stays full size, for zooming in the editor.
+        let raw = image::open(out.join("thumbnail_option_1_raw.jpg")).unwrap();
+        assert!(raw.width() > 1280, "{}", raw.width());
+    }
+
+    #[tokio::test]
+    async fn a_big_crop_is_scaled_to_youtube_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("big.png");
+        image::RgbImage::from_pixel(4000, 3000, image::Rgb([90, 120, 150])).save(&src).unwrap();
+        let out = process_custom_thumbnail(src.to_str().unwrap(), tmp.path(), &crop(0, 0, 3200, 1800), true).await.unwrap();
+        let img = image::open(&out).unwrap();
+        assert_eq!((img.width(), img.height()), (1280, 720));
     }
 }

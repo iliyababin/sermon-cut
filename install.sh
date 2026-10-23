@@ -99,7 +99,18 @@ fi
 rm -rf "$APP_OLD" "$APP_NEW"
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# On any exit: if the swap below was cut short and the app is missing, put
+# the old copy back; never leave a staged .new behind. A successful run has
+# the app in place and no .old, so this restores nothing.
+cleanup() {
+  if [ ! -d "$APP" ] && [ -d "$APP_OLD" ]; then
+    mv "$APP_OLD" "$APP" || true
+  fi
+  rm -rf "$APP_NEW" "$TMP"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "$TOOLS_DIR"
 

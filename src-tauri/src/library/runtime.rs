@@ -594,11 +594,31 @@ fn sweep(paths: &LibraryPaths) {
     }
 }
 
-/// Where a commit keeps a video's previous outputs until the new ones are
-/// in. Hidden, so no video.json can name it; a file `DONE` inside means
-/// the commit finished and only the clean-up was interrupted.
+/// Where a commit keeps a video's previous outputs (and video.json) until
+/// the new ones are in. Hidden, so no video.json can name it. Its journal,
+/// written before anything moves, lists what moves and how far it got.
 const COMMIT_BACKUP: &str = ".commit-backup";
-const COMMIT_DONE: &str = "DONE";
+const COMMIT_JOURNAL: &str = ".journal.json";
+/// What the backup's copy of video.json is called.
+const COMMIT_DATA: &str = "video.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CommitPhase {
+    /// Moving files; a crash now means the old outputs go back.
+    Swapping,
+    /// The new outputs and video.json are in; only the clean-up is left.
+    Done,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct CommitJournal {
+    phase: CommitPhase,
+    /// Old outputs, moved from the folder into the backup.
+    old: Vec<String>,
+    /// New outputs, moved from staging into the folder.
+    new: Vec<String>,
+}
 
 /// Generated files in a video folder: everything but the transcript and
 /// the review data.
@@ -617,35 +637,70 @@ fn files_in(dir: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
     Ok(names)
 }
 
+/// Names of the plain files in `dir` (sorted), leaving out any that
+/// aren't UTF-8, which no job makes.
+fn names_in(dir: &Path) -> std::io::Result<Vec<String>> {
+    Ok(files_in(dir)?.into_iter().filter_map(|n| n.into_string().ok()).collect())
+}
+
+fn write_journal(backup: &Path, journal: &CommitJournal) -> Result<(), String> {
+    fsutil::write_json_atomic(&backup.join(COMMIT_JOURNAL), journal)
+}
+
+/// Start a commit: the backup folder, its journal, and a copy of the
+/// current video.json, before anything moves.
+fn begin_commit(dir: &Path, staging: &Path) -> Result<CommitJournal, String> {
+    let backup = dir.join(COMMIT_BACKUP);
+    std::fs::create_dir(&backup).map_err(|e| format!("Failed to save results: {}", e))?;
+    let begun = (|| -> Result<CommitJournal, String> {
+        let old: Vec<String> = names_in(dir)
+            .map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?
+            .into_iter()
+            .filter(|n| is_output(n))
+            .collect();
+        // Everything staged, folders too.
+        let mut new: Vec<String> = std::fs::read_dir(staging)
+            .map_err(|e| format!("Failed to read work folder: {}", e))?
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        new.sort();
+        let journal = CommitJournal { phase: CommitPhase::Swapping, old, new };
+        write_journal(&backup, &journal)?;
+        match std::fs::read(dir.join("video.json")) {
+            Ok(bytes) => fsutil::write_atomic(&backup.join(COMMIT_DATA), &bytes)
+                .map_err(|e| format!("Failed to save results: {}", e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed to read video.json: {}", e)),
+        }
+        Ok(journal)
+    })();
+    if begun.is_err() {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
+    begun
+}
+
 /// Swap a job's staged outputs into the video folder, then write its new
 /// video.json with `write_data`. The old outputs are moved aside first and
 /// put back if anything fails, so the folder is never left half old, half
-/// new; on success they're deleted.
+/// new; on success they're deleted. A crash midway is put right by
+/// `recover_commit`.
 fn swap_in_outputs(dir: &Path, staging: &Path, write_data: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     recover_commit(dir);
     let backup = dir.join(COMMIT_BACKUP);
-    std::fs::create_dir(&backup).map_err(|e| format!("Failed to save results: {}", e))?;
+    let mut journal = begin_commit(dir, staging)?;
 
     let mut aside = Vec::new();
     let mut moved_in = Vec::new();
     let result = (|| -> Result<(), String> {
-        let old = files_in(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
-        for name in old.into_iter().filter(|n| is_output(&n.to_string_lossy())) {
-            std::fs::rename(dir.join(&name), backup.join(&name)).map_err(|e| format!("Failed to save results: {}", e))?;
-            aside.push(name);
+        for name in &journal.old {
+            std::fs::rename(dir.join(name), backup.join(name)).map_err(|e| format!("Failed to save results: {}", e))?;
+            aside.push(name.clone());
         }
-        let staged: Vec<_> = {
-            let mut v: Vec<_> = std::fs::read_dir(staging)
-                .map_err(|e| format!("Failed to read work folder: {}", e))?
-                .flatten()
-                .map(|e| e.file_name())
-                .collect();
-            v.sort();
-            v
-        };
-        for name in staged {
-            std::fs::rename(staging.join(&name), dir.join(&name)).map_err(|e| format!("Failed to save results: {}", e))?;
-            moved_in.push(name);
+        for name in &journal.new {
+            std::fs::rename(staging.join(name), dir.join(name)).map_err(|e| format!("Failed to save results: {}", e))?;
+            moved_in.push(name.clone());
         }
         write_data()
     })();
@@ -653,7 +708,8 @@ fn swap_in_outputs(dir: &Path, staging: &Path, write_data: impl FnOnce() -> Resu
     match result {
         Ok(()) => {
             // Committed. Mark it so an interrupted clean-up isn't undone.
-            let _ = std::fs::write(backup.join(COMMIT_DONE), b"");
+            journal.phase = CommitPhase::Done;
+            let _ = write_journal(&backup, &journal);
             let _ = std::fs::remove_dir_all(&backup);
             Ok(())
         }
@@ -675,25 +731,44 @@ fn swap_in_outputs(dir: &Path, staging: &Path, write_data: impl FnOnce() -> Resu
     }
 }
 
-/// Finish a commit a crash interrupted: one that got as far as DONE is
-/// kept; otherwise the folder goes back to the old outputs.
+/// Finish a commit a crash interrupted. One whose journal reached Done is
+/// kept. Otherwise the folder goes back to how it was: everything in the
+/// backup (old outputs, old video.json) is moved back, replacing the new
+/// file of the same name, and new outputs with no old namesake are
+/// deleted. Files only ever in the folder (old ones not yet moved aside,
+/// or already put back) stay. The backup is removed once all is back.
 fn recover_commit(dir: &Path) {
     let backup = dir.join(COMMIT_BACKUP);
     if !std::fs::symlink_metadata(&backup).is_ok_and(|m| m.is_dir()) {
         return;
     }
-    if !backup.join(COMMIT_DONE).exists() {
-        let saved = files_in(&backup).unwrap_or_default();
-        if let Ok(current) = files_in(dir) {
-            for name in current.iter().filter(|n| is_output(&n.to_string_lossy())) {
-                let _ = std::fs::remove_file(dir.join(name));
+    // No journal: the crash came before it was written, when nothing had
+    // moved yet.
+    let journal: Option<CommitJournal> = fsutil::read_json(&backup.join(COMMIT_JOURNAL), 1 << 20).ok().flatten();
+    // `DONE`: how an earlier build marked a finished commit.
+    if journal.as_ref().is_some_and(|j| j.phase == CommitPhase::Done) || backup.join("DONE").exists() {
+        let _ = std::fs::remove_dir_all(&backup);
+        return;
+    }
+    let mut restored = true;
+    for name in names_in(&backup).unwrap_or_default() {
+        if name == COMMIT_JOURNAL || name.contains(TMP_MARKER) {
+            continue;
+        }
+        restored &= std::fs::rename(backup.join(&name), dir.join(&name)).is_ok();
+    }
+    if let Some(j) = &journal {
+        let old: HashSet<&String> = j.old.iter().collect();
+        for name in j.new.iter().filter(|n| !old.contains(n) && is_output(n)) {
+            match std::fs::remove_file(dir.join(name)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => restored = false,
+                _ => {}
             }
         }
-        for name in saved {
-            let _ = std::fs::rename(backup.join(&name), dir.join(&name));
-        }
     }
-    let _ = std::fs::remove_dir_all(&backup);
+    if restored {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
 }
 
 fn newer_library_message(wanted: Option<&str>) -> String {
@@ -3554,27 +3629,95 @@ mod tests {
         assert!(staging.join("trimmed.mp4").exists(), "the new outputs are back in staging");
     }
 
+    /// A crash during a commit, after `steps` of its moves: the journal is
+    /// written, then each old output is moved aside, then each new one in.
+    fn crash_after(dir: &Path, staging: &Path, steps: usize) {
+        let journal = begin_commit(dir, staging).unwrap();
+        let backup = dir.join(COMMIT_BACKUP);
+        let moves = journal
+            .old
+            .iter()
+            .map(|n| (dir.join(n), backup.join(n)))
+            .chain(journal.new.iter().map(|n| (staging.join(n), dir.join(n))));
+        for (from, to) in moves.take(steps) {
+            std::fs::rename(from, to).unwrap();
+        }
+    }
+
     #[test]
-    fn interrupted_commit_is_finished_or_undone_on_open() {
+    fn a_crash_before_anything_moved_changes_nothing() {
         let (_t, dir, staging) = commit_fixture();
         let before = contents(&dir);
-        // Crashed after moving the old outputs aside and one new one in.
-        let backup = dir.join(COMMIT_BACKUP);
-        std::fs::create_dir(&backup).unwrap();
-        for f in ["trimmed.mp4", "thumbnail_option_1.jpg", "thumbnail_option_9.jpg"] {
-            std::fs::rename(dir.join(f), backup.join(f)).unwrap();
-        }
-        std::fs::rename(staging.join("trimmed.mp4"), dir.join("trimmed.mp4")).unwrap();
+        // Only the backup folder was made.
+        std::fs::create_dir(dir.join(COMMIT_BACKUP)).unwrap();
         recover_commit(&dir);
         assert_eq!(contents(&dir), before);
+        // The journal was written too.
+        crash_after(&dir, &staging, 0);
+        recover_commit(&dir);
+        assert_eq!(contents(&dir), before);
+    }
 
-        // Crashed after it finished, during the clean-up: kept.
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(backup.join("thumbnail_option_9.jpg"), "old 9").unwrap();
-        std::fs::write(backup.join(COMMIT_DONE), "").unwrap();
-        std::fs::remove_file(dir.join("thumbnail_option_9.jpg")).unwrap();
+    #[test]
+    fn a_crash_while_moving_the_old_outputs_aside_keeps_them_all() {
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        // trimmed.mp4 is still in the folder; the thumbnails are aside.
+        crash_after(&dir, &staging, 2);
+        assert!(dir.join("trimmed.mp4").exists() && !dir.join("thumbnail_option_1.jpg").exists());
+        recover_commit(&dir);
+        assert_eq!(contents(&dir), before);
+    }
+
+    #[test]
+    fn a_crash_while_moving_the_new_outputs_in_puts_the_old_back() {
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        std::fs::write(staging.join("thumbnail_option_5.jpg"), "new only").unwrap();
+        // All three old outputs aside, two of three new ones in.
+        crash_after(&dir, &staging, 5);
+        recover_commit(&dir);
+        assert_eq!(contents(&dir), before);
+    }
+
+    #[test]
+    fn a_crash_after_video_json_was_written_puts_the_old_back() {
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        crash_after(&dir, &staging, 5);
+        std::fs::write(dir.join("video.json"), "new").unwrap();
+        recover_commit(&dir);
+        assert_eq!(contents(&dir), before);
+    }
+
+    #[test]
+    fn a_crash_during_a_rollback_finishes_it() {
+        let (_t, dir, staging) = commit_fixture();
+        let before = contents(&dir);
+        crash_after(&dir, &staging, 5);
+        let backup = dir.join(COMMIT_BACKUP);
+        // The rollback took the new outputs out and put one old one back.
+        for n in ["thumbnail_option_1.jpg", "trimmed.mp4"] {
+            std::fs::rename(dir.join(n), staging.join(n)).unwrap();
+        }
+        std::fs::rename(backup.join("thumbnail_option_1.jpg"), dir.join("thumbnail_option_1.jpg")).unwrap();
+        recover_commit(&dir);
+        assert_eq!(contents(&dir), before);
+    }
+
+    #[test]
+    fn a_crash_during_the_clean_up_keeps_the_new_outputs() {
+        let (_t, dir, staging) = commit_fixture();
+        crash_after(&dir, &staging, 5);
+        std::fs::write(dir.join("video.json"), "new").unwrap();
+        let backup = dir.join(COMMIT_BACKUP);
+        let mut journal: CommitJournal = fsutil::read_json(&backup.join(COMMIT_JOURNAL), 1 << 20).unwrap().unwrap();
+        journal.phase = CommitPhase::Done;
+        write_journal(&backup, &journal).unwrap();
+        let after = contents(&dir).into_iter().filter(|(n, _)| n != COMMIT_BACKUP).collect::<Vec<_>>();
         recover_commit(&dir);
         assert!(!backup.exists());
+        assert_eq!(contents(&dir), after);
         assert!(!dir.join("thumbnail_option_9.jpg").exists());
     }
 

@@ -27,20 +27,31 @@ export function youtubeTitle(title: string): string {
 }
 
 /**
- * The chapters of the trimmed video, timed from its start: only those
- * inside the trim, the first moved to 0:00, each at least 10 s after the
- * one before and (when the length is known) 10 s before the end. Fewer
- * than 3 left means none, since YouTube would ignore them anyway.
+ * The chapters of the trimmed video, timed from its start. The chapter in
+ * effect where the trim starts becomes 0:00 and keeps its title (or, if the
+ * trim starts before every chapter, the first one moves to 0:00). After
+ * that come the chapters inside the trim, each at least 10 s after the one
+ * before and (when the length is known) 10 s before the end; 0:00 is
+ * required, so a chapter within 10 s of it is the one dropped. Fewer than 3
+ * left means none, since YouTube would ignore them anyway.
  */
 export function youtubeChapters(chapters: Chapter[], startTime: number, endTime: number): Chapter[] {
   const length = endTime - startTime;
-  const inside = chapters
-    .filter((ch) => ch.time >= startTime && (length <= 0 || ch.time < endTime))
-    .map((ch) => ({ time: ch.time - startTime, title: stripAngles(ch.title).replace(/\s+/g, " ").trim() }))
+  const clean = chapters
+    .map((ch) => ({ time: ch.time, title: stripAngles(ch.title).replace(/\s+/g, " ").trim() }))
     .filter((ch) => ch.title)
     .sort((a, b) => a.time - b.time);
-  if (inside.length === 0) return [];
-  inside[0] = { ...inside[0], time: 0 };
+  const opening = clean.filter((ch) => ch.time <= startTime).pop();
+  const inside = clean
+    .filter((ch) => ch.time > startTime && (length <= 0 || ch.time < endTime))
+    .map((ch) => ({ time: ch.time - startTime, title: ch.title }));
+  if (opening) {
+    inside.unshift({ time: 0, title: opening.title });
+  } else if (inside.length > 0) {
+    inside[0] = { ...inside[0], time: 0 };
+  } else {
+    return [];
+  }
 
   const kept: Chapter[] = [];
   for (const ch of inside) {

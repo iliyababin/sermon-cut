@@ -15,10 +15,29 @@ describe("youtubeTitle", () => {
 
 describe("youtubeChapters", () => {
   it("keeps the trim's chapters, timed from its start, the first at 0:00", () => {
-    expect(youtubeChapters([ch(50, "Before"), ...chapters, ch(900, "After")], 90, 600)).toEqual([
+    expect(youtubeChapters([...chapters, ch(900, "After")], 90, 600)).toEqual([
       ch(0, "Welcome"),
       ch(70, "The Word"),
       ch(310, "Prayer"),
+    ]);
+  });
+
+  it("starts with the chapter in effect where the trim starts, keeping its title", () => {
+    expect(youtubeChapters([ch(50, "Before"), ...chapters, ch(900, "After")], 80, 600)).toEqual([
+      ch(0, "Before"),
+      ch(20, "Welcome"),
+      ch(80, "The Word"),
+      ch(320, "Prayer"),
+    ]);
+    // A chapter starting exactly at the trim is the one in effect.
+    expect(youtubeChapters(chapters, 100, 600)[0]).toEqual(ch(0, "Welcome"));
+  });
+
+  it("drops the next chapter when it starts within 10 s of 0:00", () => {
+    expect(youtubeChapters([ch(50, "Before"), ...chapters], 95, 600)).toEqual([
+      ch(0, "Before"),
+      ch(65, "The Word"),
+      ch(305, "Prayer"),
     ]);
   });
 

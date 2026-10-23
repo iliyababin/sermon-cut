@@ -11,7 +11,7 @@ mod tools;
 mod upload;
 mod youtube;
 
-use library::runtime::Library;
+use library::runtime::{HeartbeatOutcome, Library};
 use state::AppState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
     let app = app.clone();
     app.dialog()
         .message(format!(
-            "Sermon Cut is still working on {}. Quitting now stops it, and it will have to start over.",
+            "Sermon Cut is still working on {}. Quitting now stops it. Uploads continue where they left off next time; processing and downloads start over.",
             work
         ))
         .title("Quit Sermon Cut?")
@@ -107,14 +107,18 @@ fn main() {
                         let mut tick = tokio::time::interval(std::time::Duration::from_secs(library::lock::HEARTBEAT_SECS));
                         loop {
                             tick.tick().await;
-                            let lib = library.clone();
-                            let reopen = tokio::task::spawn_blocking(move || lib.heartbeat()).await.unwrap_or(false);
-                            if reopen {
-                                if let Err(e) = library.reopen().await {
-                                    eprintln!("[library] Reopen failed: {}", e);
+                            match library.heartbeat().await {
+                                HeartbeatOutcome::Unchanged => continue,
+                                HeartbeatOutcome::LostTo(host) => {
+                                    eprintln!("[library] {} took over the library; read-only now", host);
                                 }
-                                let _ = tauri::Emitter::emit(&handle, "library-changed", ());
+                                HeartbeatOutcome::Regained => {
+                                    if let Err(e) = library.reopen().await {
+                                        eprintln!("[library] Reopen failed: {}", e);
+                                    }
+                                }
                             }
+                            let _ = tauri::Emitter::emit(&handle, "library-changed", ());
                         }
                     }
                 });

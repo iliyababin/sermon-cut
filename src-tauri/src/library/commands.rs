@@ -104,7 +104,9 @@ pub async fn regenerate_thumbnails(
     app_handle: AppHandle,
     video_id: String,
 ) -> Result<Vec<String>, String> {
-    lib.regenerate_thumbnails(&app_handle, &state, &video_id).await
+    let result = lib.regenerate_thumbnails(&app_handle, &state, &video_id).await;
+    changed(&app_handle);
+    result
 }
 
 #[tauri::command]
@@ -118,16 +120,19 @@ pub async fn process_custom_thumbnail(
     apply_color_grading: bool,
     apply_logo_overlay: bool,
 ) -> Result<String, String> {
-    lib.custom_thumbnail(
-        &app_handle,
-        &state,
-        &video_id,
-        source_image_path,
-        crop_rect,
-        apply_color_grading,
-        apply_logo_overlay,
-    )
-    .await
+    let result = lib
+        .custom_thumbnail(
+            &app_handle,
+            &state,
+            &video_id,
+            source_image_path,
+            crop_rect,
+            apply_color_grading,
+            apply_logo_overlay,
+        )
+        .await;
+    changed(&app_handle);
+    result
 }
 
 /// Save a template render (PNG bytes) of one thumbnail source. Resolves
@@ -135,12 +140,16 @@ pub async fn process_custom_thumbnail(
 #[tauri::command]
 pub async fn save_rendered_thumbnail(
     lib: State<'_, LibraryHandle>,
+    app_handle: AppHandle,
     video_id: String,
     source: String,
     render_key: String,
     image_data: Vec<u8>,
 ) -> Result<String, String> {
-    lib.save_rendered_thumbnail(&video_id, &source, &render_key, image_data).await
+    let result = lib.save_rendered_thumbnail(&video_id, &source, &render_key, image_data).await;
+    // The card shows the selected render.
+    changed(&app_handle);
+    result
 }
 
 /// Show the trimmed video (or the original) in Finder.
@@ -288,7 +297,7 @@ pub async fn youtube_upload_video(
     }
     .await;
 
-    library.finish_upload(&video_id, &job, result.as_ref().ok(), &options);
+    library.finish_upload(&video_id, job, result.as_ref().ok(), &options);
     // Final word for any screen showing this upload, including a review
     // screen reopened after the one that started it went away.
     match &result {
@@ -318,7 +327,7 @@ pub async fn retry_thumbnail(
     app_handle: AppHandle,
     video_id: String,
 ) -> Result<Vec<UploadWarning>, String> {
-    let (youtube_id, thumbnail) = lib.begin_thumbnail_retry(&video_id)?;
+    let (youtube_id, thumbnail, busy) = lib.begin_thumbnail_retry(&video_id)?;
     let result = async {
         let tokens = crate::commands::AppTokens { state: &state, app: &app_handle };
         let endpoints = upload::Endpoints::youtube();
@@ -333,7 +342,7 @@ pub async fn retry_thumbnail(
         }
     }
     .await;
-    let remaining = lib.finish_thumbnail_retry(&video_id, &youtube_id, result.is_ok());
+    let remaining = lib.finish_thumbnail_retry(busy, &video_id, &youtube_id, result.is_ok());
     changed(&app_handle);
     result.map(|_| remaining).map_err(|e| UploadWarning::thumbnail(&e).message)
 }

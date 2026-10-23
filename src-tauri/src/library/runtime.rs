@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 pub type AppStateHandle = Arc<tokio::sync::Mutex<AppState>>;
 
+const SWITCH_BUSY: &str = "Wait for processing, downloads and uploads to finish before changing the library folder.";
+
 const FILE_CHANGED: &str =
     "The file changed since it was added. If it's still copying, wait for it to finish, then try again.";
 
@@ -214,11 +216,33 @@ pub fn effective_logo(app: &AppHandle, logo_path: Option<String>) -> Option<Stri
     }
 }
 
+/// What to tell the user about a read-only library. `why` is either the
+/// message itself or "locked:<host>" when another computer has it open.
+fn readonly_reason(why: &str) -> String {
+    match why.strip_prefix("locked:") {
+        Some(host) => format!(
+            "This library is open on {}. It's read-only here so the two computers don't overwrite each other's changes.",
+            host
+        ),
+        None => why.to_string(),
+    }
+}
+
+/// Outcome of a lock heartbeat.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeartbeatOutcome {
+    Unchanged,
+    /// Another computer took the library over; it's read-only here now.
+    LostTo(String),
+    /// The computer that had it let go; reopen it for writing.
+    Regained,
+}
+
 impl Inner {
     fn writable(&self) -> Result<&LibraryPaths, String> {
         match (&self.mode, &self.paths) {
             (Mode::Writable, Some(paths)) => Ok(paths),
-            (Mode::ReadOnly(why), _) | (Mode::Unavailable(why), _) => Err(why.clone()),
+            (Mode::ReadOnly(why), _) | (Mode::Unavailable(why), _) => Err(readonly_reason(why)),
             _ => Err("The library isn't open".into()),
         }
     }
@@ -226,6 +250,28 @@ impl Inner {
     fn save(&self) -> Result<(), String> {
         let paths = self.writable()?;
         manifest::save(paths, &self.manifest)
+    }
+
+    /// The second half of a scan: match what `observe` saw to the entries.
+    /// Callers hold the scan lock from before the observe until after this.
+    fn apply_scan(&mut self, obs: &[FileObs]) {
+        let busy = self.busy_set();
+        let last_present = self.scanned.then(|| std::mem::take(&mut self.last.present));
+        let reconciled = scan::reconcile(&mut self.manifest.entries, obs, &busy, last_present.as_ref());
+        if self.mode == Mode::Writable {
+            if let Some(paths) = self.paths.clone() {
+                for id in &reconciled.replaced {
+                    if let Err(e) = manifest::remove_video_dir(&paths, id) {
+                        eprintln!("[library] {}", e);
+                    }
+                }
+            }
+            if reconciled.changed {
+                self.save_logged();
+            }
+        }
+        self.last = reconciled;
+        self.scanned = true;
     }
 
     fn save_logged(&self) {
@@ -340,7 +386,9 @@ impl Inner {
             error: match status {
                 ViewStatus::Error => e.error.clone().or_else(|| Some("Something went wrong".into())),
                 ViewStatus::Unreadable => Some("The file changed and Sermon Cut can't read it any more. It may be incomplete or damaged.".into()),
-                _ => None,
+                ViewStatus::Queued | ViewStatus::Processing => None,
+                // E.g. a failed re-process of a video whose earlier results are kept.
+                _ => e.error.clone(),
             },
             duration: e.duration,
             size: e.fingerprint.size,
@@ -397,14 +445,7 @@ impl Inner {
             Mode::Writable => (true, true, self.notice.clone(), None),
             Mode::ReadOnly(why) => {
                 let locked = why.strip_prefix("locked:").map(|h| h.to_string());
-                let message = match &locked {
-                    Some(host) => format!(
-                        "This library is open on {}. It's read-only here so the two computers don't overwrite each other's changes.",
-                        host
-                    ),
-                    None => why.clone(),
-                };
-                (true, false, Some(message), locked)
+                (true, false, Some(readonly_reason(why)), locked)
             }
             Mode::Unavailable(why) => (false, false, Some(why.clone()), None),
         };
@@ -563,7 +604,14 @@ impl Library {
             },
         };
 
-        let session = self.inner().session.clone();
+        // A reopen (lock regained, take over) can happen while this session
+        // still has work going; that work's files and status are left alone.
+        let (session, running, idle) = {
+            let g = self.inner();
+            let running = g.running.as_ref().map(|r| r.id.clone());
+            let idle = running.is_none() && g.downloads.is_empty() && g.busy.is_empty();
+            (g.session.clone(), running, idle)
+        };
         if mode == Mode::Writable {
             match lock::acquire(&paths, &session, force_lock) {
                 Ok(Acquire::Acquired) => {}
@@ -574,8 +622,17 @@ impl Library {
 
         let mut manifest = manifest;
         if mode == Mode::Writable {
-            sweep(&paths);
-            if manifest::mark_interrupted(&mut manifest) {
+            if idle {
+                sweep(&paths);
+            }
+            let has_results = |e: &Entry| {
+                paths.video_dir(&e.id).is_ok_and(|dir| {
+                    let data = manifest::load_video_data(&dir);
+                    !data.thumbnail_options.is_empty()
+                        && data.trimmed_file.is_some_and(|t| dir.join(t).is_file())
+                })
+            };
+            if manifest::mark_interrupted(&mut manifest, running.as_deref(), has_results) {
                 if let Err(e) = manifest::save(&paths, &manifest) {
                     eprintln!("[library] Failed to save library.json: {}", e);
                 }
@@ -583,7 +640,8 @@ impl Library {
         }
 
         let mut g = self.inner();
-        // Interrupted entries get their running job back if one is somehow still alive.
+        // Queue, running job, uploads and downloads are this session's and
+        // carry on; mark_interrupted skipped the running job's entry.
         g.paths = Some(paths);
         g.manifest = manifest;
         g.mode = mode;
@@ -600,25 +658,30 @@ impl Library {
             return Ok(());
         }
         if g.running.is_some() || !g.queue.is_empty() || !g.downloads.is_empty() || !g.busy.is_empty() {
-            return Err("Wait for processing, downloads and uploads to finish before changing the library folder.".into());
+            return Err(SWITCH_BUSY.into());
         }
         Ok(())
     }
 
     /// Point the library at a different folder (Settings).
     pub async fn switch(self: &Arc<Self>, configured: String) -> Result<(), String> {
-        self.check_switch(&configured)?;
-        if self.inner().configured == configured {
-            return Ok(());
-        }
+        // No scan, trash or download commit runs meanwhile; while the folder
+        // changes, nothing can be written (the old paths are gone).
         let _scan = self.scan_lock.lock().await;
+        let (paths, session) = {
+            let mut g = self.inner();
+            if g.configured == configured {
+                return Ok(());
+            }
+            if g.running.is_some() || !g.queue.is_empty() || !g.downloads.is_empty() || !g.busy.is_empty() {
+                return Err(SWITCH_BUSY.into());
+            }
+            g.configured = configured;
+            g.mode = Mode::Unavailable("Switching folders…".into());
+            (g.paths.take(), g.session.clone())
+        };
         let lib = self.clone();
         blocking(move || {
-            let (paths, session) = {
-                let mut g = lib.inner();
-                g.configured = configured;
-                (g.paths.take(), g.session.clone())
-            };
             if let Some(old) = paths {
                 lock::release(&old, &session);
             }
@@ -645,25 +708,45 @@ impl Library {
     }
 
     /// Refresh lock.json; go read-only if another computer took over.
-    /// Returns true when another computer has let go of a library we were
-    /// locked out of, so it should be reopened for writing.
-    pub fn heartbeat(&self) -> bool {
-        let mut g = self.inner();
-        let Some(paths) = g.paths.clone() else { return false };
-        match g.mode.clone() {
-            Mode::Writable => {
-                match lock::heartbeat(&paths, &g.session) {
-                    Ok(Some(host)) => g.mode = Mode::ReadOnly(format!("locked:{}", host)),
-                    Ok(None) => {}
-                    Err(e) => eprintln!("[library] Lock heartbeat failed: {}", e),
+    /// `Regained` means another computer let go of a library we were locked
+    /// out of, so it should be reopened for writing. Holds the scan lock so
+    /// it can't write the lock file of a folder being switched away from.
+    pub async fn heartbeat(self: &Arc<Self>) -> HeartbeatOutcome {
+        let _scan = self.scan_lock.lock().await;
+        let (paths, session, mode) = {
+            let g = self.inner();
+            let Some(paths) = g.paths.clone() else { return HeartbeatOutcome::Unchanged };
+            (paths, g.session.clone(), g.mode.clone())
+        };
+        let lib = self.clone();
+        let outcome = blocking(move || match mode {
+            Mode::Writable => match lock::heartbeat(&paths, &session) {
+                Ok(Some(host)) => {
+                    let mut g = lib.inner();
+                    // Unchanged meanwhile (the scan lock keeps switches out,
+                    // but not every mode change).
+                    if g.mode == Mode::Writable {
+                        g.mode = Mode::ReadOnly(format!("locked:{}", host));
+                        return HeartbeatOutcome::LostTo(host);
+                    }
+                    HeartbeatOutcome::Unchanged
                 }
-                false
-            }
+                Ok(None) => HeartbeatOutcome::Unchanged,
+                Err(e) => {
+                    eprintln!("[library] Lock heartbeat failed: {}", e);
+                    HeartbeatOutcome::Unchanged
+                }
+            },
             Mode::ReadOnly(why) if why.starts_with("locked:") => {
-                matches!(lock::acquire(&paths, &g.session, false), Ok(Acquire::Acquired))
+                match lock::acquire(&paths, &session, false) {
+                    Ok(Acquire::Acquired) => HeartbeatOutcome::Regained,
+                    _ => HeartbeatOutcome::Unchanged,
+                }
             }
-            _ => false,
-        }
+            _ => HeartbeatOutcome::Unchanged,
+        })
+        .await;
+        outcome.unwrap_or(HeartbeatOutcome::Unchanged)
     }
 
     pub async fn reopen(self: &Arc<Self>) -> Result<(), String> {
@@ -760,23 +843,7 @@ impl Library {
                 return Ok(());
             }
         };
-        let busy = g.busy_set();
-        let last_present = g.scanned.then(|| std::mem::take(&mut g.last.present));
-        let reconciled = scan::reconcile(&mut g.manifest.entries, &obs, &busy, last_present.as_ref());
-        if g.mode == Mode::Writable {
-            if let Some(paths) = g.paths.clone() {
-                for id in &reconciled.replaced {
-                    if let Err(e) = manifest::remove_video_dir(&paths, id) {
-                        eprintln!("[library] {}", e);
-                    }
-                }
-            }
-            if reconciled.changed {
-                g.save_logged();
-            }
-        }
-        g.last = reconciled;
-        g.scanned = true;
+        g.apply_scan(&obs);
         Ok(())
     }
 
@@ -911,38 +978,70 @@ impl Library {
         );
     }
 
+    /// Take the next queued video and mark it processing.
+    fn start_next(&self) -> Option<(String, CancellationToken)> {
+        let mut g = self.inner();
+        while let Some(id) = g.queue.pop_front() {
+            let Ok(e) = g.entry_mut(&id) else { continue };
+            let previous = e.status;
+            e.status = EntryStatus::Processing;
+            let token = CancellationToken::new();
+            g.running = Some(Running {
+                id: id.clone(),
+                stage: ProcessingStage::ExtractingAudio,
+                progress: 0.0,
+                message: "Starting...".into(),
+                cancel: token.clone(),
+                previous,
+            });
+            g.save_logged();
+            return Some((id, token));
+        }
+        None
+    }
+
+    /// Record how the running job ended (None: cancelled). A failed
+    /// re-process of a video that already had results keeps them (run_job
+    /// only replaces them when it succeeds) and its status, with the error
+    /// shown on its card.
+    fn finish_job(&self, id: &str, result: &Option<Result<(), String>>) {
+        let staging = {
+            let mut g = self.inner();
+            let running = g.running.take();
+            let previous = running.map(|r| r.previous).unwrap_or(EntryStatus::New);
+            let staging = g.paths.as_ref().map(|p| p.tmp_dir().join(format!("job-{}", id)));
+            if let Ok(e) = g.entry_mut(id) {
+                match result {
+                    Some(Ok(())) => {}
+                    Some(Err(err)) if matches!(previous, EntryStatus::Done | EntryStatus::ReadyForReview) => {
+                        e.status = previous;
+                        e.error = Some(format!("Re-processing failed: {}", err));
+                    }
+                    Some(Err(err)) => {
+                        e.status = EntryStatus::Error;
+                        e.error = Some(err.clone());
+                    }
+                    None => {
+                        e.status = if previous == EntryStatus::Processing { EntryStatus::New } else { previous };
+                        // A cancelled retry still shows why it failed before.
+                        if e.status != EntryStatus::Error {
+                            e.error = None;
+                        }
+                    }
+                }
+            }
+            g.save_logged();
+            staging
+        };
+        if let Some(staging) = staging {
+            let _ = std::fs::remove_dir_all(staging);
+        }
+    }
+
     /// Runs queued jobs one at a time, forever.
     pub async fn worker(self: Arc<Self>, app: AppHandle, app_state: AppStateHandle) {
         loop {
-            let next = {
-                let mut g = self.inner();
-                let next = g.queue.pop_front();
-                if let Some(id) = &next {
-                    let token = CancellationToken::new();
-                    let previous = match g.entry_mut(id) {
-                        Ok(e) => {
-                            let previous = e.status;
-                            e.status = EntryStatus::Processing;
-                            e.error = None;
-                            previous
-                        }
-                        Err(_) => continue,
-                    };
-                    g.running = Some(Running {
-                        id: id.clone(),
-                        stage: ProcessingStage::ExtractingAudio,
-                        progress: 0.0,
-                        message: "Starting...".into(),
-                        cancel: token.clone(),
-                        previous,
-                    });
-                    g.save_logged();
-                    next.map(|id| (id, token))
-                } else {
-                    None
-                }
-            };
-            let Some((id, token)) = next else {
+            let Some((id, token)) = self.start_next() else {
                 self.wake.notified().await;
                 continue;
             };
@@ -952,33 +1051,8 @@ impl Library {
                 r = self.run_job(&app, &app_state, &id) => Some(r),
                 _ = token.cancelled() => None,
             };
+            self.finish_job(&id, &result);
 
-            let staging = {
-                let mut g = self.inner();
-                let running = g.running.take();
-                let staging = g.paths.as_ref().map(|p| p.tmp_dir().join(format!("job-{}", id)));
-                if let Ok(e) = g.entry_mut(&id) {
-                    match &result {
-                        Some(Ok(())) => {}
-                        Some(Err(err)) => {
-                            e.status = EntryStatus::Error;
-                            e.error = Some(err.clone());
-                        }
-                        None => {
-                            e.status = running.map(|r| r.previous).unwrap_or(EntryStatus::New);
-                            if e.status == EntryStatus::Processing {
-                                e.status = EntryStatus::New;
-                            }
-                            e.error = None;
-                        }
-                    }
-                }
-                g.save_logged();
-                staging
-            };
-            if let Some(staging) = staging {
-                let _ = std::fs::remove_dir_all(staging);
-            }
             if let Some(Err(err)) = &result {
                 eprintln!("[process] {} failed: {}", id, err);
                 let _ = app.emit(
@@ -1042,6 +1116,9 @@ impl Library {
                 let result = crate::modal::transcribe_audio(&path_string(&audio), &api_url, api_key.as_deref()).await;
                 let _ = std::fs::remove_file(&audio);
                 let transcription = result?;
+                // The one output saved straight away rather than staged: it
+                // costs a paid transcription, and it's keyed to the file's
+                // hash, so it only replaces a transcript of other content.
                 manifest::save_transcript(
                     &video_dir,
                     &TranscriptFile {
@@ -1171,25 +1248,31 @@ impl Library {
 
     /// Move the user's file to the Trash, then delete the app's data for it.
     pub async fn trash(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        self.trash_with(id, move_to_trash).await
+    }
+
+    async fn trash_with(self: &Arc<Self>, id: &str, mover: fn(&Path) -> Result<(), String>) -> Result<(), String> {
+        // A scan that listed the file just before it went would add it back
+        // as a new video once the entry is gone.
+        let _scan = self.scan_lock.lock().await;
         let path = self.with_entry(id, |g, paths| {
             g.require_idle(id)?;
-            let e = g.entry(id)?;
-            let path = paths.original(&e.file_name)?;
+            let path = paths.original(&g.entry(id)?.file_name)?;
             g.busy.insert(id.to_string());
             Ok(path)
         })?;
+        let _busy = BusyGuard { lib: &**self, id: id.to_string() };
         let lib = self.clone();
         let check = path.clone();
         let result = blocking(move || -> Result<(), String> {
             let paths = lib.inner().paths.clone().ok_or("The library isn't open")?;
             paths.verify_original(&check)?;
-            move_to_trash(&check)
+            mover(&check)
         })
         .await
         .and_then(|r| r);
 
         let mut g = self.inner();
-        g.busy.remove(id);
         result.map_err(|e| {
             format!(
                 "Couldn't move \"{}\" to the Trash: {}. Some network and external drives have no Trash; delete the file in Finder if you want it gone.",
@@ -1212,7 +1295,8 @@ impl Library {
     /// is ignored rather than losing the text edits.
     pub fn save_review(&self, id: &str, review: Review, selected_source: Option<String>) -> Result<(), String> {
         self.with_entry(id, |g, paths| {
-            if g.running.as_ref().is_some_and(|r| r.id == id) {
+            // Processing replaces video.json, so edits made now would be lost.
+            if g.queue.iter().any(|q| q == id) || g.running.as_ref().is_some_and(|r| r.id == id) {
                 return Err("This video is being processed".into());
             }
             let dir = paths.ensure_video_dir(id)?;
@@ -1227,24 +1311,22 @@ impl Library {
         })
     }
 
-    /// Mark an id busy for an operation that runs outside the lock.
-    fn begin_op(&self, id: &str) -> Result<(LibraryPaths, Entry, VideoData), String> {
-        self.with_entry(id, |g, paths| {
+    /// Mark an id busy for an operation that runs outside the lock, until
+    /// the returned guard is dropped.
+    fn begin_op(&self, id: &str) -> Result<(BusyGuard<'_>, LibraryPaths, Entry, VideoData), String> {
+        let (paths, e, data) = self.with_entry(id, |g, paths| {
             g.require_idle(id)?;
-            g.busy.insert(id.to_string());
             let e = g.entry(id)?.clone();
             let data = manifest::load_video_data(&paths.video_dir(id)?);
+            g.busy.insert(id.to_string());
             Ok((paths.clone(), e, data))
-        })
-    }
-
-    fn end_op(&self, id: &str) {
-        self.inner().busy.remove(id);
+        })?;
+        Ok((BusyGuard { lib: self, id: id.to_string() }, paths, e, data))
     }
 
     pub async fn regenerate_thumbnails(self: &Arc<Self>, app: &AppHandle, app_state: &AppStateHandle, id: &str) -> Result<Vec<String>, String> {
-        let (paths, entry, data) = self.begin_op(id)?;
-        let result = async {
+        let (_busy, paths, entry, data) = self.begin_op(id)?;
+        async {
             let logo = effective_logo(app, app_state.lock().await.settings.logo_path.clone());
             let dir = paths.ensure_video_dir(id)?;
             let transcript = manifest::load_transcript(&dir).map(|t| t.transcription);
@@ -1305,9 +1387,7 @@ impl Library {
             manifest::save_video_data(&dir, &data)?;
             Ok(names.iter().map(|n| path_string(&dir.join(n))).collect())
         }
-        .await;
-        self.end_op(id);
-        result
+        .await
     }
 
     pub async fn custom_thumbnail(
@@ -1320,8 +1400,8 @@ impl Library {
         grading: bool,
         with_logo: bool,
     ) -> Result<String, String> {
-        let (paths, _entry, _data) = self.begin_op(id)?;
-        let result = async {
+        let (_busy, paths, _entry, _data) = self.begin_op(id)?;
+        async {
             let logo = if with_logo {
                 effective_logo(app, app_state.lock().await.settings.logo_path.clone())
             } else {
@@ -1340,9 +1420,7 @@ impl Library {
             manifest::save_video_data(&dir, &data)?;
             Ok(path_string(&dir.join(name)))
         }
-        .await;
-        self.end_op(id);
-        result
+        .await
     }
 
     /// Persist a template render of one thumbnail source, replacing that
@@ -1410,9 +1488,9 @@ impl Library {
         id: &str,
         thumbnail_source: Option<String>,
         render_key: Option<String>,
-    ) -> Result<UploadJob, String> {
-        let (paths, entry, data) = self.begin_op(id)?;
-        let prepare = || -> Result<UploadJob, String> {
+    ) -> Result<UploadJob<'_>, String> {
+        let (busy, paths, entry, data) = self.begin_op(id)?;
+        let prepare = || -> Result<(PathBuf, Option<PathBuf>, Option<Vec<crate::state::TranscriptSegment>>), String> {
             let dir = paths.video_dir(id)?;
             let video_path = match data.trimmed_file.as_ref().map(|n| dir.join(n)).filter(|p| p.exists()) {
                 Some(p) => p,
@@ -1422,23 +1500,21 @@ impl Library {
             let segments = manifest::load_transcript(&dir)
                 .filter(|t| t.file_hash == entry.fingerprint.hash)
                 .map(|t| t.transcription.segments);
-            Ok(UploadJob {
-                video_path,
-                thumbnail_path,
-                segments,
-                file_hash: entry.fingerprint.hash.clone(),
-                cancel: CancellationToken::new(),
-            })
+            Ok((video_path, thumbnail_path, segments))
         };
-        let job = prepare();
-        match &job {
-            Ok(job) => {
-                let active = ActiveUpload { percent: 0, cancel: job.cancel.clone() };
-                self.inner().uploads.insert(id.to_string(), active);
-            }
-            Err(_) => self.end_op(id),
-        }
-        job
+        // On an error, dropping the guard frees the video again.
+        let (video_path, thumbnail_path, segments) = prepare()?;
+        let cancel = CancellationToken::new();
+        let active = ActiveUpload { percent: 0, cancel: cancel.clone() };
+        self.inner().uploads.insert(id.to_string(), active);
+        Ok(UploadJob {
+            video_path,
+            thumbnail_path,
+            segments,
+            file_hash: entry.fingerprint.hash.clone(),
+            cancel,
+            _busy: busy,
+        })
     }
 
     pub fn set_upload_progress(&self, id: &str, percent: u32) {
@@ -1476,9 +1552,8 @@ impl Library {
 
     /// End an upload; with an outcome it succeeded and is recorded, with
     /// the privacy and playlist it was uploaded with and any warnings.
-    pub fn finish_upload(&self, id: &str, job: &UploadJob, outcome: Option<&UploadOutcome>, options: &UploadOptions) {
+    pub fn finish_upload(&self, id: &str, job: UploadJob<'_>, outcome: Option<&UploadOutcome>, options: &UploadOptions) {
         let mut g = self.inner();
-        g.busy.remove(id);
         g.uploads.remove(id);
         let Some(outcome) = outcome else { return };
         if let Ok(e) = g.entry_mut(id) {
@@ -1496,13 +1571,17 @@ impl Library {
             e.error = None;
         }
         g.save_logged();
+        // Recorded first, then free (the job's guard): a second upload can't
+        // start without seeing this one.
+        drop(g);
+        drop(job);
     }
 
     /// For "Set thumbnail again": the last upload's YouTube id and the
     /// thumbnail to send (the selected one), with the video marked busy.
     /// Finish with `finish_thumbnail_retry`.
-    pub fn begin_thumbnail_retry(&self, id: &str) -> Result<(String, PathBuf), String> {
-        let (paths, entry, data) = self.begin_op(id)?;
+    pub fn begin_thumbnail_retry(&self, id: &str) -> Result<(String, PathBuf, BusyGuard<'_>), String> {
+        let (busy, paths, entry, data) = self.begin_op(id)?;
         let prepare = || -> Result<(String, PathBuf), String> {
             let video_id = entry
                 .uploads
@@ -1515,18 +1594,15 @@ impl Library {
             let thumbnail = resolve_thumbnail(&dir, &data, None, None)?.ok_or("This video has no thumbnail to send.")?;
             Ok((video_id, thumbnail))
         };
-        let r = prepare();
-        if r.is_err() {
-            self.end_op(id);
-        }
-        r
+        let (video_id, thumbnail) = prepare()?;
+        Ok((video_id, thumbnail, busy))
     }
 
     /// After "Set thumbnail again": on success the thumbnail warning goes.
     /// Returns the upload's remaining warnings.
-    pub fn finish_thumbnail_retry(&self, id: &str, video_id: &str, ok: bool) -> Vec<UploadWarning> {
+    pub fn finish_thumbnail_retry(&self, busy: BusyGuard<'_>, id: &str, video_id: &str, ok: bool) -> Vec<UploadWarning> {
+        drop(busy);
         let mut g = self.inner();
-        g.busy.remove(id);
         let mut remaining = Vec::new();
         if let Ok(e) = g.entry_mut(id) {
             if let Some(rec) = e.uploads.iter_mut().rev().find(|u| u.video_id.as_deref() == Some(video_id)) {
@@ -1605,16 +1681,17 @@ impl Library {
         url: &str,
         quality: &str,
     ) -> Result<String, String> {
-        let info = crate::youtube_dl::get_video_info(url).await?;
+        // Listed (and so blocking a folder switch) from the start, while the
+        // details are fetched too.
         let job_id = super::new_id();
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let paths = {
             let mut g = self.inner();
             let paths = g.writable()?.clone();
             g.downloads.push(DownloadItem {
                 job_id: job_id.clone(),
-                youtube_id: info.id.clone(),
-                title: info.title.clone(),
+                youtube_id: String::new(),
+                title: "Getting video details…".into(),
                 cancel: Some(cancel_tx),
             });
             paths
@@ -1623,6 +1700,19 @@ impl Library {
 
         let work = paths.tmp_dir().join(format!("dl-{}", job_id));
         let result = async {
+            let info = tokio::select! {
+                info = crate::youtube_dl::get_video_info(url) => info?,
+                _ = cancel_rx.wait_for(|cancelled| *cancelled) => return Err("Download cancelled".to_string()),
+            };
+            {
+                let mut g = self.inner();
+                if let Some(d) = g.downloads.iter_mut().find(|d| d.job_id == job_id) {
+                    d.youtube_id = info.id.clone();
+                    d.title = info.title.clone();
+                }
+            }
+            emit_changed(app);
+
             paths.ensure_dir(&paths.tmp_dir())?;
             std::fs::create_dir_all(&work).map_err(|e| format!("Failed to create download folder: {}", e))?;
             let file = crate::youtube_dl::download_video(url, quality, &info.id, &work, cancel_rx, app.clone()).await?;
@@ -1637,8 +1727,11 @@ impl Library {
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_else(|| "mp4".into());
 
-            // Hold the lock across the move and the new entry, so a scan
-            // can't see the file before it has its YouTube details.
+            // Under the scan lock, so a scan that listed the folder before
+            // the move can't mark the new entry missing; and under `inner`
+            // across the move and the new entry, so a scan can't see the
+            // file before it has its YouTube details.
+            let _scan = self.scan_lock.lock().await;
             let mut g = self.inner();
             g.writable()?;
             let name = move_into_library(&file, &paths.root, &download_file_name(&info.title, &info.id, &ext))?;
@@ -1663,6 +1756,9 @@ impl Library {
 
     pub fn cancel_download(&self, youtube_id: &str) {
         let g = self.inner();
+        if youtube_id.is_empty() {
+            return;
+        }
         for d in g.downloads.iter().filter(|d| d.youtube_id == youtube_id || d.job_id == youtube_id) {
             if let Some(tx) = &d.cancel {
                 let _ = tx.send(true);
@@ -1700,12 +1796,29 @@ impl UploadOptions {
     }
 }
 
-pub struct UploadJob {
+pub struct UploadJob<'a> {
     pub video_path: PathBuf,
     pub thumbnail_path: Option<PathBuf>,
     pub segments: Option<Vec<crate::state::TranscriptSegment>>,
     pub file_hash: String,
     pub cancel: CancellationToken,
+    /// The video stays busy until the job is finished or dropped.
+    _busy: BusyGuard<'a>,
+}
+
+/// Keeps a video marked busy (no processing, reset, trash or second upload)
+/// until dropped, including on an early return or a panic.
+pub struct BusyGuard<'a> {
+    lib: &'a Library,
+    id: String,
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = self.lib.inner();
+        g.busy.remove(&self.id);
+        g.uploads.remove(&self.id);
+    }
 }
 
 /// The upload session kept on a library entry.
@@ -1918,7 +2031,7 @@ mod tests {
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.upload_progress, Some(42));
 
-        lib.finish_upload(&id, &job, Some(&outcome("x", vec![])), &public());
+        lib.finish_upload(&id, job, Some(&outcome("x", vec![])), &public());
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Done);
         assert_eq!(v.upload_progress, None);
@@ -1927,7 +2040,7 @@ mod tests {
 
         // A failed upload goes back to how it was, with nothing recorded.
         let job = lib.begin_upload(&id, None, None).unwrap();
-        lib.finish_upload(&id, &job, None, &public());
+        lib.finish_upload(&id, job, None, &public());
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Done);
         assert_eq!(v.uploads.len(), 1);
@@ -1945,7 +2058,7 @@ mod tests {
         let store = EntrySession { lib: &lib, id: &id };
         let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
         store.save(Some(&session));
-        lib.finish_upload(&id, &job, None, &public());
+        lib.finish_upload(&id, job, None, &public());
 
         // Survives a restart (library.json read again).
         let root = lib.root().unwrap();
@@ -1954,7 +2067,7 @@ mod tests {
         assert_eq!(reopened.upload_session(&id), Some(session.clone()));
 
         let job = lib.begin_upload(&id, None, None).unwrap();
-        lib.finish_upload(&id, &job, Some(&outcome("abc", vec![])), &public());
+        lib.finish_upload(&id, job, Some(&outcome("abc", vec![])), &public());
         assert_eq!(lib.upload_session(&id), None);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads[0].video_id.as_deref(), Some("abc"));
@@ -1967,7 +2080,7 @@ mod tests {
         let job = lib.begin_upload(&id, None, None).unwrap();
         lib.cancel_upload(&id).unwrap();
         assert!(job.cancel.is_cancelled());
-        lib.finish_upload(&id, &job, None, &public());
+        lib.finish_upload(&id, job, None, &public());
         assert!(lib.cancel_upload(&id).is_err());
     }
 
@@ -1977,17 +2090,17 @@ mod tests {
         let thumb = UploadWarning { kind: WarningKind::Thumbnail, message: "t".into() };
         let captions = UploadWarning { kind: WarningKind::Captions, message: "c".into() };
         let job = lib.begin_upload(&id, None, None).unwrap();
-        lib.finish_upload(&id, &job, Some(&outcome("vid9", vec![thumb.clone(), captions.clone()])), &public());
+        lib.finish_upload(&id, job, Some(&outcome("vid9", vec![thumb.clone(), captions.clone()])), &public());
 
-        let (video_id, path) = lib.begin_thumbnail_retry(&id).unwrap();
+        let (video_id, path, busy) = lib.begin_thumbnail_retry(&id).unwrap();
         assert_eq!(video_id, "vid9");
         assert_eq!(path, dir.join("thumbnail_option_2.jpg"));
         // Busy meanwhile.
         assert!(lib.begin_upload(&id, None, None).is_err());
         // A failure keeps the warning.
-        assert_eq!(lib.finish_thumbnail_retry(&id, &video_id, false), vec![thumb, captions.clone()]);
-        let (video_id, _) = lib.begin_thumbnail_retry(&id).unwrap();
-        assert_eq!(lib.finish_thumbnail_retry(&id, &video_id, true), vec![captions.clone()]);
+        assert_eq!(lib.finish_thumbnail_retry(busy, &id, &video_id, false), vec![thumb, captions.clone()]);
+        let (video_id, _, busy) = lib.begin_thumbnail_retry(&id).unwrap();
+        assert_eq!(lib.finish_thumbnail_retry(busy, &id, &video_id, true), vec![captions.clone()]);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads[0].warnings, vec![captions]);
         assert!(!v.busy);
@@ -2027,7 +2140,7 @@ mod tests {
         let (_t, lib, id, _dir) = processed_library();
         let job = lib.begin_upload(&id, None, None).unwrap();
         let options = UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PL1".into()) };
-        lib.finish_upload(&id, &job, Some(&outcome("y", vec![])), &options);
+        lib.finish_upload(&id, job, Some(&outcome("y", vec![])), &options);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads[0].privacy.as_deref(), Some("unlisted"));
         assert_eq!(v.uploads[0].playlist_id.as_deref(), Some("PL1"));
@@ -2139,7 +2252,7 @@ mod tests {
         let (_t, lib, id, _dir) = processed_library();
         let job = lib.begin_upload(&id, None, None).unwrap();
         lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k", png()).await.unwrap();
-        lib.finish_upload(&id, &job, None, &public());
+        lib.finish_upload(&id, job, None, &public());
 
         lib.inner().queue.push_back(id.clone());
         let err = lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k2", png()).await.unwrap_err();
@@ -2159,17 +2272,17 @@ mod tests {
 
         let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("k".into())).unwrap();
         assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
-        lib.finish_upload(&id, &job, None, &public());
+        lib.finish_upload(&id, job, None, &public());
 
         // A stale key falls back to the source itself.
         let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("old".into())).unwrap();
         assert_eq!(job.thumbnail_path, Some(dir.join("thumbnail_option_2.jpg")));
-        lib.finish_upload(&id, &job, None, &public());
+        lib.finish_upload(&id, job, None, &public());
 
         // No source given: the selected one's render.
         let job = lib.begin_upload(&id, None, None).unwrap();
         assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
-        lib.finish_upload(&id, &job, None, &public());
+        lib.finish_upload(&id, job, None, &public());
 
         assert!(lib.begin_upload(&id, Some("/etc/passwd".into()), None).is_err());
         assert!(!lib.inner().busy.contains(&id), "a refused upload doesn't stay busy");
@@ -2186,6 +2299,134 @@ mod tests {
         let d = lib.detail(&id).unwrap();
         assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_1.jpg"));
         assert_eq!(d.review.title.as_deref(), Some("U"));
+    }
+
+    #[tokio::test]
+    async fn trash_during_a_scan_leaves_no_ghost() {
+        let (_t, lib, id, _dir) = processed_library();
+        let root = lib.root().unwrap();
+        // A scan is under way and has listed the file...
+        let scanning = lib.scan_lock.lock().await;
+        let known = scan::known_files(&lib.inner().manifest.entries);
+        let probe = |_: &Path| Some(1.0);
+        let obs = scan::observe(&root, &known, &mut ScanCache::default(), &probe, std::time::Duration::ZERO).unwrap();
+        assert_eq!(obs.len(), 1);
+        // ...when Move to Trash is clicked.
+        let trash = tokio::spawn({
+            let (lib, id) = (lib.clone(), id.clone());
+            async move { lib.trash_with(&id, |p| std::fs::remove_file(p).map_err(|e| e.to_string())).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(root.join("a.mp4").exists(), "the trash waits for the scan");
+        lib.inner().apply_scan(&obs);
+        drop(scanning);
+        trash.await.unwrap().unwrap();
+
+        assert!(!root.join("a.mp4").exists());
+        let g = lib.inner();
+        assert!(g.manifest.entries.is_empty(), "no entry comes back for the trashed file");
+        assert!(g.busy.is_empty());
+    }
+
+    #[test]
+    fn review_is_refused_while_queued() {
+        let (_t, lib, id, _dir) = processed_library();
+        lib.inner().queue.push_back(id.clone());
+        let err = lib.save_review(&id, Review::default(), None).unwrap_err();
+        assert!(err.contains("processed"), "{err}");
+        lib.inner().queue.clear();
+        lib.save_review(&id, Review::default(), None).unwrap();
+    }
+
+    #[test]
+    fn failed_reprocess_keeps_status_and_outputs() {
+        let (_t, lib, id, dir) = processed_library();
+        lib.inner().queue.push_back(id.clone());
+        let (started, _token) = lib.start_next().unwrap();
+        assert_eq!(started, id);
+        assert_eq!(lib.view(vec![]).videos[0].status, ViewStatus::Processing);
+
+        lib.finish_job(&id, &Some(Err("ffmpeg broke".into())));
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(v.status, ViewStatus::ReadyForReview);
+        assert_eq!(v.error.as_deref(), Some("Re-processing failed: ffmpeg broke"));
+        assert!(dir.join("thumbnail_option_1.jpg").is_file());
+        assert_eq!(lib.detail(&id).unwrap().thumbnail_options.len(), 2);
+
+        // Cancelling the next try clears the old failure; a first-time
+        // failure is an Error.
+        lib.inner().queue.push_back(id.clone());
+        lib.start_next().unwrap();
+        lib.finish_job(&id, &None);
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!((v.status, v.error), (ViewStatus::ReadyForReview, None));
+        lib.inner().manifest.get_mut(&id).unwrap().status = EntryStatus::New;
+        lib.inner().queue.push_back(id.clone());
+        lib.start_next().unwrap();
+        lib.finish_job(&id, &Some(Err("no network".into())));
+        let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!((v.status, v.error.as_deref()), (ViewStatus::Error, Some("no network")));
+    }
+
+    #[test]
+    fn locked_library_errors_name_the_other_computer() {
+        let (_t, lib, id, _dir) = processed_library();
+        lib.inner().mode = Mode::ReadOnly("locked:Office iMac".into());
+        let err = lib.reset(&id).unwrap_err();
+        assert!(err.starts_with("This library is open on Office iMac."), "{err}");
+        assert_eq!(lib.view(vec![]).message.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn busy_guard_frees_the_video_on_panic() {
+        let (_t, lib, id, _dir) = processed_library();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _busy = lib.begin_op(&id).unwrap();
+            assert!(lib.inner().busy.contains(&id));
+            panic!("thumbnail pipeline crashed");
+        }));
+        assert!(r.is_err());
+        assert!(!lib.inner().busy.contains(&id));
+        assert!(lib.reset(&id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_takeover_and_release() {
+        let (_t, lib, _id, _dir) = processed_library();
+        assert_eq!(lib.heartbeat().await, HeartbeatOutcome::Unchanged);
+        let paths = lib.inner().paths.clone().unwrap();
+        let other = lock::LockInfo {
+            host: "Office iMac".into(),
+            pid: 1,
+            session: "other".into(),
+            app_version: "0".into(),
+            heartbeat: chrono::Utc::now().timestamp(),
+        };
+        fsutil::write_json_atomic(&paths.lock_file(), &other).unwrap();
+        assert_eq!(lib.heartbeat().await, HeartbeatOutcome::LostTo("Office iMac".into()));
+        let view = lib.view(vec![]);
+        assert!(!view.writable);
+        assert_eq!(view.locked_by.as_deref(), Some("Office iMac"));
+        assert_eq!(lib.heartbeat().await, HeartbeatOutcome::Unchanged);
+
+        // The other Mac lets go.
+        std::fs::remove_file(paths.lock_file()).unwrap();
+        assert_eq!(lib.heartbeat().await, HeartbeatOutcome::Regained);
+        lib.reopen().await.unwrap();
+        assert!(lib.view(vec![]).writable);
+    }
+
+    #[tokio::test]
+    async fn switch_refuses_while_busy() {
+        let (_t, lib, id, _dir) = processed_library();
+        let other = tempfile::tempdir().unwrap();
+        let folder = other.path().to_string_lossy().to_string();
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        assert!(lib.switch(folder.clone()).await.is_err());
+        lib.finish_upload(&id, job, None, &public());
+        lib.switch(folder).await.unwrap();
+        let view = lib.view(vec![]);
+        assert!(view.available && view.writable && view.videos.is_empty());
     }
 
     #[test]

@@ -140,15 +140,24 @@ pub fn save(paths: &LibraryPaths, manifest: &Manifest) -> Result<(), String> {
     fsutil::write_json_atomic(&paths.manifest(), manifest)
 }
 
-/// When the app restarts, the job that was running is gone.
-pub fn mark_interrupted(manifest: &mut Manifest) -> bool {
+/// When the app restarts, the job that was running is gone. A video that
+/// already had results (a re-process) keeps them, since processing only
+/// replaces them when it finishes. `running` is a job of this session that
+/// is still going (the library was reopened under it), left alone.
+pub fn mark_interrupted(manifest: &mut Manifest, running: Option<&str>, has_results: impl Fn(&Entry) -> bool) -> bool {
     let mut changed = false;
     for e in &mut manifest.entries {
-        if e.status == EntryStatus::Processing {
+        if e.status != EntryStatus::Processing || running == Some(e.id.as_str()) {
+            continue;
+        }
+        if has_results(e) {
+            e.status = if e.uploads.is_empty() { EntryStatus::ReadyForReview } else { EntryStatus::Done };
+            e.error = Some("Re-processing was interrupted. The earlier results are kept.".into());
+        } else {
             e.status = EntryStatus::Error;
             e.error = Some("Processing was interrupted. Click Retry to start again.".into());
-            changed = true;
         }
+        changed = true;
     }
     changed
 }
@@ -416,9 +425,18 @@ mod tests {
         e.status = EntryStatus::Processing;
         m.entries.push(e);
         m.entries.push(entry("b.mp4"));
-        assert!(mark_interrupted(&mut m));
+        assert!(mark_interrupted(&mut m, None, |_| false));
         assert_eq!(m.entries[0].status, EntryStatus::Error);
         assert_eq!(m.entries[1].status, EntryStatus::New);
+
+        // A re-process keeps the earlier results; a live job is left alone.
+        m.entries[0].status = EntryStatus::Processing;
+        m.entries[1].status = EntryStatus::Processing;
+        let live = m.entries[1].id.clone();
+        assert!(mark_interrupted(&mut m, Some(&live), |_| true));
+        assert_eq!(m.entries[0].status, EntryStatus::ReadyForReview);
+        assert!(m.entries[0].error.as_deref().unwrap().contains("earlier results"));
+        assert_eq!(m.entries[1].status, EntryStatus::Processing);
     }
 
     #[test]

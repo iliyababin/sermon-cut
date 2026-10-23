@@ -391,7 +391,7 @@ function DownloadCard({ item, progress }: { item: DownloadItem; progress?: Downl
       </div>
       <div>
         <button
-          onClick={() => cancelDownload(item.youtube_id)}
+          onClick={() => cancelDownload(item.job_id)}
           className="p-2 text-muted-foreground hover:text-destructive rounded-lg hover:bg-destructive/10 transition-colors"
           title="Cancel download"
         >
@@ -493,13 +493,11 @@ function VideoCard(props: VideoCardProps) {
           </div>
         )}
 
-        {video.status === "error" && video.error && (
+        {/* Any status: a failed re-process keeps the earlier results and says why. */}
+        {video.error && (
           <p className="mt-2 text-xs text-destructive line-clamp-3" title={video.error}>
             {video.error}
           </p>
-        )}
-        {video.status === "unreadable" && video.error && (
-          <p className="mt-2 text-xs text-destructive">{video.error}</p>
         )}
         {video.status === "too_long" && (
           <p className="mt-2 text-xs text-muted-foreground">

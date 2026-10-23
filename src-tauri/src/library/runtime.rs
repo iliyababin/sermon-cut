@@ -1790,34 +1790,35 @@ impl Library {
             if !fingerprint_matches(&now, &entry.fingerprint) {
                 return Err(FILE_CHANGED.to_string());
             }
-            // Nothing else writes this folder while the video is busy.
-            let (dir, staged) = (dir.clone(), out.clone());
-            blocking(move || -> Result<(), String> {
-                let mut data = manifest::load_video_data(&dir);
-                std::fs::rename(&staged, dir.join(&name)).map_err(|e| format!("Failed to save the trimmed video: {}", e))?;
-                if let Some(old) = data.trimmed_file.as_ref().filter(|old| **old != name) {
-                    let _ = std::fs::remove_file(dir.join(old));
-                }
-                data.trimmed_file = Some(name);
-                data.trim_start = Some(actual);
-                data.trim_end = Some(end);
-                manifest::save_video_data(&dir, &data)
-            })
-            .await??;
-            {
-                // A half-finished upload was of the old cut.
-                let mut g = self.inner();
-                if let Ok(e) = g.entry_mut(id) {
-                    if e.upload_session.take().is_some() {
-                        g.save_logged();
-                    }
-                }
+            let (to, staged) = (dir.join(&name), out.clone());
+            blocking(move || std::fs::rename(&staged, &to)).await?.map_err(|e| format!("Failed to save the trimmed video: {}", e))?;
+            if let Some(old) = self.record_trim(id, &dir, &name, actual, end)? {
+                let _ = std::fs::remove_file(dir.join(old));
             }
             Ok((actual, end))
         }
         .await;
         let _ = std::fs::remove_dir_all(&staging);
         result
+    }
+
+    /// Record a new cut in video.json, under the lock like every other
+    /// video.json edit (the review screen saves while a trim runs). Returns
+    /// the cut it replaced, to delete.
+    fn record_trim(&self, id: &str, dir: &Path, name: &str, start: f64, end: f64) -> Result<Option<String>, String> {
+        let mut g = self.inner();
+        let mut data = manifest::load_video_data(dir);
+        let old = data.trimmed_file.replace(name.to_string()).filter(|old| old != name);
+        data.trim_start = Some(start);
+        data.trim_end = Some(end);
+        manifest::save_video_data(dir, &data)?;
+        // A half-finished upload was of the old cut.
+        if let Ok(e) = g.entry_mut(id) {
+            if e.upload_session.take().is_some() {
+                g.save_logged();
+            }
+        }
+        Ok(old)
     }
 
     /// A still of the original video at `time`, for the trim panel when the
@@ -3257,6 +3258,27 @@ mod tests {
         assert!(!lib.inner().busy.contains(&id));
         assert!(dir.join("thumbnail_option_1.jpg").exists(), "thumbnails are kept");
         assert!(lib.set_trim_with(&id, 9.5, 10.0, &none).await.is_err(), "at least a second");
+    }
+
+    #[test]
+    fn a_trim_keeps_review_edits_saved_meanwhile() {
+        let (_t, lib, id, dir) = processed_library();
+        std::fs::write(dir.join("trimmed_new.mp4"), b"cut").unwrap();
+        let guard = lib.inner();
+        std::thread::scope(|s| {
+            let trim = s.spawn(|| lib.record_trim(&id, &dir, "trimmed_new.mp4", 4.0, 20.0));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!trim.is_finished(), "waits for the lock");
+            // save_review, which holds the lock, runs meanwhile.
+            let mut data = manifest::load_video_data(&dir);
+            data.review.title = Some("Edited".into());
+            manifest::save_video_data(&dir, &data).unwrap();
+            drop(guard);
+            trim.join().unwrap().unwrap();
+        });
+        let data = manifest::load_video_data(&dir);
+        assert_eq!(data.review.title.as_deref(), Some("Edited"));
+        assert_eq!((data.trimmed_file.as_deref(), data.trim_start, data.trim_end), (Some("trimmed_new.mp4"), Some(4.0), Some(20.0)));
     }
 
     /// What a scan sees for a file in the library folder.

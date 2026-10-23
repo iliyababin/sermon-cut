@@ -388,6 +388,16 @@ impl Inner {
             .collect()
     }
 
+    /// Nothing of this session is running, queued or writing: no job,
+    /// download, busy video (upload, trash, thumbnail work) or render.
+    fn is_idle(&self) -> bool {
+        self.running.is_none()
+            && self.queue.is_empty()
+            && self.downloads.is_empty()
+            && self.busy.is_empty()
+            && self.rendering == 0
+    }
+
     fn require_not_updating(&self) -> Result<(), String> {
         if self.updating {
             return Err(UPDATING.into());
@@ -1086,7 +1096,7 @@ impl Library {
         let (session, running, idle, queue_idle) = {
             let g = self.inner();
             let running = g.running.as_ref().map(|r| r.id.clone());
-            let idle = running.is_none() && g.downloads.is_empty() && g.busy.is_empty() && g.rendering == 0;
+            let idle = g.is_idle();
             (g.session.clone(), running, idle, g.running.is_none() && g.queue.is_empty())
         };
         if mode == Mode::Writable {
@@ -1172,7 +1182,7 @@ impl Library {
         if g.configured == configured {
             return Ok(());
         }
-        if g.running.is_some() || !g.queue.is_empty() || !g.downloads.is_empty() || !g.busy.is_empty() {
+        if !g.is_idle() {
             return Err(SWITCH_BUSY.into());
         }
         Ok(())
@@ -1189,7 +1199,7 @@ impl Library {
             if g.configured == configured {
                 return Ok(());
             }
-            if g.running.is_some() || !g.queue.is_empty() || !g.downloads.is_empty() || !g.busy.is_empty() {
+            if !g.is_idle() {
                 return Err(SWITCH_BUSY.into());
             }
             g.configured = configured;
@@ -1323,7 +1333,7 @@ impl Library {
                 // Not writable yet (e.g. drive unplugged): a later scan retries.
                 return;
             };
-            if g.running.is_some() || !g.queue.is_empty() || !g.busy.is_empty() || !g.downloads.is_empty() {
+            if !g.is_idle() {
                 return;
             }
             g.mode = Mode::ReadOnly(UPDATING_LIBRARY.into());
@@ -2586,7 +2596,7 @@ impl Library {
         let paths = {
             let g = self.inner();
             let paths = g.writable()?.clone();
-            if g.running.is_some() || !g.queue.is_empty() || !g.busy.is_empty() || !g.downloads.is_empty() {
+            if !g.is_idle() {
                 return Err("Wait for processing, downloads and uploads to finish first.".into());
             }
             paths
@@ -4113,6 +4123,32 @@ mod tests {
         let err = lib.reset(&id).unwrap_err();
         assert!(err.starts_with("This library is open on Office iMac."), "{err}");
         assert_eq!(lib.view(vec![]).message.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn any_work_makes_the_library_not_idle() {
+        let (_t, lib, id, _dir) = processed_library();
+        assert!(lib.inner().is_idle());
+        let work: [fn(&mut Inner, &str); 4] = [
+            |g, id| g.queue.push_back(id.into()),
+            |g, id| {
+                g.busy.insert(id.into());
+            },
+            |g, _| g.rendering += 1,
+            |g, id| {
+                g.downloads.push(DownloadItem { job_id: "j".into(), youtube_id: id.into(), title: String::new(), cancel: None })
+            },
+        ];
+        for add in work {
+            add(&mut lib.inner(), &id);
+            assert!(!lib.inner().is_idle());
+            assert_eq!(lib.check_switch("/elsewhere"), Err(SWITCH_BUSY.to_string()));
+            let mut g = lib.inner();
+            g.queue.clear();
+            g.busy.clear();
+            g.rendering = 0;
+            g.downloads.clear();
+        }
     }
 
     #[test]

@@ -110,6 +110,11 @@ pub struct Entry {
     /// Id from the pre-0.4 state.json, so migration can be re-run safely.
     #[serde(default)]
     pub legacy_id: Option<String>,
+    /// The file wasn't in the folder at the last scan. Kept so the first
+    /// scan after a restart can tell a re-export (replace in place) from a
+    /// new file that reuses a name (a new entry).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
 }
 
 impl Entry {
@@ -130,6 +135,7 @@ impl Entry {
             upload_session: None,
             added_at: chrono::Utc::now().to_rfc3339(),
             legacy_id: None,
+            missing: false,
         }
     }
 

@@ -761,7 +761,8 @@ impl Library {
             }
         };
         let busy = g.busy_set();
-        let reconciled = scan::reconcile(&mut g.manifest.entries, &obs, &busy);
+        let last_present = g.scanned.then(|| std::mem::take(&mut g.last.present));
+        let reconciled = scan::reconcile(&mut g.manifest.entries, &obs, &busy, last_present.as_ref());
         if g.mode == Mode::Writable {
             if let Some(paths) = g.paths.clone() {
                 for id in &reconciled.replaced {

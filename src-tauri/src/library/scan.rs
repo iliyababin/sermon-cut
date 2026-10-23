@@ -230,25 +230,58 @@ pub struct Reconciled {
 
 /// Apply a scan to the entries. `busy` entries (queued/processing/uploading)
 /// are never reset here; the job re-checks the file itself.
-pub fn reconcile(entries: &mut Vec<Entry>, obs: &[FileObs], busy: &HashSet<String>) -> Reconciled {
+///
+/// `previously_present` is the set of entries whose file was in the folder
+/// at the last scan, or None for the first scan since the library was
+/// opened. A file whose content changed under an entry's name replaces that
+/// entry only if the entry's file was there all along (re-exported in
+/// place). If the entry's file had gone, a new file that reuses its name is
+/// a different video: it gets its own entry, and the old one stays Missing
+/// with its work intact.
+pub fn reconcile(
+    entries: &mut Vec<Entry>,
+    obs: &[FileObs],
+    busy: &HashSet<String>,
+    previously_present: Option<&HashSet<String>>,
+) -> Reconciled {
     let mut r = Reconciled::default();
-    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
-        by_key.entry(match_key(&e.file_name)).or_insert(i);
+        by_key.entry(match_key(&e.file_name)).or_default().push(i);
     }
     let mut claimed: HashSet<usize> = HashSet::new();
     let mut unmatched: Vec<&FileObs> = Vec::new();
 
-    // Pass 1: same name.
+    // Whether the file at `o` could be the entry's own file, rewritten.
+    let was_present = |e: &Entry, o: &FileObs| match previously_present {
+        Some(set) => set.contains(&e.id),
+        // First scan after opening: there's no last scan to go by, so the
+        // file must be newer than what we knew and the entry not marked
+        // missing when the library was last open.
+        None => !e.missing && e.fingerprint.mtime_ms < o.mtime_ms,
+    };
+
+    // Pass 1: same name. Among entries with this name, prefer the unchanged
+    // one, then one with the same content, then one whose file was there
+    // all along (replaced in place).
     for o in obs {
-        let Some(&i) = by_key.get(&match_key(&o.name)) else {
+        let candidates: Vec<usize> = by_key
+            .get(&match_key(&o.name))
+            .map(|v| v.iter().copied().filter(|i| !claimed.contains(i)).collect())
+            .unwrap_or_default();
+        let pick = {
+            let unchanged = |e: &Entry| e.fingerprint.size == o.size && e.fingerprint.mtime_ms == o.mtime_ms;
+            let same_content = |e: &Entry| o.hash.as_ref().is_some_and(|h| *h == e.fingerprint.hash);
+            let find = |test: &dyn Fn(&Entry) -> bool| candidates.iter().copied().find(|i| test(&entries[*i]));
+            find(&unchanged)
+                .or_else(|| find(&same_content))
+                .or_else(|| find(&|e| was_present(e, o)))
+        };
+        let Some(i) = pick else {
             unmatched.push(o);
             continue;
         };
-        if !claimed.insert(i) {
-            unmatched.push(o);
-            continue;
-        }
+        claimed.insert(i);
         let e = &mut entries[i];
         r.present.insert(e.id.clone());
         if e.file_name != o.name {
@@ -331,6 +364,14 @@ pub fn reconcile(entries: &mut Vec<Entry>, obs: &[FileObs], busy: &HashSet<Strin
         entries.push(entry);
         r.changed = true;
     }
+
+    for e in entries.iter_mut() {
+        let missing = !r.present.contains(&e.id);
+        if e.missing != missing {
+            e.missing = missing;
+            r.changed = true;
+        }
+    }
     r
 }
 
@@ -361,7 +402,7 @@ mod tests {
     #[test]
     fn new_file_becomes_new_entry() {
         let mut entries = vec![];
-        let r = reconcile(&mut entries, &[ready("a.mp4", 10, 1, "h1")], &HashSet::new());
+        let r = reconcile(&mut entries, &[ready("a.mp4", 10, 1, "h1")], &HashSet::new(), None);
         assert!(r.changed);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, EntryStatus::New);
@@ -371,7 +412,7 @@ mod tests {
     #[test]
     fn unchanged_file_changes_nothing() {
         let mut entries = vec![entry("a.mp4", 10, 1, "h1")];
-        let r = reconcile(&mut entries, &[ready("a.mp4", 10, 1, "h1")], &HashSet::new());
+        let r = reconcile(&mut entries, &[ready("a.mp4", 10, 1, "h1")], &HashSet::new(), None);
         assert!(!r.changed);
         assert!(r.present.contains(&entries[0].id));
     }
@@ -379,10 +420,130 @@ mod tests {
     #[test]
     fn missing_file_is_not_present_and_kept() {
         let mut entries = vec![entry("a.mp4", 10, 1, "h1")];
-        let r = reconcile(&mut entries, &[], &HashSet::new());
-        assert!(!r.changed);
+        let r = reconcile(&mut entries, &[], &HashSet::new(), None);
+        // Only the missing mark changes.
+        assert!(r.changed);
+        assert!(entries[0].missing);
         assert_eq!(entries.len(), 1);
         assert!(r.present.is_empty());
+        let r = reconcile(&mut entries, &[], &HashSet::new(), Some(&HashSet::new()));
+        assert!(!r.changed);
+    }
+
+    /// Scan `obs` as the next scan after `prev`.
+    fn rescan(entries: &mut Vec<Entry>, obs: &[FileObs], prev: &Reconciled) -> Reconciled {
+        reconcile(entries, obs, &HashSet::new(), Some(&prev.present))
+    }
+
+    #[test]
+    fn same_name_after_moving_out_is_a_new_entry() {
+        let mut e = entry("Sunday.mp4", 10, 1, "old");
+        e.status = EntryStatus::Done;
+        let old_id = e.id.clone();
+        let mut entries = vec![e];
+        let r = reconcile(&mut entries, &[ready("Sunday.mp4", 10, 1, "old")], &HashSet::new(), None);
+        // Last week's file is moved out...
+        let r = rescan(&mut entries, &[], &r);
+        assert!(r.present.is_empty());
+        // ...and this week's is dropped in under the same name.
+        let r = rescan(&mut entries, &[ready("Sunday.mp4", 20, 9, "new")], &r);
+        assert!(r.replaced.is_empty());
+        assert_eq!(entries.len(), 2);
+        let old = entries.iter().find(|e| e.id == old_id).unwrap();
+        assert_eq!(old.status, EntryStatus::Done);
+        assert_eq!(old.fingerprint.hash, "old");
+        assert!(old.missing);
+        let new = entries.iter().find(|e| e.id != old_id).unwrap();
+        assert_eq!(new.status, EntryStatus::New);
+        let new_id = new.id.clone();
+        assert!(r.present.contains(&new_id) && !r.present.contains(&old_id));
+
+        // Later scans keep matching each name to its own content.
+        let r = rescan(&mut entries, &[ready("Sunday.mp4", 20, 9, "new")], &r);
+        assert!(!r.changed);
+        assert_eq!(r.present.len(), 1);
+        assert!(r.present.contains(&new_id));
+    }
+
+    #[test]
+    fn same_name_after_moving_out_across_a_restart_is_a_new_entry() {
+        let mut e = entry("Sunday.mp4", 10, 1, "old");
+        e.status = EntryStatus::Done;
+        let mut entries = vec![e];
+        // Seen missing before the app quit (persisted)...
+        reconcile(&mut entries, &[], &HashSet::new(), None);
+        assert!(entries[0].missing);
+        // ...then the first scan after launch finds a new file of that name.
+        let r = reconcile(&mut entries, &[ready("Sunday.mp4", 20, 9, "new")], &HashSet::new(), None);
+        assert!(r.replaced.is_empty());
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].status, EntryStatus::Done);
+    }
+
+    #[test]
+    fn copying_over_a_missing_name_is_not_its_entry() {
+        let mut entries = vec![entry("Sunday.mp4", 10, 1, "old")];
+        let r = rescan(&mut entries, &[], &Reconciled::default());
+        let copying = FileObs { state: ObsState::Copying, hash: None, duration: None, ..ready("Sunday.mp4", 3, 9, "") };
+        let r = rescan(&mut entries, &[copying], &r);
+        assert!(r.copying_ids.is_empty());
+        assert_eq!(r.copying.len(), 1);
+        assert!(r.present.is_empty());
+    }
+
+    #[test]
+    fn in_place_re_export_replaces_during_a_run() {
+        let mut e = entry("Sunday.mp4", 10, 1, "old");
+        e.status = EntryStatus::ReadyForReview;
+        let id = e.id.clone();
+        let mut entries = vec![e];
+        let r = reconcile(&mut entries, &[ready("Sunday.mp4", 10, 1, "old")], &HashSet::new(), None);
+        // Being written over: still this entry.
+        let copying = FileObs { state: ObsState::Copying, hash: None, duration: None, ..ready("Sunday.mp4", 5, 8, "") };
+        let r = rescan(&mut entries, &[copying], &r);
+        assert!(r.copying_ids.contains(&id));
+        let r = rescan(&mut entries, &[ready("Sunday.mp4", 20, 9, "new")], &r);
+        assert_eq!(r.replaced, vec![id.clone()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].fingerprint.hash, "new");
+        assert_eq!(entries[0].status, EntryStatus::New);
+    }
+
+    #[test]
+    fn in_place_re_export_replaces_across_a_restart() {
+        let mut e = entry("Sunday.mp4", 10, 1, "old");
+        e.status = EntryStatus::Done;
+        let id = e.id.clone();
+        let mut entries = vec![e];
+        // Re-exported while the app was closed: newer, and never seen missing.
+        let r = reconcile(&mut entries, &[ready("Sunday.mp4", 20, 9, "new")], &HashSet::new(), None);
+        assert_eq!(r.replaced, vec![id]);
+        assert_eq!(entries.len(), 1);
+        // An older file under the name isn't a re-export of it.
+        let mut entries = vec![entry("Sunday.mp4", 10, 5, "old")];
+        let r = reconcile(&mut entries, &[ready("Sunday.mp4", 20, 2, "other")], &HashSet::new(), None);
+        assert!(r.replaced.is_empty());
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn same_named_entries_are_matched_by_content() {
+        let mut first = entry("Sunday.mp4", 10, 1, "a");
+        first.status = EntryStatus::Done;
+        first.missing = true;
+        let second = entry("Sunday.mp4", 20, 2, "b");
+        let (first_id, second_id) = (first.id.clone(), second.id.clone());
+        // The manifest order puts the missing one first; content decides.
+        let mut entries = vec![first, second];
+        let r = reconcile(&mut entries, &[ready("Sunday.mp4", 20, 2, "b")], &HashSet::new(), None);
+        assert!(r.present.contains(&second_id) && !r.present.contains(&first_id));
+        assert!(r.replaced.is_empty());
+        // The first one's file comes back (touched): it's matched by hash.
+        let r = rescan(&mut entries, &[ready("Sunday.mp4", 10, 7, "a")], &r);
+        assert!(r.present.contains(&first_id) && !r.present.contains(&second_id));
+        assert!(r.replaced.is_empty());
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].status, EntryStatus::Done);
     }
 
     #[test]
@@ -391,7 +552,7 @@ mod tests {
         e.status = EntryStatus::Done;
         let id = e.id.clone();
         let mut entries = vec![e];
-        let r = reconcile(&mut entries, &[ready("Renamed.mp4", 10, 1, "h1")], &HashSet::new());
+        let r = reconcile(&mut entries, &[ready("Renamed.mp4", 10, 1, "h1")], &HashSet::new(), None);
         assert!(r.changed);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, id);
@@ -406,6 +567,7 @@ mod tests {
             &mut entries,
             &[ready("a.mp4", 10, 1, "h1"), ready("a copy.mp4", 10, 2, "h1")],
             &HashSet::new(),
+            None,
         );
         assert_eq!(entries.len(), 2);
     }
@@ -424,7 +586,7 @@ mod tests {
             warnings: vec![],
         });
         let mut entries = vec![e];
-        let r = reconcile(&mut entries, &[ready("a.mp4", 20, 2, "h2")], &HashSet::new());
+        let r = reconcile(&mut entries, &[ready("a.mp4", 20, 2, "h2")], &HashSet::new(), None);
         assert_eq!(r.replaced, vec![entries[0].id.clone()]);
         assert_eq!(entries[0].status, EntryStatus::New);
         assert_eq!(entries[0].uploads.len(), 1);
@@ -436,7 +598,7 @@ mod tests {
         let mut e = entry("a.mp4", 10, 1, "h1");
         e.status = EntryStatus::ReadyForReview;
         let mut entries = vec![e];
-        let r = reconcile(&mut entries, &[ready("a.mp4", 10, 5, "h1")], &HashSet::new());
+        let r = reconcile(&mut entries, &[ready("a.mp4", 10, 5, "h1")], &HashSet::new(), None);
         assert!(r.replaced.is_empty());
         assert_eq!(entries[0].status, EntryStatus::ReadyForReview);
         assert_eq!(entries[0].fingerprint.mtime_ms, 5);
@@ -447,7 +609,7 @@ mod tests {
         let e = entry("a.mp4", 10, 1, "h1");
         let busy: HashSet<String> = [e.id.clone()].into();
         let mut entries = vec![e];
-        let r = reconcile(&mut entries, &[ready("a.mp4", 20, 2, "h2")], &busy);
+        let r = reconcile(&mut entries, &[ready("a.mp4", 20, 2, "h2")], &busy, None);
         assert!(r.replaced.is_empty());
         assert_eq!(entries[0].fingerprint.hash, "h1");
     }
@@ -463,7 +625,7 @@ mod tests {
             hash: None,
             duration: None,
         };
-        let r = reconcile(&mut entries, &[obs], &HashSet::new());
+        let r = reconcile(&mut entries, &[obs], &HashSet::new(), None);
         assert!(entries.is_empty());
         assert_eq!(r.copying.len(), 1);
     }
@@ -471,7 +633,7 @@ mod tests {
     #[test]
     fn nfd_name_matches_nfc_entry_and_keeps_disk_spelling() {
         let mut entries = vec![entry("Caf\u{e9}.mp4", 10, 1, "h1")];
-        let r = reconcile(&mut entries, &[ready("Cafe\u{301}.mp4", 10, 1, "h1")], &HashSet::new());
+        let r = reconcile(&mut entries, &[ready("Cafe\u{301}.mp4", 10, 1, "h1")], &HashSet::new(), None);
         assert_eq!(entries.len(), 1);
         assert!(r.present.contains(&entries[0].id));
         assert_eq!(entries[0].file_name, "Cafe\u{301}.mp4");

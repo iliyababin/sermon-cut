@@ -22,6 +22,7 @@ import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
 import type { LibraryVideo, LibraryView, LibraryStatus, ProcessingStage, DownloadItem } from "@/lib/types";
 import { LocalImage } from "./LocalImage";
+import { duplicateFileNames, formatFileSize } from "@/lib/utils";
 import {
   Film,
   Clock,
@@ -198,6 +199,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
 
   const hiddenCount = library.videos.filter((v) => v.hidden).length;
   const videos = library.videos.filter((v) => showHidden || !v.hidden);
+  const sharedNames = duplicateFileNames(library.videos);
   const maxMinutes = Math.round(library.max_transcribe_secs / 60);
 
   return (
@@ -312,6 +314,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
             <VideoCard
               key={video.id}
               video={video}
+              sharedName={sharedNames.has(video.file_name.normalize("NFC"))}
               live={progress[video.id]}
               uploadPercent={uploads[video.id] ?? video.upload_progress ?? 0}
               writable={library.writable}
@@ -401,6 +404,8 @@ function DownloadCard({ item, progress }: { item: DownloadItem; progress?: Downl
 
 interface VideoCardProps {
   video: LibraryVideo;
+  /** Another item has the same file name: show what tells them apart. */
+  sharedName: boolean;
   live?: ProcessingProgress;
   uploadPercent: number;
   writable: boolean;
@@ -450,7 +455,11 @@ function VideoCard(props: VideoCardProps) {
           {video.title}
         </h3>
         <p className="text-sm text-muted-foreground truncate" title={video.file_name}>
-          {video.title !== video.file_name.replace(/\.[^.]+$/, "") ? video.file_name : video.channel}
+          {props.sharedName
+            ? `${video.file_name} · added ${formatAddedDate(video.added_at)} · ${formatFileSize(video.size)}`
+            : video.title !== video.file_name.replace(/\.[^.]+$/, "")
+              ? video.file_name
+              : video.channel}
         </p>
 
         <div className="flex items-center gap-3 mt-2 text-sm text-muted-foreground flex-wrap">
@@ -701,4 +710,10 @@ function formatDuration(seconds: number): string {
     return `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
   }
   return `${minutes}:${secs.toString().padStart(2, "0")}`;
+}
+
+function formatAddedDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }

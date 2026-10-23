@@ -38,3 +38,29 @@ export function rawThumbnailVariant(path: string): string {
     ? path.replace(/\.(jpg|jpeg)$/i, "_raw.jpg")
     : path;
 }
+
+/** "1.2 GB", "350 MB": a file size for people. */
+export function formatFileSize(bytes: number): string {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  const digits = unit === 0 || value >= 100 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unit]}`;
+}
+
+/**
+ * File names that more than one library item shares (compared the way the
+ * backend does, NFC), so their cards can show what tells them apart.
+ */
+export function duplicateFileNames(videos: { file_name: string }[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const v of videos) {
+    const key = v.file_name.normalize("NFC");
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n > 1).map(([name]) => name));
+}

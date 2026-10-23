@@ -624,8 +624,8 @@ fn standalone_dir(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> 
 /// Crop an arbitrary image for the standalone Thumbnail tab.
 ///
 /// The library-backed `process_custom_thumbnail` needs a real video id; this
-/// one works on any file the user picks. Grading and the logo overlay are
-/// skipped on purpose — the template system draws those in the webview.
+/// one works on any file the user picks. Grading is skipped on purpose, and
+/// the template draws the logo and text in the webview.
 /// Only the latest result matters ("Save As" copies it out), so earlier
 /// files are cleared first.
 #[tauri::command]

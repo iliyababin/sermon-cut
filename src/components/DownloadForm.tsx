@@ -4,14 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import type { VideoInfo } from "@/lib/types";
 import { Loader2, Clock, User, Zap, Download, X } from "lucide-react";
 import { ErrorBanner } from "./ErrorBanner";
-
-interface DownloadProgress {
-  video_id: string;
-  progress: number;
-  speed: string | null;
-  eta: string | null;
-  status: string;
-}
+import { formatTimeDisplay } from "@/lib/clips";
+import type { DownloadProgress } from "@/lib/types";
 
 interface DownloadFormProps {
   onGoToLibrary: () => void;
@@ -201,7 +195,7 @@ export function DownloadForm({ onGoToLibrary, isActive }: DownloadFormProps) {
                 {videoInfo.duration && (
                   <span className="flex items-center gap-1">
                     <Clock className="w-4 h-4" />
-                    {formatDuration(videoInfo.duration)}
+                    {formatTimeDisplay(videoInfo.duration)}
                   </span>
                 )}
               </div>
@@ -277,13 +271,3 @@ export function DownloadForm({ onGoToLibrary, isActive }: DownloadFormProps) {
   );
 }
 
-function formatDuration(seconds: number): string {
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const secs = Math.floor(seconds % 60);
-
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-  }
-  return `${minutes}:${secs.toString().padStart(2, "0")}`;
-}

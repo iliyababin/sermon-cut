@@ -276,6 +276,7 @@ pub struct Reconciled {
 /// place). If the entry's file had gone, a new file that reuses its name is
 /// a different video: it gets its own entry, and the old one stays Missing
 /// with its work intact.
+#[cfg(test)]
 pub fn reconcile(
     entries: &mut Vec<Entry>,
     obs: &[FileObs],

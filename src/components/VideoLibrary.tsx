@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ErrorBanner } from "./ErrorBanner";
+import { formatTimeDisplay } from "@/lib/clips";
+import type { DownloadProgress } from "@/lib/types";
 import {
   getLibrary,
   rescanLibrary,
@@ -47,14 +49,6 @@ import {
   ExternalLink,
   Download,
 } from "lucide-react";
-
-interface DownloadProgress {
-  video_id: string;
-  progress: number;
-  speed: string | null;
-  eta: string | null;
-  status: string;
-}
 
 interface UploadProgress {
   video_id: string;
@@ -504,7 +498,7 @@ function VideoCard(props: VideoCardProps) {
           {video.duration ? (
             <span className="flex items-center gap-1">
               <Clock className="w-4 h-4" />
-              {formatDuration(video.duration)}
+              {formatTimeDisplay(video.duration)}
             </span>
           ) : null}
           <StatusBadge
@@ -768,17 +762,6 @@ function getProcessingLabel(stage?: ProcessingStage): string {
     default:
       return "Processing";
   }
-}
-
-function formatDuration(seconds: number): string {
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const secs = Math.floor(seconds % 60);
-
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-  }
-  return `${minutes}:${secs.toString().padStart(2, "0")}`;
 }
 
 function formatAddedDate(iso: string): string {

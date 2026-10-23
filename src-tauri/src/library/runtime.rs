@@ -260,7 +260,7 @@ pub struct ThumbnailOption {
     pub id: String,
     pub path: String,
     /// What the template draws over: the plain crop of a generated option
-    /// (the option itself has the logo burned in), else the option.
+    /// (the option itself is graded and shrunk), else the option.
     pub render_from: String,
     /// Changes whenever the image is regenerated (its mtime), so it is part
     /// of the render key.

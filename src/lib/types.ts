@@ -253,3 +253,12 @@ export interface CropRect {
   width: number;
   height: number;
 }
+
+/** A "download-progress" event. */
+export interface DownloadProgress {
+  video_id: string;
+  progress: number;
+  speed: string | null;
+  eta: string | null;
+  status: string;
+}

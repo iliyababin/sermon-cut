@@ -172,10 +172,8 @@ fn pick_and_save(
 
         let cropped = crop_image(&img, &fallback_crop);
         // Crop-only variant for the template overlays (see the main loop).
-        if count > 1 {
-            let raw_path = output_dir.join(format!("{}thumbnail_option_1_raw.jpg", output_stem));
-            save_jpeg(&cropped, &raw_path)?;
-        }
+        let raw_path = output_dir.join(format!("{}thumbnail_option_1_raw.jpg", output_stem));
+        save_jpeg(&cropped, &raw_path)?;
         let graded = shrunk_and_graded(&cropped);
 
         let out_path = output_dir.join(format!("{}thumbnail_option_1.jpg", output_stem));
@@ -204,20 +202,13 @@ fn pick_and_save(
         );
 
         // Cropped once. The plain crop, at full size for zooming in the
-        // editor, is what the template draws over (multi-thumbnail mode).
+        // editor, is what the template draws over.
         let cropped = crop_image(&img, &person_crop);
-        if count > 1 {
-            let raw_path = output_dir.join(format!("{}thumbnail_option_{}_raw.jpg", output_stem, idx + 1));
-            save_jpeg(&cropped, &raw_path)?;
-        }
+        let raw_path = output_dir.join(format!("{}thumbnail_option_{}_raw.jpg", output_stem, idx + 1));
+        save_jpeg(&cropped, &raw_path)?;
         let result = shrunk_and_graded(&cropped);
 
-        let out_name = if count > 1 {
-            format!("{}thumbnail_option_{}.jpg", output_stem, idx + 1)
-        } else {
-            format!("{}thumbnail.jpg", output_stem)
-        };
-        let out_path = output_dir.join(&out_name);
+        let out_path = output_dir.join(format!("{}thumbnail_option_{}.jpg", output_stem, idx + 1));
         save_jpeg(&result, &out_path)?;
 
         let abs = out_path
@@ -260,11 +251,12 @@ fn crop_image(img: &RgbImage, rect: &CropRect) -> RgbImage {
 }
 
 // =====================================================================
-// Public API — same signatures as the old thumbnail.rs
+// Public API
 // =====================================================================
 
 /// Generate thumbnail options for review, written straight into `output_dir`
-/// as thumbnail_option_N.jpg (plus _raw and _debug variants).
+/// as thumbnail_option_N.jpg (graded, YouTube size), each with its plain
+/// crop as thumbnail_option_N_raw.jpg for the template to draw over.
 pub async fn generate_thumbnail_options(
     video_path: &Path,
     start_time: f64,

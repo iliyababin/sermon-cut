@@ -355,11 +355,8 @@ pub fn score_detection(det: &PoseDetection, img: &RgbImage) -> ScoredDetection {
     let center_dist = (box_cx - img_w / 2.0).abs() / (img_w / 2.0);
     let center_bonus = 1.0 - center_dist * 0.3;
 
-    let facing_score = if facing.is_facing_camera() {
-        FACING_BONUS
-    } else {
-        1.0
-    };
+    // Only detections facing the camera get this far (see above).
+    let facing_score = FACING_BONUS;
 
     let gesture_score = calculate_gesture_score(&det.keypoints);
     let gest_bonus = 1.0 + (GESTURE_BONUS - 1.0) * gesture_score;

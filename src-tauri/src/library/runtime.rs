@@ -1702,7 +1702,7 @@ impl Library {
         let on_step = |f: f32, _: &str| {
             self.set_progress(app, id, ProcessingStage::Trimming, 50.0 + 25.0 * f, "Trimming video to sermon boundaries...");
         };
-        let start = crate::ffmpeg::trim_accurate(&video_path, start, end, &staging.join(&trimmed_name), &on_step).await?;
+        let start = crate::ffmpeg::trim_accurate(&video_path, start, end, &staging.join(&trimmed_name), &on_step).await?.start;
 
         self.set_progress(app, id, ProcessingStage::GeneratingThumbnails, 75.0, "Generating thumbnail options...");
         let title = transcription.suggested_title.clone().unwrap_or(display_title);
@@ -1808,7 +1808,7 @@ impl Library {
         let result = async {
             let name = trimmed_name(&entry.file_name);
             let out = staging.join(&name);
-            let actual = crate::ffmpeg::trim_accurate(&video_path, start, end, &out, on_step).await?;
+            let actual = crate::ffmpeg::trim_accurate(&video_path, start, end, &out, on_step).await?.start;
 
             let check = video_path.clone();
             let now = blocking(move || fsutil::fingerprint(&check)).await??;

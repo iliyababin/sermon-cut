@@ -222,7 +222,7 @@ export function ThumbnailEditor({
             </button>
             <input
               type="range"
-              min="10"
+              min="100"
               max="500"
               value={zoomPercent}
               onChange={(e) => setZoom(Number(e.target.value) / 100)}

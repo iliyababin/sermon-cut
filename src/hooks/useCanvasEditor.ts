@@ -1,15 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import type { CropRect } from "@/lib/types";
-
-interface CanvasEditorState {
-  zoom: number;
-  panX: number;
-  panY: number;
-}
+import { clampCropToImage, defaultCrop, toPixelCrop, type Rect } from "@/lib/crop";
 
 interface UseCanvasEditorOptions {
   aspectRatio?: number;
-  minZoom?: number;
+  /** How far in you can zoom, relative to the whole image. */
   maxZoom?: number;
 }
 
@@ -18,270 +13,170 @@ interface ImageDimensions {
   height: number;
 }
 
+/**
+ * A crop editor on a canvas. The state is the crop itself, in image pixels,
+ * always kept inside the image (`clampCropToImage`); the canvas draws the
+ * image so that the crop fills a fixed frame. So what's in the frame is
+ * exactly what gets cut, whatever the canvas size.
+ */
 export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
-  const { aspectRatio = 16 / 9, minZoom = 0.1, maxZoom = 5 } = options;
+  const { aspectRatio = 16 / 9, maxZoom = 5 } = options;
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const [imageDimensions, setImageDimensions] = useState<ImageDimensions | null>(null);
-  const [state, setState] = useState<CanvasEditorState>({
-    zoom: 1,
-    panX: 0,
-    panY: 0,
-  });
+  const [crop, setCrop] = useState<Rect | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [imageLoaded, setImageLoaded] = useState(false);
 
-  // Load image from path (base64 data URL)
-  const loadImage = useCallback((imageDataUrl: string) => {
-    const img = new Image();
-    img.onload = () => {
-      imageRef.current = img;
-      setImageDimensions({ width: img.width, height: img.height });
-      setImageLoaded(true);
+  /** The crop made valid for the loaded image. */
+  const clampToImage = useCallback(
+    (rect: Rect): Rect => {
+      const img = imageRef.current;
+      if (!img) return rect;
+      const full = defaultCrop(img.width, img.height, aspectRatio);
+      return clampCropToImage(rect, img.width, img.height, aspectRatio, full.width / maxZoom);
+    },
+    [aspectRatio, maxZoom]
+  );
 
-      // Calculate initial zoom to fit image in view while maintaining aspect ratio
-      if (canvasRef.current) {
-        const canvas = canvasRef.current;
-        const canvasAspect = canvas.width / canvas.height;
-        const imageAspect = img.width / img.height;
+  // Load image from path (base64 data URL); starts on the whole image.
+  const loadImage = useCallback(
+    (imageDataUrl: string) => {
+      const img = new Image();
+      img.onload = () => {
+        imageRef.current = img;
+        setImageDimensions({ width: img.width, height: img.height });
+        setCrop(defaultCrop(img.width, img.height, aspectRatio));
+        setImageLoaded(true);
+      };
+      img.onerror = () => {
+        console.error("Failed to load image");
+        setImageLoaded(false);
+      };
+      img.src = imageDataUrl;
+    },
+    [aspectRatio]
+  );
 
-        // Start with the image filling the canvas
-        let initialZoom: number;
-        if (imageAspect > canvasAspect) {
-          // Image is wider than canvas - fit by width
-          initialZoom = canvas.width / img.width;
-        } else {
-          // Image is taller than canvas - fit by height
-          initialZoom = canvas.height / img.height;
-        }
-
-        // Center the image
-        const scaledWidth = img.width * initialZoom;
-        const scaledHeight = img.height * initialZoom;
-        const panX = (canvas.width - scaledWidth) / 2;
-        const panY = (canvas.height - scaledHeight) / 2;
-
-        setState({
-          zoom: initialZoom,
-          panX,
-          panY,
-        });
+  /** The crop frame on a canvas of this size: a centred box with a margin. */
+  const frameIn = useCallback(
+    (canvasWidth: number, canvasHeight: number): Rect => {
+      let width = canvasWidth * 0.9;
+      let height = width / aspectRatio;
+      if (height > canvasHeight * 0.9) {
+        height = canvasHeight * 0.9;
+        width = height * aspectRatio;
       }
-    };
-    img.onerror = () => {
-      console.error("Failed to load image");
-      setImageLoaded(false);
-    };
-    img.src = imageDataUrl;
-  }, []);
+      return { x: (canvasWidth - width) / 2, y: (canvasHeight - height) / 2, width, height };
+    },
+    [aspectRatio]
+  );
+
+  /** Canvas pixels per image pixel. */
+  const scaleOf = useCallback(
+    (c: Rect): number => {
+      const canvas = canvasRef.current;
+      if (!canvas) return 1;
+      return frameIn(canvas.width, canvas.height).width / c.width;
+    },
+    [frameIn]
+  );
 
   // Draw the canvas
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     const img = imageRef.current;
+    if (!canvas || !ctx || !img || !crop) return;
 
-    if (!canvas || !ctx || !img) return;
+    const w = canvas.width;
+    const h = canvas.height;
+    const frame = frameIn(w, h);
+    const scale = frame.width / crop.width;
 
-    // Clear canvas
     ctx.fillStyle = "#1a1a1a";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, frame.x - crop.x * scale, frame.y - crop.y * scale, img.width * scale, img.height * scale);
 
-    // Draw image with current pan and zoom
-    const scaledWidth = img.width * state.zoom;
-    const scaledHeight = img.height * state.zoom;
+    // Dim outside the frame
+    ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+    ctx.fillRect(0, 0, w, frame.y);
+    ctx.fillRect(0, frame.y + frame.height, w, h - frame.y - frame.height);
+    ctx.fillRect(0, frame.y, frame.x, frame.height);
+    ctx.fillRect(frame.x + frame.width, frame.y, w - frame.x - frame.width, frame.height);
 
-    ctx.drawImage(
-      img,
-      state.panX,
-      state.panY,
-      scaledWidth,
-      scaledHeight
-    );
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(frame.x, frame.y, frame.width, frame.height);
 
-    // Draw crop overlay
-    drawCropOverlay(ctx, canvas.width, canvas.height);
-  }, [state, aspectRatio]);
+    // Rule of thirds
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 3; i++) {
+      ctx.beginPath();
+      ctx.moveTo(frame.x + (frame.width / 3) * i, frame.y);
+      ctx.lineTo(frame.x + (frame.width / 3) * i, frame.y + frame.height);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(frame.x, frame.y + (frame.height / 3) * i);
+      ctx.lineTo(frame.x + frame.width, frame.y + (frame.height / 3) * i);
+      ctx.stroke();
+    }
+  }, [crop, frameIn]);
 
-  // Draw crop overlay with dimmed areas outside the crop
-  const drawCropOverlay = useCallback(
-    (ctx: CanvasRenderingContext2D, canvasWidth: number, canvasHeight: number) => {
-      // Calculate crop area (centered 16:9 rectangle)
-      const cropRect = calculateCropRectInCanvas(canvasWidth, canvasHeight);
-
-      // Draw semi-transparent overlay on areas outside crop
-      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
-
-      // Top
-      ctx.fillRect(0, 0, canvasWidth, cropRect.y);
-      // Bottom
-      ctx.fillRect(0, cropRect.y + cropRect.height, canvasWidth, canvasHeight - cropRect.y - cropRect.height);
-      // Left
-      ctx.fillRect(0, cropRect.y, cropRect.x, cropRect.height);
-      // Right
-      ctx.fillRect(cropRect.x + cropRect.width, cropRect.y, canvasWidth - cropRect.x - cropRect.width, cropRect.height);
-
-      // Draw crop border
-      ctx.strokeStyle = "#fff";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(cropRect.x, cropRect.y, cropRect.width, cropRect.height);
-
-      // Draw rule of thirds guides
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
-      ctx.lineWidth = 1;
-      const thirdW = cropRect.width / 3;
-      const thirdH = cropRect.height / 3;
-      for (let i = 1; i < 3; i++) {
-        // Vertical lines
-        ctx.beginPath();
-        ctx.moveTo(cropRect.x + thirdW * i, cropRect.y);
-        ctx.lineTo(cropRect.x + thirdW * i, cropRect.y + cropRect.height);
-        ctx.stroke();
-        // Horizontal lines
-        ctx.beginPath();
-        ctx.moveTo(cropRect.x, cropRect.y + thirdH * i);
-        ctx.lineTo(cropRect.x + cropRect.width, cropRect.y + thirdH * i);
-        ctx.stroke();
-      }
-    },
-    [aspectRatio]
-  );
-
-  // Calculate crop rectangle in canvas coordinates
-  const calculateCropRectInCanvas = useCallback(
-    (canvasWidth: number, canvasHeight: number) => {
-      const canvasAspect = canvasWidth / canvasHeight;
-
-      let cropWidth: number;
-      let cropHeight: number;
-
-      if (aspectRatio > canvasAspect) {
-        // Crop is wider than canvas - fit by width
-        cropWidth = canvasWidth * 0.9;
-        cropHeight = cropWidth / aspectRatio;
-      } else {
-        // Crop is taller than canvas - fit by height
-        cropHeight = canvasHeight * 0.9;
-        cropWidth = cropHeight * aspectRatio;
-      }
-
-      const cropX = (canvasWidth - cropWidth) / 2;
-      const cropY = (canvasHeight - cropHeight) / 2;
-
-      return { x: cropX, y: cropY, width: cropWidth, height: cropHeight };
-    },
-    [aspectRatio]
-  );
-
-  // Convert canvas crop to source image coordinates
+  // The crop in source image pixels, for the backend.
   const getCropRect = useCallback((): CropRect | null => {
-    const canvas = canvasRef.current;
     const img = imageRef.current;
+    if (!img || !crop) return null;
+    return toPixelCrop(crop, img.width, img.height);
+  }, [crop]);
 
-    if (!canvas || !img) return null;
+  /** 1 = the whole image; up to maxZoom. */
+  const zoom = (() => {
+    const img = imageRef.current;
+    if (!img || !crop) return 1;
+    return defaultCrop(img.width, img.height, aspectRatio).width / crop.width;
+  })();
 
-    const cropInCanvas = calculateCropRectInCanvas(canvas.width, canvas.height);
-
-    // Convert canvas coordinates to image coordinates
-    // The image is drawn at (panX, panY) with scale (zoom)
-    const sourceX = (cropInCanvas.x - state.panX) / state.zoom;
-    const sourceY = (cropInCanvas.y - state.panY) / state.zoom;
-    const sourceWidth = cropInCanvas.width / state.zoom;
-    const sourceHeight = cropInCanvas.height / state.zoom;
-
-    // Clamp to image bounds
-    const clampedX = Math.max(0, Math.round(sourceX));
-    const clampedY = Math.max(0, Math.round(sourceY));
-    const clampedWidth = Math.min(img.width - clampedX, Math.round(sourceWidth));
-    const clampedHeight = Math.min(img.height - clampedY, Math.round(sourceHeight));
-
-    return {
-      x: clampedX,
-      y: clampedY,
-      width: Math.max(1, clampedWidth),
-      height: Math.max(1, clampedHeight),
-    };
-  }, [state, calculateCropRectInCanvas]);
-
-  // Zoom controls
+  // Zoom about the crop's centre
   const setZoom = useCallback(
     (newZoom: number) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const clampedZoom = Math.min(maxZoom, Math.max(minZoom, newZoom));
-
-      // Zoom toward center of canvas
-      const centerX = canvas.width / 2;
-      const centerY = canvas.height / 2;
-
-      const zoomRatio = clampedZoom / state.zoom;
-
-      setState((prev) => ({
-        ...prev,
-        zoom: clampedZoom,
-        panX: centerX - (centerX - prev.panX) * zoomRatio,
-        panY: centerY - (centerY - prev.panY) * zoomRatio,
-      }));
+      const img = imageRef.current;
+      if (!img) return;
+      const width = defaultCrop(img.width, img.height, aspectRatio).width / Math.min(maxZoom, Math.max(1, newZoom));
+      setCrop((prev) => {
+        if (!prev) return prev;
+        const height = width / aspectRatio;
+        const cx = prev.x + prev.width / 2;
+        const cy = prev.y + prev.height / 2;
+        return clampToImage({ x: cx - width / 2, y: cy - height / 2, width, height });
+      });
     },
-    [state.zoom, minZoom, maxZoom]
+    [aspectRatio, maxZoom, clampToImage]
   );
 
-  const zoomIn = useCallback(() => {
-    setZoom(state.zoom * 1.2);
-  }, [state.zoom, setZoom]);
+  const zoomIn = useCallback(() => setZoom(zoom * 1.2), [zoom, setZoom]);
+  const zoomOut = useCallback(() => setZoom(zoom / 1.2), [zoom, setZoom]);
 
-  const zoomOut = useCallback(() => {
-    setZoom(state.zoom / 1.2);
-  }, [state.zoom, setZoom]);
-
-  // Center the image in the crop area
+  // Centre the crop on the image, keeping its size
   const center = useCallback(() => {
-    const canvas = canvasRef.current;
     const img = imageRef.current;
+    if (!img) return;
+    setCrop((prev) =>
+      prev ? clampToImage({ ...prev, x: (img.width - prev.width) / 2, y: (img.height - prev.height) / 2 }) : prev
+    );
+  }, [clampToImage]);
 
-    if (!canvas || !img) return;
-
-    const scaledWidth = img.width * state.zoom;
-    const scaledHeight = img.height * state.zoom;
-
-    setState((prev) => ({
-      ...prev,
-      panX: (canvas.width - scaledWidth) / 2,
-      panY: (canvas.height - scaledHeight) / 2,
-    }));
-  }, [state.zoom]);
-
-  // Reset to initial state
+  // Back to the whole image
   const reset = useCallback(() => {
-    const canvas = canvasRef.current;
     const img = imageRef.current;
+    if (!img) return;
+    setCrop(defaultCrop(img.width, img.height, aspectRatio));
+  }, [aspectRatio]);
 
-    if (!canvas || !img) return;
-
-    const canvasAspect = canvas.width / canvas.height;
-    const imageAspect = img.width / img.height;
-
-    let initialZoom: number;
-    if (imageAspect > canvasAspect) {
-      initialZoom = canvas.width / img.width;
-    } else {
-      initialZoom = canvas.height / img.height;
-    }
-
-    const scaledWidth = img.width * initialZoom;
-    const scaledHeight = img.height * initialZoom;
-
-    setState({
-      zoom: initialZoom,
-      panX: (canvas.width - scaledWidth) / 2,
-      panY: (canvas.height - scaledHeight) / 2,
-    });
-  }, []);
-
-  // Mouse event handlers
+  // Dragging moves the image under the frame
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     setIsDragging(true);
     setDragStart({ x: e.clientX, y: e.clientY });
@@ -290,49 +185,38 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       if (!isDragging) return;
-
       const dx = e.clientX - dragStart.x;
       const dy = e.clientY - dragStart.y;
-
-      setState((prev) => ({
-        ...prev,
-        panX: prev.panX + dx,
-        panY: prev.panY + dy,
-      }));
-
+      setCrop((prev) => {
+        if (!prev) return prev;
+        const scale = scaleOf(prev);
+        return clampToImage({ ...prev, x: prev.x - dx / scale, y: prev.y - dy / scale });
+      });
       setDragStart({ x: e.clientX, y: e.clientY });
     },
-    [isDragging, dragStart]
+    [isDragging, dragStart, scaleOf, clampToImage]
   );
 
-  const handleMouseUp = useCallback(() => {
-    setIsDragging(false);
-  }, []);
-
-  const handleMouseLeave = useCallback(() => {
-    setIsDragging(false);
-  }, []);
+  const handleMouseUp = useCallback(() => setIsDragging(false), []);
+  const handleMouseLeave = useCallback(() => setIsDragging(false), []);
 
   const handleWheel = useCallback(
     (e: React.WheelEvent<HTMLCanvasElement>) => {
       e.preventDefault();
-      const delta = e.deltaY > 0 ? 0.9 : 1.1;
-      setZoom(state.zoom * delta);
+      setZoom(zoom * (e.deltaY > 0 ? 0.9 : 1.1));
     },
-    [state.zoom, setZoom]
+    [zoom, setZoom]
   );
 
-  // Redraw when state changes
+  // Redraw when the crop changes
   useEffect(() => {
-    if (imageLoaded) {
-      draw();
-    }
-  }, [draw, imageLoaded, state]);
+    if (imageLoaded) draw();
+  }, [draw, imageLoaded]);
 
   return {
     canvasRef,
     loadImage,
-    zoom: state.zoom,
+    zoom,
     setZoom,
     zoomIn,
     zoomOut,

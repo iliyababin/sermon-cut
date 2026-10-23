@@ -203,6 +203,8 @@ export interface Settings {
   upload_privacy: UploadPrivacy;
   youtube_signed_in: boolean;
   youtube_channel_name: string | null;
+  /** Speakers named in reviews, most recent first (the app keeps it). */
+  recent_preachers: string[];
 }
 
 /** The settings a save may change. Absent fields are left alone; for the

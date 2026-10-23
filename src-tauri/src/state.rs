@@ -107,6 +107,34 @@ pub struct Settings {
     /// only an upload changes it.
     #[serde(default = "default_upload_privacy")]
     pub upload_privacy: String,
+    /// Speakers named on the review screen, most recent first. Server-owned:
+    /// only saving a review changes it.
+    #[serde(default)]
+    pub recent_preachers: Vec<String>,
+}
+
+/// How many speakers `recent_preachers` keeps.
+pub const MAX_RECENT_PREACHERS: usize = 10;
+
+/// Put `name` first in `list` (unique ignoring case, at most
+/// MAX_RECENT_PREACHERS). `replacing` is a name this same video added
+/// earlier and is now changing, e.g. while the speaker's name is still
+/// being typed; it's dropped so half-typed names don't pile up. Returns
+/// whether the list changed.
+pub fn remember_preacher(list: &mut Vec<String>, name: &str, replacing: Option<&str>) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let before = list.clone();
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    if let Some(old) = replacing.filter(|old| !same(old, name)) {
+        list.retain(|p| !same(p, old));
+    }
+    list.retain(|p| !same(p, name));
+    list.insert(0, name.to_string());
+    list.truncate(MAX_RECENT_PREACHERS);
+    *list != before
 }
 
 fn default_upload_privacy() -> String {
@@ -129,6 +157,7 @@ pub struct SettingsView {
     pub upload_privacy: String,
     pub youtube_signed_in: bool,
     pub youtube_channel_name: Option<String>,
+    pub recent_preachers: Vec<String>,
 }
 
 /// What the webview may change: only the user-editable fields, each one
@@ -178,6 +207,7 @@ impl Default for Settings {
             youtube_auth: None,
             youtube_playlist_id: None,
             upload_privacy: default_upload_privacy(),
+            recent_preachers: Vec::new(),
         }
     }
 }
@@ -195,6 +225,7 @@ impl Settings {
             upload_privacy: self.upload_privacy.clone(),
             youtube_signed_in: auth.is_some_and(|a| a.access_token.is_some() || a.refresh_token.is_some()),
             youtube_channel_name: auth.and_then(|a| a.channel_name.clone()),
+            recent_preachers: self.recent_preachers.clone(),
         }
     }
 
@@ -242,6 +273,9 @@ pub struct AppState {
     /// The newest settings save applied this run; older ones are ignored so
     /// saves that arrive out of order can't undo a later edit.
     pub settings_seq: u64,
+    /// The video whose review last added a new name to
+    /// `recent_preachers`, and that name (see `remember_preacher`).
+    pub preacher_draft: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +309,33 @@ fn get_state_file_path() -> PathBuf {
 }
 
 impl AppState {
+    /// A review named `preacher` for `video_id`: keep the recent-speakers
+    /// list up to date. Returns whether it changed (and needs saving).
+    pub fn note_preacher(&mut self, video_id: &str, preacher: &str) -> bool {
+        let preacher = preacher.trim();
+        if preacher.is_empty() {
+            return false;
+        }
+        let replacing = self
+            .preacher_draft
+            .as_ref()
+            .filter(|(id, _)| id == video_id)
+            .map(|(_, name)| name.clone());
+        let is_new = !self
+            .settings
+            .recent_preachers
+            .iter()
+            .any(|p| p.to_lowercase() == preacher.to_lowercase());
+        let changed = remember_preacher(&mut self.settings.recent_preachers, preacher, replacing.as_deref());
+        if is_new {
+            self.preacher_draft = Some((video_id.to_string(), preacher.to_string()));
+        } else if replacing.is_some_and(|r| r.to_lowercase() != preacher.to_lowercase()) {
+            // Settled on a name already known; the draft is gone.
+            self.preacher_draft = None;
+        }
+        changed
+    }
+
     pub fn load() -> Self {
         let path = get_state_file_path();
 
@@ -290,6 +351,7 @@ impl AppState {
                         legacy_videos: persisted.videos,
                         notices: persisted.notices,
                         settings_seq: 0,
+                        preacher_draft: None,
                     };
                 }
                 Err(e) => {
@@ -397,6 +459,41 @@ mod tests {
         assert!(!view.contains("secret") && !view.contains("refresh"), "{view}");
         assert!(view.contains("\"youtube_signed_in\":true"));
         assert!(view.contains("Youth"));
+    }
+
+    #[test]
+    fn recent_preachers_are_unique_capped_and_newest_first() {
+        let mut list = Vec::new();
+        for i in 0..12 {
+            assert!(remember_preacher(&mut list, &format!("Pastor {i}"), None));
+        }
+        assert_eq!(list.len(), MAX_RECENT_PREACHERS);
+        assert_eq!(list[0], "Pastor 11");
+        assert_eq!(list[9], "Pastor 2");
+        // Same name, other case: moved to the front, not added twice.
+        assert!(remember_preacher(&mut list, "  pastor 5 ", None));
+        assert_eq!(list[0], "pastor 5");
+        assert_eq!(list.iter().filter(|p| p.to_lowercase() == "pastor 5").count(), 1);
+        assert_eq!(list.len(), MAX_RECENT_PREACHERS);
+        assert!(!remember_preacher(&mut list, "pastor 5", None));
+        assert!(!remember_preacher(&mut list, "   ", None));
+    }
+
+    #[test]
+    fn typing_a_name_keeps_only_the_finished_one() {
+        let mut state = AppState::default();
+        state.settings.recent_preachers = vec!["Pastor Ann".into()];
+        for typed in ["Pas", "Pastor B", "Pastor Bob"] {
+            state.note_preacher("v1", typed);
+        }
+        assert_eq!(state.settings.recent_preachers, vec!["Pastor Bob", "Pastor Ann"]);
+        // Picking a known name for the same video drops the typed one.
+        state.note_preacher("v1", "pastor ann");
+        assert_eq!(state.settings.recent_preachers, vec!["pastor ann"]);
+        // Another video's names are kept.
+        state.note_preacher("v2", "Guest");
+        state.note_preacher("v3", "Pastor Ann");
+        assert_eq!(state.settings.recent_preachers, vec!["Pastor Ann", "Guest"]);
     }
 
     #[test]

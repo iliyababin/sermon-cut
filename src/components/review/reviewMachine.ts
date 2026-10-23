@@ -3,7 +3,7 @@ import type { UploadWarning } from "@/lib/types";
 /**
  * The review screen's upload flow as a reducer:
  *
- *   editing → (confirming) → uploading → done | error | cancelled
+ *   editing → confirming → uploading → done | error | cancelled
  *
  * Every step is a state, so a second click while one is in progress has
  * nothing to act on: Upload only starts from editing, error or cancelled.
@@ -13,7 +13,8 @@ import type { UploadWarning } from "@/lib/types";
 
 export type ReviewPhase =
   | { kind: "editing" }
-  /** Asking whether to upload a video that was already uploaded. */
+  /** Asking to confirm the upload (title, speaker, privacy, and whether
+   * it was uploaded before). */
   | { kind: "confirming" }
   /** `request` identifies the upload this screen started (the screen runs
    * it once per request); null when it was started before the screen
@@ -27,7 +28,7 @@ export type ReviewPhase =
 
 export interface ReviewState {
   phase: ReviewPhase;
-  /** Uploads of this video so far, for the "upload again?" question. */
+  /** Uploads of this video so far, for the confirm question. */
   uploadCount: number;
   nextRequest: number;
   /** Cancel was clicked for the running upload; waiting for it to stop. */
@@ -86,7 +87,8 @@ export function reviewReducer(state: ReviewState, event: ReviewEvent): ReviewSta
   switch (event.type) {
     case "upload":
       if (!canStartUpload(phase) || !event.ready) return state;
-      return state.uploadCount > 0 ? { ...state, phase: { kind: "confirming" } } : startUploading(state);
+      // Always confirmed first: an upload can't be taken back.
+      return { ...state, phase: { kind: "confirming" } };
     case "confirm":
       return phase.kind === "confirming" ? startUploading(state) : state;
     case "cancelConfirm":

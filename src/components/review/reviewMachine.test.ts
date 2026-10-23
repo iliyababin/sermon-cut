@@ -3,9 +3,12 @@ import { initialReviewState, reviewReducer, reviewShortcut, type ReviewEvent, ty
 
 const fresh = initialReviewState({ status: "ready_for_review", uploadProgress: null, uploads: [] });
 
-function run(state: ReviewState, ...events: ReviewEvent[]): ReviewState {
-  return events.reduce(reviewReducer, state);
+function run(state: ReviewState, ...events: (ReviewEvent | ReviewEvent[])[]): ReviewState {
+  return events.flat().reduce(reviewReducer, state);
 }
+
+/** Upload clicked and confirmed. */
+const UPLOAD: ReviewEvent[] = [{ type: "upload", ready: true }, { type: "confirm" }];
 
 describe("reviewMachine", () => {
   it("starts from the video's status", () => {
@@ -20,13 +23,15 @@ describe("reviewMachine", () => {
     expect(done.uploadCount).toBe(1);
   });
 
-  it("uploads straight away the first time", () => {
-    const s = run(fresh, { type: "upload", ready: true });
+  it("asks first, then uploads", () => {
+    const asking = run(fresh, { type: "upload", ready: true });
+    expect(asking.phase).toEqual({ kind: "confirming" });
+    const s = run(asking, { type: "confirm" });
     expect(s.phase).toEqual({ kind: "uploading", progress: 0, request: 1 });
   });
 
   it("ignores a second click while uploading", () => {
-    const once = run(fresh, { type: "upload", ready: true });
+    const once = run(fresh, UPLOAD);
     const twice = run(once, { type: "upload", ready: true });
     expect(twice).toBe(once);
   });
@@ -36,7 +41,7 @@ describe("reviewMachine", () => {
   });
 
   it("asks before uploading again, and a cancelled confirm goes back to editing", () => {
-    const uploaded = run(fresh, { type: "upload", ready: true }, { type: "succeeded", url: "u" }, { type: "uploadAgain" });
+    const uploaded = run(fresh, UPLOAD, { type: "succeeded", url: "u" }, { type: "uploadAgain" });
     expect(uploaded.uploadCount).toBe(1);
     const asking = run(uploaded, { type: "upload", ready: true });
     expect(asking.phase).toEqual({ kind: "confirming" });
@@ -47,29 +52,29 @@ describe("reviewMachine", () => {
   });
 
   it("counts a success once even when reported twice", () => {
-    const s = run(fresh, { type: "upload", ready: true }, { type: "succeeded", url: "u" }, { type: "succeeded", url: "u" });
+    const s = run(fresh, UPLOAD, { type: "succeeded", url: "u" }, { type: "succeeded", url: "u" });
     expect(s.phase).toEqual({ kind: "done", url: "u", warnings: [] });
     expect(s.uploadCount).toBe(1);
   });
 
   it("keeps progress monotonic and follows uploads started elsewhere", () => {
-    let s = run(fresh, { type: "upload", ready: true }, { type: "progress", percent: 50 }, { type: "progress", percent: 30 });
+    let s = run(fresh, UPLOAD, { type: "progress", percent: 50 }, { type: "progress", percent: 30 });
     expect(s.phase).toMatchObject({ kind: "uploading", progress: 50 });
     s = run(fresh, { type: "progress", percent: 10 });
     expect(s.phase).toEqual({ kind: "uploading", progress: 10, request: null });
   });
 
   it("can retry after an error or a cancel", () => {
-    const failed = run(fresh, { type: "upload", ready: true }, { type: "failed", message: "boom" });
+    const failed = run(fresh, UPLOAD, { type: "failed", message: "boom" });
     expect(failed.phase).toEqual({ kind: "error", message: "boom" });
-    expect(run(failed, { type: "upload", ready: true }).phase).toMatchObject({ kind: "uploading", request: 2 });
-    const cancelled = run(fresh, { type: "upload", ready: true }, { type: "cancelled" });
+    expect(run(failed, UPLOAD).phase).toMatchObject({ kind: "uploading", request: 2 });
+    const cancelled = run(fresh, UPLOAD, { type: "cancelled" });
     expect(cancelled.phase).toEqual({ kind: "cancelled" });
-    expect(run(cancelled, { type: "upload", ready: true }).phase).toMatchObject({ kind: "uploading" });
+    expect(run(cancelled, UPLOAD).phase).toMatchObject({ kind: "uploading" });
   });
 
   it("cancels once, and the upload ends as cancelled", () => {
-    const uploading = run(fresh, { type: "upload", ready: true });
+    const uploading = run(fresh, UPLOAD);
     const asked = run(uploading, { type: "cancelRequested" });
     expect(asked.cancelling).toBe(true);
     expect(run(asked, { type: "cancelRequested" })).toBe(asked);
@@ -77,7 +82,7 @@ describe("reviewMachine", () => {
     expect(stopped.phase).toEqual({ kind: "cancelled" });
     expect(stopped.cancelling).toBe(false);
     // Upload again continues (the backend resumes the session).
-    expect(run(stopped, { type: "upload", ready: true }).phase).toMatchObject({ kind: "uploading", request: 2 });
+    expect(run(stopped, UPLOAD).phase).toMatchObject({ kind: "uploading", request: 2 });
     // Nothing to cancel when not uploading.
     expect(run(fresh, { type: "cancelRequested" })).toBe(fresh);
   });
@@ -87,7 +92,7 @@ describe("reviewMachine", () => {
     const playlist = { kind: "playlist" as const, message: "Not added to the playlist." };
     const done = run(
       fresh,
-      { type: "upload", ready: true },
+      UPLOAD,
       { type: "succeeded", url: "u", warnings: [thumb, playlist] }
     );
     expect(done.phase).toEqual({ kind: "done", url: "u", warnings: [thumb, playlist] });

@@ -19,6 +19,7 @@ vi.mock("@/lib/thumbnailRenderer", () => ({
 vi.mock("./ThumbnailEditor", () => ({ ThumbnailEditor: () => null }));
 
 import { ReviewScreen } from "./ReviewScreen";
+import { ask } from "@tauri-apps/plugin-dialog";
 
 const TITLE = "The Hope We Have";
 const PREACHER = "Pastor X";
@@ -197,6 +198,29 @@ describe("ReviewScreen", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("ffmpeg crashed");
     fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
     await waitFor(() => expect(regenerate.disabled).toBe(true));
+  });
+
+  it("names the title, speaker and privacy before uploading", async () => {
+    vi.mocked(ask).mockClear();
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    const privacy = (await screen.findByLabelText("Privacy")) as HTMLSelectElement;
+    await waitFor(() => expect(privacy.value).toBe("unlisted"));
+    fireEvent.click(screen.getByRole("button", { name: /^upload$/i }));
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(1));
+    expect(vi.mocked(ask).mock.calls[0][0]).toBe(`Upload "${TITLE}" by ${PREACHER} as Unlisted?`);
+  });
+
+  it("starts a video with no speaker from the most recent one", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "get_settings"
+        ? Promise.resolve({ upload_privacy: "public", youtube_playlist_id: null, recent_preachers: ["Pastor Y", "Pastor Z"] })
+        : base(cmd, args)
+    );
+    render(<ReviewScreen video={video({ review: { title: TITLE, description: "", preacher: null } })} onBack={() => {}} />);
+    const input = screen.getByLabelText("Preacher") as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("Pastor Y"));
+    expect(document.querySelectorAll("#recent-preachers option")).toHaveLength(2);
   });
 
   it("starts from the last privacy and the default playlist", async () => {

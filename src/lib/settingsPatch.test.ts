@@ -11,7 +11,7 @@ const saved: Settings = {
   youtube_playlist_id: "PL1",
   upload_privacy: "public",
   youtube_signed_in: true,
-  youtube_channel_name: "Youth",
+  youtube_channel_name: "Youth",  recent_preachers: [],
 };
 
 describe("settingsPatch", () => {

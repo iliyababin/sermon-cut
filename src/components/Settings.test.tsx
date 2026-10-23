@@ -35,7 +35,7 @@ const initial: SettingsType = {
   youtube_playlist_id: null,
   upload_privacy: "public",
   youtube_signed_in: false,
-  youtube_channel_name: null,
+  youtube_channel_name: null,  recent_preachers: [],
 };
 
 function saves() {

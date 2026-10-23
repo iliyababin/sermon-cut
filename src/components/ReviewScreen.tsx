@@ -67,6 +67,12 @@ interface ReviewScreenProps {
 }
 
 const AUTOSAVE_MS = 1000;
+
+const PRIVACY_LABELS: Record<UploadPrivacy, string> = {
+  public: "Public",
+  unlisted: "Unlisted",
+  private: "Private",
+};
 const RENDER_DEBOUNCE_MS = 1500;
 
 type RenderMap = Record<string, { path: string; key: string }>;
@@ -89,6 +95,10 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   );
   const chapters: Chapter[] = video.transcription?.suggested_chapters || [];
   const [preacher, setPreacher] = useState(video.review.preacher ?? "");
+  // Speakers named before, offered as suggestions; a video with no speaker
+  // saved yet starts with the most recent one.
+  const [recentPreachers, setRecentPreachers] = useState<string[]>([]);
+  const preacherTouched = useRef(false);
 
   // Trim boundaries (what the trimmed video was cut to, used for chapters and captions)
   const startTime = video.trim_start ?? video.transcription?.sermon_start ?? 0;
@@ -257,6 +267,11 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     loadYoutube();
     getSettings()
       .then((s) => {
+        const recent = s.recent_preachers ?? [];
+        setRecentPreachers(recent);
+        if (video.review.preacher == null && !preacherTouched.current && recent[0]) {
+          setPreacher(recent[0]);
+        }
         if (choicesTouched.current) return;
         setPrivacy(s.upload_privacy);
         setPlaylistId(s.youtube_playlist_id ?? "");
@@ -358,14 +373,22 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     if (await flush()) onBack();
   };
 
-  // "Upload again?" is asked when the machine says so, once.
+  // The upload is confirmed when the machine says so, once, naming what
+  // goes up and how.
   useEffect(() => {
     if (phase.kind !== "confirming") return;
     let current = true;
-    ask("This video has already been uploaded to YouTube. Upload it again as a new YouTube video?", {
-      title: "Upload again",
-      kind: "warning",
-      okLabel: "Upload Again",
+    const again = review.uploadCount > 0;
+    const lines = [
+      `Upload "${title.trim()}" by ${preacher.trim()} as ${PRIVACY_LABELS[privacy]}?`,
+    ];
+    if (again) {
+      lines.push("This video has already been uploaded to YouTube. This makes a new, separate YouTube video.");
+    }
+    ask(lines.join("\n\n"), {
+      title: again ? "Upload again" : "Upload to YouTube",
+      kind: again ? "warning" : "info",
+      okLabel: again ? "Upload Again" : "Upload",
       cancelLabel: "Cancel",
     })
       .then((yes) => current && dispatch({ type: yes ? "confirm" : "cancelConfirm" }))
@@ -780,13 +803,23 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                 </label>
                 <input
                   type="text"
+                  aria-label="Preacher"
                   value={preacher}
-                  onChange={(e) => setPreacher(e.target.value)}
+                  list="recent-preachers"
+                  onChange={(e) => {
+                    preacherTouched.current = true;
+                    setPreacher(e.target.value);
+                  }}
                   placeholder="Enter speaker name"
                   className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-ring ${
                     !preacher.trim() ? "border-red-300" : "border-input"
                   }`}
                 />
+                <datalist id="recent-preachers">
+                  {recentPreachers.map((name) => (
+                    <option key={name} value={name} />
+                  ))}
+                </datalist>
               </div>
 
               {video.source_url && (

@@ -88,13 +88,23 @@ pub async fn forget_video(lib: State<'_, LibraryHandle>, app_handle: AppHandle, 
 #[tauri::command]
 pub async fn save_review(
     lib: State<'_, LibraryHandle>,
+    state: State<'_, AppStateHandle>,
     video_id: String,
     title: Option<String>,
     description: Option<String>,
     preacher: Option<String>,
     selected_source: Option<String>,
 ) -> Result<(), String> {
-    lib.save_review(&video_id, Review { title, description, preacher }, selected_source)
+    let named = preacher.clone().unwrap_or_default();
+    lib.save_review(&video_id, Review { title, description, preacher }, selected_source)?;
+    // Offered on the next video's review screen.
+    let mut s = state.lock().await;
+    if s.note_preacher(&video_id, &named) {
+        if let Err(e) = s.save() {
+            eprintln!("[warn] Failed to save state: {}", e);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

@@ -640,3 +640,39 @@ async fn a_session_uri_that_isnt_youtubes_is_never_contacted() {
     assert_eq!(h.upload().await.unwrap(), "vid2");
     assert_eq!(h.server.with(|s| s.queries), 0);
 }
+
+/// Dock-Quit or a crash mid-chunk: the upload future is simply dropped (no
+/// cancel, nothing cleaned up). The next app run, with the session read
+/// back from library.json, continues from the server's Range.
+#[tokio::test]
+async fn a_quit_mid_chunk_only_pauses_the_upload() {
+    let mut h = Harness::new().await;
+    h.cfg.stall_timeout = Duration::from_secs(30);
+    h.faults(vec![Fault::PartialStore(CHUNK as usize), Fault::StallMidBody]);
+    let server = h.server.clone();
+    let mid_second_chunk = async move {
+        while server.with(|s| s.chunk_puts) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    tokio::select! {
+        r = h.upload() => panic!("the upload should still be running: {:?}", r),
+        _ = mid_second_chunk => {} // the upload future is dropped here
+    }
+    assert_eq!(h.server.with(|s| s.sessions["s1"].data.len()), CHUNK as usize);
+
+    // A new app run: the session as saved in library.json, a new client.
+    let saved = serde_json::to_string(&h.store.load().expect("the session was saved when it was created")).unwrap();
+    let store = MemoryStore::default();
+    store.save(Some(&serde_json::from_str(&saved).unwrap()));
+    let http = build_client();
+    let tokens = FakeTokens::new();
+    let uploader = Uploader { http: &http, cfg: &h.cfg, tokens: &tokens, cancel: &CancellationToken::new() };
+    let up = uploader.upload(&store, &h.video(), &|_, _| {}).await.unwrap();
+    assert_eq!(up.video_id, "vid1");
+    h.assert_complete_once();
+    // Asked where to continue, then sent only the rest.
+    assert_eq!(h.server.with(|s| (s.creates, s.queries, s.chunk_puts)), (1, 1, 5));
+    assert!(store.load().is_none());
+}

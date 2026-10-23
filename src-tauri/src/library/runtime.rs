@@ -21,6 +21,8 @@ pub type AppStateHandle = Arc<tokio::sync::Mutex<AppState>>;
 
 const SWITCH_BUSY: &str = "Wait for processing, downloads and uploads to finish before changing the library folder.";
 
+const UPDATING_LIBRARY: &str = "Updating library…";
+
 const FILE_CHANGED: &str =
     "The file changed since it was added. If it's still copying, wait for it to finish, then try again.";
 
@@ -83,6 +85,8 @@ pub struct Library {
     inner: Mutex<Inner>,
     scan_lock: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
+    /// The pre-0.4 migration ran this launch.
+    migration_tried: std::sync::atomic::AtomicBool,
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +623,7 @@ impl Library {
             }),
             scan_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
+            migration_tried: std::sync::atomic::AtomicBool::new(false),
         });
         lib.inner().configured = configured;
         lib
@@ -835,7 +840,12 @@ impl Library {
     }
 
     /// Migrate pre-0.4 videos if there are any and the library is writable.
+    /// Called under the scan lock. Runs once per launch: a video that fails
+    /// is tried again on the next launch, up to migrate::MAX_ATTEMPTS.
     async fn migrate_if_needed(self: &Arc<Self>, app_state: &AppStateHandle) {
+        if self.migration_tried.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let legacy = {
             let state = app_state.lock().await;
             if state.legacy_videos.is_empty() {
@@ -843,43 +853,70 @@ impl Library {
             }
             state.legacy_videos.clone()
         };
-        let lib = self.clone();
-        let result = blocking(move || {
-            let mut g = lib.inner();
-            let paths = g.writable()?.clone();
-            let result = super::migrate::migrate(&paths, &mut g.manifest, &legacy);
-            // Save even after a partial failure: entries made so far point at
-            // files already moved, and a re-run picks up from there.
-            g.save()?;
-            result.map(|outcome| (paths, outcome))
-        })
-        .await
-        .and_then(|r| r);
-
-        match result {
-            Ok((paths, outcome)) => {
-                let mut state = app_state.lock().await;
-                if let Err(e) = AppState::backup_pre_library_state() {
-                    eprintln!("[migrate] {}", e);
-                    return;
-                }
-                state.legacy_videos.clear();
-                if !outcome.outside.is_empty() {
-                    state.notices.push(format!(
-                        "These videos from before the library update are outside the library folder, so they're no longer listed. Copy them into the library folder to keep working on them: {}",
-                        outcome.outside.join(", ")
-                    ));
-                }
-                match state.save() {
-                    Ok(()) => super::migrate::cleanup(&paths, &outcome),
-                    Err(e) => eprintln!("[migrate] Failed to save state: {}", e),
-                }
-                println!("[migrate] Moved old videos into the library");
+        // Nothing else may change the list while files move, so the library
+        // is read-only ("Updating library…") meanwhile. The scan lock keeps
+        // scans, trash, downloads and switches out; idle means no job,
+        // upload or download can write either. Busy: a later scan retries.
+        let (paths, manifest) = {
+            let mut g = self.inner();
+            let Ok(paths) = g.writable().cloned() else {
+                // Not writable yet (e.g. drive unplugged): a later scan retries.
+                return;
+            };
+            if g.running.is_some() || !g.queue.is_empty() || !g.busy.is_empty() || !g.downloads.is_empty() {
+                return;
             }
-            // Not writable yet (e.g. drive unplugged) or a move failed:
-            // state.json is left alone and the next scan tries again.
-            Err(e) => eprintln!("[migrate] Deferred: {}", e),
+            g.mode = Mode::ReadOnly(UPDATING_LIBRARY.into());
+            (paths, g.manifest.clone())
+        };
+        self.migration_tried.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let moved = blocking({
+            let paths = paths.clone();
+            move || {
+                let mut manifest = manifest;
+                let outcome = super::migrate::migrate(&paths, &mut manifest, &legacy);
+                // Saved even after failures: entries made so far point at
+                // files already moved, and the next run picks up from there.
+                let saved = manifest::save(&paths, &manifest);
+                (manifest, outcome, saved)
+            }
+        })
+        .await;
+        {
+            let mut g = self.inner();
+            if g.mode == Mode::ReadOnly(UPDATING_LIBRARY.into()) {
+                g.mode = Mode::Writable;
+            }
+            if let Ok((manifest, _, _)) = &moved {
+                g.manifest = manifest.clone();
+            }
         }
+        let (outcome, saved) = match moved {
+            Ok((_, outcome, saved)) => (outcome, saved),
+            Err(e) => return eprintln!("[migrate] {}", e),
+        };
+        if let Err(e) = saved {
+            // state.json keeps every old video; the next launch tries again.
+            return eprintln!("[migrate] Failed to save library.json: {}", e);
+        }
+
+        let mut state = app_state.lock().await;
+        if let Err(e) = AppState::backup_pre_library_state() {
+            eprintln!("[migrate] {}", e);
+            return;
+        }
+        let notices = super::migrate::settle(&mut state.legacy_videos, &outcome);
+        state.notices.extend(notices);
+        match state.save() {
+            Ok(()) => super::migrate::cleanup(&paths, &outcome),
+            Err(e) => eprintln!("[migrate] Failed to save state: {}", e),
+        }
+        println!(
+            "[migrate] Moved {} old videos into the library; {} failed",
+            outcome.done.len(),
+            outcome.failed.len()
+        );
     }
 
     /// Scan the folder. One at a time; I/O happens without the lock.

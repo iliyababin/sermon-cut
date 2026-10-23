@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useReducer, useRef } from "react";
+import { useBeforeLeave } from "@/lib/beforeLeave";
 import {
   regenerateThumbnails,
   getVideo,
@@ -217,6 +218,8 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   // The save in flight, if any; flushing waits for it, so leaving never
   // races a save that already started.
   const saving = useRef<Promise<boolean>>(Promise.resolve(true));
+  // Why the last save failed, for whoever is waiting to leave.
+  const lastSaveError = useRef<string | null>(null);
 
   /** Save pending edits; resolves with whether everything is saved. */
   const flush = (): Promise<boolean> => {
@@ -232,6 +235,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
       )
         .then(() => {
           savedInputs.current = { title: v.title, preacher: v.preacher, singleLine: v.singleLine };
+          lastSaveError.current = null;
           setSaveError(null);
           setSavedOnce(true);
           return true;
@@ -239,7 +243,8 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         .catch((err) => {
           // Still unsaved: the next flush (e.g. Back) tries again.
           dirty.current = true;
-          setSaveError(errorMessage(err, "Couldn't save your changes"));
+          lastSaveError.current = errorMessage(err, "Couldn't save your changes");
+          setSaveError(lastSaveError.current);
           return false;
         })
         .finally(() => setSavesInFlight((n) => n - 1));
@@ -269,6 +274,12 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
   }, [title, description, preacher, singleLine, selectedSource]);
 
   useEffect(() => () => void flush(), []);
+
+  // Leaving (another screen, another video, closing or quitting the app)
+  // waits for the edits to be saved.
+  useBeforeLeave(async () => {
+    if (!(await flush())) throw new Error(lastSaveError.current ?? "Couldn't save your changes");
+  });
 
   // Load YouTube auth status, the upload defaults and the playlists
   const loadYoutube = () => {

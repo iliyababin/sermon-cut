@@ -1,5 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { emit, listen } from "@tauri-apps/api/event";
+import { runBeforeLeave } from "./lib/beforeLeave";
 import { VideoLibrary } from "./components/VideoLibrary";
 import { DownloadForm } from "./components/DownloadForm";
 import { ReviewScreen } from "./components/ReviewScreen";
@@ -19,27 +21,72 @@ export default function App() {
   const [reviewKey, setReviewKey] = useState(0);
   const [appVersion, setAppVersion] = useState("");
   const updater = useUpdaterState();
+  // Leaving was held up because the edits couldn't be saved.
+  const [leaveBlocked, setLeaveBlocked] = useState<{ message: string; leave: () => void } | null>(null);
+  const viewRef = useRef(currentView);
+  viewRef.current = currentView;
 
   useEffect(() => {
     getVersion().then(setAppVersion);
     updater.checkForUpdates();
   }, []);
 
-  const handleVideoSelect = async (video: LibraryVideo) => {
-    // Only processed videos have something to review
-    if (video.status !== "ready_for_review" && video.status !== "done" && video.status !== "uploading") return;
-    try {
-      setSelectedVideo(await getVideo(video.id));
-      setReviewKey((k) => k + 1);
-      setCurrentView("review");
-    } catch (err) {
-      alert(errorMessage(err, "Couldn't open this video"));
+  // Closing the window or quitting: save first. The app waits up to 2 s for
+  // "flush-done", then goes ahead either way.
+  useEffect(() => {
+    const unlisten = listen("flush-before-exit", async () => {
+      try {
+        await runBeforeLeave();
+      } catch (err) {
+        console.error("Couldn't save before closing:", err);
+      }
+      await emit("flush-done");
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  /** Run `go` once whatever the open review has pending is saved. `always`:
+   * check even when the review isn't the screen showing (it is about to be
+   * replaced). If saving fails, stay and say why, with a way to leave anyway. */
+  const leaveThen = async (go: () => void | Promise<void>, always = false) => {
+    if (always || viewRef.current === "review") {
+      try {
+        await runBeforeLeave();
+      } catch (err) {
+        setLeaveBlocked({
+          message: errorMessage(err, "Couldn't save your changes"),
+          leave: () => {
+            setLeaveBlocked(null);
+            void go();
+          },
+        });
+        return;
+      }
     }
+    setLeaveBlocked(null);
+    await go();
   };
 
-  const handleGoToLibrary = () => {
-    setCurrentView("library");
+  const navigate = (view: View) => void leaveThen(() => setCurrentView(view));
+
+  const handleVideoSelect = (video: LibraryVideo) => {
+    // Only processed videos have something to review
+    if (video.status !== "ready_for_review" && video.status !== "done" && video.status !== "uploading") return;
+    // Opening reads the saved review, so the open one is saved first.
+    void leaveThen(async () => {
+      try {
+        setSelectedVideo(await getVideo(video.id));
+        setReviewKey((k) => k + 1);
+        setCurrentView("review");
+      } catch (err) {
+        alert(errorMessage(err, "Couldn't open this video"));
+      }
+    }, true);
   };
+
+  const handleGoToLibrary = () => navigate("library");
 
   return (
     <UpdaterContext.Provider value={updater}>
@@ -58,32 +105,32 @@ export default function App() {
             icon={<Film className="w-5 h-5" />}
             label="Video Library"
             active={currentView === "library"}
-            onClick={() => setCurrentView("library")}
+            onClick={() => navigate("library")}
           />
           <NavButton
             icon={<Download className="w-5 h-5" />}
             label="Download"
             active={currentView === "download"}
-            onClick={() => setCurrentView("download")}
+            onClick={() => navigate("download")}
           />
           <NavButton
             icon={<Image className="w-5 h-5" />}
             label="Thumbnail"
             active={currentView === "thumbnail"}
-            onClick={() => setCurrentView("thumbnail")}
+            onClick={() => navigate("thumbnail")}
           />
           <NavButton
             icon={<SettingsIcon className="w-5 h-5" />}
             label="Settings"
             active={currentView === "settings"}
-            onClick={() => setCurrentView("settings")}
+            onClick={() => navigate("settings")}
           />
         </nav>
 
         {updater.available && (
           <div className="px-2 pb-2">
             <button
-              onClick={() => setCurrentView("settings")}
+              onClick={() => navigate("settings")}
               className="w-full px-3 py-2 bg-primary/10 text-primary rounded-lg hover:bg-primary/20 transition-colors text-sm flex items-center gap-2"
             >
               <ArrowUpCircle className="w-4 h-4" />
@@ -98,6 +145,19 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 overflow-auto relative">
+        {leaveBlocked && (
+          <div role="alert" className="m-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center justify-between gap-3">
+            <span>{leaveBlocked.message}</span>
+            <span className="flex gap-2 shrink-0">
+              <button onClick={() => setLeaveBlocked(null)} className="px-3 py-1 bg-secondary text-secondary-foreground rounded-lg">
+                Stay
+              </button>
+              <button onClick={leaveBlocked.leave} className="px-3 py-1 bg-destructive text-destructive-foreground rounded-lg">
+                Leave anyway
+              </button>
+            </span>
+          </div>
+        )}
         <div className={currentView === "library" ? "" : "hidden"}>
           <VideoLibrary onVideoSelect={handleVideoSelect} visible={currentView === "library"} />
         </div>

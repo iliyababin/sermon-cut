@@ -28,6 +28,54 @@ static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
 /// opening a second one.
 static ASKING: AtomicBool = AtomicBool::new(false);
 
+/// The webview has saved its pending edits (or was given up on) for the
+/// close or quit under way; cleared if the user then keeps working.
+static FLUSHED: AtomicBool = AtomicBool::new(false);
+/// Waiting for the webview's "flush-done"; another close or quit leaves it
+/// to the one already waiting.
+static FLUSHING: AtomicBool = AtomicBool::new(false);
+/// How long a close or quit waits for the webview to save.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Before closing or quitting, ask the webview to save pending edits
+/// ("flush-before-exit") and run `then` once it answers ("flush-done") or
+/// FLUSH_TIMEOUT passes. Returns true if `then` will run later, so the
+/// caller should hold the close or quit back; false if the flush is done.
+/// Nothing blocks the event loop and no lock is held while waiting.
+fn flush_first(app: &AppHandle, then: impl FnOnce(&AppHandle) + Send + 'static) -> bool {
+    if FLUSHED.load(Ordering::SeqCst) {
+        return false;
+    }
+    if FLUSHING.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    let (done, answered) = tokio::sync::oneshot::channel::<()>();
+    let listener = tauri::Listener::once(app, "flush-done", move |_| {
+        let _ = done.send(());
+    });
+    if let Err(e) = tauri::Emitter::emit(app, "flush-before-exit", ()) {
+        eprintln!("[app] Couldn't ask the window to save: {}", e);
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if tokio::time::timeout(FLUSH_TIMEOUT, answered).await.is_err() {
+            eprintln!("[app] The window didn't confirm saving in time; going ahead");
+        }
+        tauri::Listener::unlisten(&app, listener);
+        FLUSHED.store(true, Ordering::SeqCst);
+        FLUSHING.store(false, Ordering::SeqCst);
+        then(&app);
+    });
+    true
+}
+
+/// Quit, unless there's work to ask about first.
+fn quit(app: &AppHandle, library: &Library) {
+    if !ask_before_quitting(app, library) {
+        app.exit(0);
+    }
+}
+
 /// Before quitting mid-upload (or mid-processing/download), ask first.
 /// Returns true if quitting should wait for the user's answer.
 fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
@@ -54,6 +102,10 @@ fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
             let app = app.clone();
             move |quit| {
                 ASKING.store(false, Ordering::SeqCst);
+                if !quit {
+                    // Kept working: the next close or quit saves again.
+                    FLUSHED.store(false, Ordering::SeqCst);
+                }
                 if quit {
                     QUIT_CONFIRMED.store(true, Ordering::SeqCst);
                     app.exit(0);
@@ -166,8 +218,11 @@ fn main() {
         .on_menu_event({
             let library = library.clone();
             move |app, event| {
-                if event.id() == "quit" && !ask_before_quitting(app, &library) {
-                    app.exit(0);
+                if event.id() == "quit" {
+                    let later = library.clone();
+                    if !flush_first(app, move |app| quit(app, &later)) {
+                        quit(app, &library);
+                    }
                 }
             }
         })
@@ -175,7 +230,12 @@ fn main() {
             let library = library.clone();
             move |window, event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    if ask_before_quitting(window.app_handle(), &library) {
+                    // Save first, then close again (which comes back here).
+                    let again = window.clone();
+                    if flush_first(window.app_handle(), move |_| {
+                        let _ = again.close();
+                    }) || ask_before_quitting(window.app_handle(), &library)
+                    {
                         api.prevent_close();
                     }
                 }
@@ -246,7 +306,11 @@ fn main() {
         // be running, since begin_update refused to start otherwise.
         tauri::RunEvent::ExitRequested { code, .. } if code == Some(tauri::RESTART_EXIT_CODE) => {}
         tauri::RunEvent::ExitRequested { api, .. } => {
-            if ask_before_quitting(app, &library) {
+            let then = {
+                let library = library.clone();
+                move |app: &AppHandle| quit(app, &library)
+            };
+            if flush_first(app, then) || ask_before_quitting(app, &library) {
                 api.prevent_exit();
             }
         }

@@ -19,6 +19,7 @@ async fn view(lib: &Library, state: &AppStateHandle) -> LibraryView {
 
 fn changed(app: &AppHandle) {
     let _ = app.emit("library-changed", ());
+    crate::notify::refresh_badge(app);
 }
 
 #[tauri::command]
@@ -35,6 +36,7 @@ pub async fn rescan_library(
 ) -> Result<LibraryView, String> {
     lib.rescan(&state).await?;
     crate::commands::allow_library_paths(&app_handle, lib.root().as_deref());
+    crate::notify::refresh_badge(&app_handle);
     Ok(view(&lib, &state).await)
 }
 
@@ -341,6 +343,15 @@ pub async fn youtube_upload_video(
     .await;
 
     library.finish_upload(&video_id, job, result.as_ref().ok(), &options);
+    let shown_title = library.title_of(&video_id);
+    match &result {
+        Ok(_) => crate::notify::notify(&app_handle, crate::notify::Event::Uploaded { title: &shown_title }),
+        Err(UploadError::Cancelled) => {}
+        Err(e) => crate::notify::notify(
+            &app_handle,
+            crate::notify::Event::UploadFailed { title: &shown_title, error: &e.user_message() },
+        ),
+    }
     // Final word for any screen showing this upload, including a review
     // screen reopened after the one that started it went away.
     match &result {

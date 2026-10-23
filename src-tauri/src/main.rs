@@ -5,6 +5,7 @@ mod youtube_dl;
 mod ffmpeg;
 mod library;
 mod modal;
+mod notify;
 mod state;
 mod thumbnail;
 mod tools;
@@ -106,6 +107,7 @@ fn main() {
                         }
                         commands::allow_user_paths(&handle, library.root().as_deref(), &settings);
                         let _ = tauri::Emitter::emit(&handle, "library-changed", ());
+                        notify::refresh_badge(&handle);
                     }
                 });
                 tauri::async_runtime::spawn(library.clone().worker(handle.clone(), app_state.clone()));
@@ -159,6 +161,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(app_state)
         .manage(youtube::SignInSlot::default())
         .manage(library.clone())

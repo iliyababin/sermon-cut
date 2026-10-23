@@ -33,6 +33,7 @@
     "fs:allow-rename",
     "fs:allow-copy-file",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "notification:default"
   ]
 }

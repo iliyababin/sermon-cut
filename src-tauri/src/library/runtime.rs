@@ -208,6 +208,7 @@ fn path_string(p: &Path) -> String {
 
 fn emit_changed(app: &AppHandle) {
     let _ = app.emit("library-changed", ());
+    crate::notify::refresh_badge(app);
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1141,6 +1142,21 @@ impl Library {
         self.inner().view(notices)
     }
 
+    /// Videos waiting for review, for the Dock badge.
+    pub fn ready_for_review_count(&self) -> usize {
+        let g = self.inner();
+        g.manifest
+            .entries
+            .iter()
+            .filter(|e| !e.hidden && g.status_of(e) == ViewStatus::ReadyForReview)
+            .count()
+    }
+
+    /// The title a video is shown with, for notifications.
+    pub fn title_of(&self, id: &str) -> String {
+        self.inner().manifest.get(id).map(|e| e.display_title()).unwrap_or_default()
+    }
+
     pub fn detail(&self, id: &str) -> Result<VideoDetail, String> {
         let g = self.inner();
         let e = g.entry(id)?;
@@ -1347,6 +1363,10 @@ impl Library {
             };
             self.finish_job(&id, &result);
 
+            if let Some(Ok(())) = &result {
+                let title = self.title_of(&id);
+                crate::notify::notify(&app, crate::notify::Event::Processed { title: &title });
+            }
             if let Some(Err(err)) = &result {
                 eprintln!("[process] {} failed: {}", id, err);
                 let _ = app.emit(

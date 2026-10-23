@@ -287,6 +287,19 @@ pub const FACING_BONUS: f32 = 1.3;
 pub const GESTURE_BONUS: f32 = 1.5;
 pub const PITCH_THRESHOLD: f32 = 0.6;
 pub const PITCH_PENALTY: f32 = 0.6;
+/// A person shorter than this share of the frame height is small: their
+/// crop is mostly upscaled background. The score falls off linearly below
+/// it, down to SMALL_SUBJECT_FLOOR.
+pub const SMALL_SUBJECT: f32 = 0.4;
+pub const SMALL_SUBJECT_FLOOR: f32 = 0.3;
+
+/// 1.0 for a person at least SMALL_SUBJECT of the frame tall, less below.
+pub fn subject_size_bonus(det_h: f32, img_h: f32) -> f32 {
+    if img_h <= 0.0 {
+        return 1.0;
+    }
+    (det_h / img_h / SMALL_SUBJECT).clamp(SMALL_SUBJECT_FLOOR, 1.0)
+}
 
 /// Detailed scoring result for a single detection.
 #[derive(Debug, Clone)]
@@ -366,7 +379,10 @@ pub fn score_detection(det: &PoseDetection, img: &RgbImage) -> ScoredDetection {
         1.0
     };
 
+    let size_bonus = subject_size_bonus(det.h, img.height() as f32);
+
     let score = det.conf
+        * size_bonus
         * standing_bonus
         * center_bonus
         * facing_score
@@ -375,9 +391,10 @@ pub fn score_detection(det: &PoseDetection, img: &RgbImage) -> ScoredDetection {
         * pitch_bonus;
 
     let details = format!(
-        "s={:.2} ar={:.1} face={} gest={:.2} pitch={:.2}",
+        "s={:.2} ar={:.1} size={:.2} face={} gest={:.2} pitch={:.2}",
         score,
         aspect_ratio,
+        size_bonus,
         facing.label(),
         gesture_score,
         pitch_ratio
@@ -388,5 +405,47 @@ pub fn score_detection(det: &PoseDetection, img: &RgbImage) -> ScoredDetection {
         score,
         status: DetectionStatus::Valid,
         details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A front-facing standing person: both eyes, ears and the nose visible,
+    /// arms down.
+    fn person(x: f32, y: f32, w: f32, h: f32) -> PoseDetection {
+        let mut kps = [[0.0_f32; 3]; 17];
+        let cx = x + w / 2.0;
+        let head = y + h * 0.08;
+        kps[NOSE] = [cx, head + 6.0, 0.9];
+        kps[LEFT_EYE] = [cx + w * 0.08, head, 0.9];
+        kps[RIGHT_EYE] = [cx - w * 0.08, head, 0.9];
+        kps[LEFT_EAR] = [cx + w * 0.15, head, 0.9];
+        kps[RIGHT_EAR] = [cx - w * 0.15, head, 0.9];
+        PoseDetection { x, y, w, h, conf: 0.9, keypoints: kps }
+    }
+
+    fn frame() -> RgbImage {
+        RgbImage::from_pixel(1920, 1080, image::Rgb([90, 90, 90]))
+    }
+
+    #[test]
+    fn size_bonus_falls_off_below_the_threshold() {
+        assert_eq!(subject_size_bonus(800.0, 1080.0), 1.0);
+        assert_eq!(subject_size_bonus(432.0, 1080.0), 1.0);
+        assert!((subject_size_bonus(216.0, 1080.0) - 0.5).abs() < 1e-6);
+        assert_eq!(subject_size_bonus(20.0, 1080.0), SMALL_SUBJECT_FLOOR);
+    }
+
+    #[test]
+    fn a_small_subject_scores_below_a_large_one() {
+        let img = frame();
+        // Same place, same pose, same proportions; only the size differs.
+        let large = score_detection(&person(860.0, 100.0, 300.0, 800.0), &img);
+        let small = score_detection(&person(935.0, 600.0, 75.0, 200.0), &img);
+        assert_eq!(large.status, DetectionStatus::Valid);
+        assert_eq!(small.status, DetectionStatus::Valid);
+        assert!(small.score < large.score * 0.6, "small {} vs large {}", small.score, large.score);
     }
 }

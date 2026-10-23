@@ -11,6 +11,9 @@ const ASPECT_RATIO: f64 = 16.0 / 9.0;
 const ANCHOR_X: f64 = 0.70;
 const TORSO_CUTOFF: f64 = 0.65;
 const HEADROOM: f64 = 0.10;
+/// Smaller crops would be blown up to 1280×720 and look soft.
+/// (640 wide at 16:9.)
+const MIN_CROP_HEIGHT: f64 = 360.0;
 
 /// Calculate a 16:9 crop centered on a detected person's upper body.
 pub fn calculate_person_crop(
@@ -31,6 +34,17 @@ pub fn calculate_person_crop(
     let mut y_start = y_bottom - h_crop;
     let cx_person = bbox_x + bbox_w / 2.0;
     let mut x_start = cx_person - w_crop * ANCHOR_X;
+
+    // At least 640×360 (or the whole image fitted to 16:9, if smaller),
+    // grown about the crop's middle and keeping the person at the anchor.
+    let min_h = MIN_CROP_HEIGHT.min(img_h).min(img_w / ASPECT_RATIO);
+    if h_crop < min_h {
+        let cy = y_start + h_crop / 2.0;
+        h_crop = min_h;
+        w_crop = h_crop * ASPECT_RATIO;
+        y_start = cy - h_crop / 2.0;
+        x_start = cx_person - w_crop * ANCHOR_X;
+    }
 
     // Clamp to image bounds
     x_start = x_start.max(0.0).min(img_w - w_crop);
@@ -94,5 +108,46 @@ pub fn calculate_fallback_crop(img_w: u32, img_h: u32) -> CropRect {
         y: ((img_h - h) / 2.0) as i32,
         width: w as i32,
         height: h as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inside(c: &CropRect, w: i32, h: i32) -> bool {
+        c.x >= 0 && c.y >= 0 && c.x + c.width <= w && c.y + c.height <= h
+    }
+
+    #[test]
+    fn a_small_person_still_gets_a_640x360_crop() {
+        // A 60×150 person far away in a 1920×1080 frame: the torso crop
+        // would be about 107px tall.
+        let c = calculate_person_crop(1200.0, 500.0, 60.0, 150.0, 1920, 1080);
+        assert!(c.width >= 639 && c.height >= 359, "{:?}", c);
+        assert!(inside(&c, 1920, 1080), "{:?}", c);
+        // The person is still in it.
+        assert!(c.x <= 1200 && c.x + c.width >= 1260, "{:?}", c);
+    }
+
+    #[test]
+    fn a_small_person_at_the_edge_stays_in_frame() {
+        let c = calculate_person_crop(1880.0, 20.0, 40.0, 100.0, 1920, 1080);
+        assert!(c.width >= 639 && c.height >= 359, "{:?}", c);
+        assert!(inside(&c, 1920, 1080), "{:?}", c);
+    }
+
+    #[test]
+    fn a_large_person_is_unchanged_by_the_minimum() {
+        let c = calculate_person_crop(900.0, 100.0, 500.0, 900.0, 1920, 1080);
+        // 900 × 0.65 × 1.1 = 643.5 tall.
+        assert_eq!(c.height, 643);
+        assert!(inside(&c, 1920, 1080), "{:?}", c);
+    }
+
+    #[test]
+    fn a_tiny_image_is_fitted_whole() {
+        let c = calculate_person_crop(100.0, 50.0, 40.0, 100.0, 480, 270);
+        assert_eq!((c.x, c.y, c.width, c.height), (0, 0, 480, 270));
     }
 }

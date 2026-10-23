@@ -306,43 +306,59 @@ async fn video_params(video_path: &Path) -> Result<VideoParams, String> {
     })
 }
 
-/// ffmpeg arguments to re-encode `params`' codec so the result can be
-/// joined to a stream copy of the original, and the bitstream filter that
-/// puts its parameter sets in-band for joining. None for codecs we can't
-/// match.
-fn head_encoder(params: &VideoParams) -> Option<(Vec<String>, Option<&'static str>)> {
-    let mut args: Vec<String> = Vec::new();
-    let bsf = match params.codec.as_str() {
-        "h264" => {
-            args.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "16"].map(String::from));
-            let profile = params.profile.as_deref().map(|p| p.to_lowercase());
-            match profile.as_deref() {
-                Some("high") => args.extend(["-profile:v".into(), "high".into()]),
-                Some("main") => args.extend(["-profile:v".into(), "main".into()]),
-                Some("baseline") | Some("constrained baseline") => {
-                    args.extend(["-profile:v".into(), "baseline".into()])
-                }
-                _ => {}
-            }
-            Some("h264_mp4toannexb")
-        }
-        "hevc" => {
-            args.extend(["-c:v", "libx265", "-preset", "veryfast", "-crf", "18"].map(String::from));
-            Some("hevc_mp4toannexb")
-        }
-        "mpeg4" => {
-            args.extend(["-c:v", "mpeg4", "-q:v", "2"].map(String::from));
-            None
-        }
-        _ => return None,
-    };
+/// ffmpeg arguments to re-encode `params`' picture so the result can be
+/// joined to a stream copy of the original. H.264 only: HEVC and others
+/// are cut at a keyframe instead.
+fn head_encoder(params: &VideoParams) -> Option<Vec<String>> {
+    if params.codec != "h264" {
+        return None;
+    }
+    let mut args: Vec<String> = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16"].map(String::from).to_vec();
+    let profile = params.profile.as_deref().map(|p| p.to_lowercase());
+    match profile.as_deref() {
+        Some("high") => args.extend(["-profile:v".into(), "high".into()]),
+        Some("main") => args.extend(["-profile:v".into(), "main".into()]),
+        Some("baseline") | Some("constrained baseline") => args.extend(["-profile:v".into(), "baseline".into()]),
+        _ => {}
+    }
     if let Some(pix) = &params.pix_fmt {
         args.extend(["-pix_fmt".into(), pix.clone()]);
     }
     if params.width > 0 && params.height > 0 {
         args.extend(["-s".into(), format!("{}x{}", params.width, params.height)]);
     }
-    Some((args, bsf))
+    Some(args)
+}
+
+/// Puts H.264's parameter sets in-band, for joining.
+const ANNEXB: &str = "h264_mp4toannexb";
+
+/// The NAL unit types `trace_headers` printed, in order.
+fn nal_types(log: &str) -> Vec<u8> {
+    log.lines()
+        .filter(|l| l.contains("nal_unit_type"))
+        .filter_map(|l| l.rsplit('=').next()?.trim().parse().ok())
+        .collect()
+}
+
+/// Whether the H.264 keyframe at `k` (relative) is an IDR picture, which
+/// nothing after it refers back past. An open-GOP keyframe (a plain I
+/// picture with a recovery point) has pictures after it that use the
+/// ones before it, which a join would corrupt. Unknown counts as no.
+async fn is_idr(video_path: &Path, st: f64, k: f64) -> Result<bool, String> {
+    let seek = (k - SEEK_EARLY).max(0.0);
+    let filters = format!("{},trace_headers", drop_before(k + st));
+    let output = crate::tools::command("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-v", "info", "-ss", &format_time(seek), "-i", path_str(video_path)?])
+        .args(["-map", "0:v:0", "-c", "copy", "-copyts", "-bsf:v", &filters, "-frames:v", "1", "-f", "null", "-"])
+        .output()
+        .await
+        .map_err(|e| crate::tools::spawn_error("ffmpeg", e))?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg error: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    // Parameter sets and SEI come first; the first slice decides.
+    Ok(nal_types(&String::from_utf8_lossy(&output.stderr)).into_iter().find(|t| (1..=5).contains(t)) == Some(5))
 }
 
 fn is_mp4_family(path: &Path) -> bool {
@@ -368,8 +384,9 @@ async fn decodes_cleanly(path: &Path, limit: Option<f64>) -> Result<(), String> 
     Ok(())
 }
 
-/// Cut exactly at `start` (relative): re-encode the picture from `start`
-/// to the next keyframe, stream copy it from there to `end`, join the two
+/// Cut exactly at `start` (relative), for H.264 whose next keyframe is an
+/// IDR picture (else Err, and the caller cuts at the keyframe): re-encode
+/// the picture from `start` to the next keyframe, stream copy it from there to `end`, join the two
 /// (concat demuxer), and copy the sound from `start`. Each piece is checked
 /// before the join, and the join itself after. Returns the original's time
 /// that the result's 0 shows, measured through its sound. Temporary files
@@ -385,9 +402,14 @@ async fn smart_cut(
     on_step: &(dyn Fn(f32, &str) + Send + Sync),
 ) -> Result<f64, String> {
     let params = video_params(video_path).await?;
-    let (encode, bsf) = head_encoder(&params).ok_or_else(|| format!("can't re-encode {} video", params.codec))?;
+    let encode = head_encoder(&params).ok_or_else(|| format!("{} video is cut at a keyframe", params.codec))?;
     on_step(0.3, "Finding the next keyframe…");
     let next = keyframe_after(video_path, st, start, end - start).await?.filter(|k| *k < end);
+    if let Some(k) = next {
+        if !is_idr(video_path, st, k).await? {
+            return Err(format!("the keyframe at {:.2}s isn't an IDR picture (open GOP)", k));
+        }
+    }
     let src = path_str(video_path)?;
 
     on_step(0.4, "Re-encoding the first few seconds…");
@@ -404,10 +426,7 @@ async fn smart_cut(
     .map(String::from)
     .to_vec();
     args.extend(encode);
-    if let Some(b) = bsf {
-        args.extend(["-bsf:v".into(), b.into()]);
-    }
-    args.extend(["-f", "mpegts", "-y", path_str(&head)?].map(String::from));
+    args.extend(["-bsf:v", ANNEXB, "-f", "mpegts", "-y", path_str(&head)?].map(String::from));
     run_ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>()).await?;
     non_empty(&head)?;
     decodes_cleanly(&head, None).await?;
@@ -417,10 +436,7 @@ async fn smart_cut(
         on_step(0.6, "Copying the rest…");
         let tail = work.join("tail.ts");
         let seek = (k - SEEK_EARLY).max(0.0);
-        let filters = match bsf {
-            Some(b) => format!("{},{}", drop_before(k + st), b),
-            None => drop_before(k + st),
-        };
+        let filters = format!("{},{}", drop_before(k + st), ANNEXB);
         run_ffmpeg(&[
             "-ss", &format_time(seek), "-t", &format_time(end - seek), "-i", src,
             "-map", "0:v:0", "-an", "-c:v", "copy", "-copyts", "-bsf:v", &filters, "-f", "mpegts", "-y", path_str(&tail)?,
@@ -484,9 +500,6 @@ async fn smart_cut(
         if let Some(ts) = params.timescale.filter(|t| *t > 0) {
             args.extend(["-video_track_timescale".into(), ts.to_string()]);
         }
-        if params.codec == "hevc" {
-            args.extend(["-tag:v".into(), "hvc1".into()]);
-        }
     }
     args.extend(["-y".into(), path_str(output_path)?.to_string()]);
     run_ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>()).await?;
@@ -513,7 +526,8 @@ async fn smart_cut(
 pub enum CutMethod {
     /// Stream copy from the keyframe at or before the start.
     Keyframe,
-    /// The start re-encoded up to the next keyframe, stream copy after.
+    /// The start re-encoded up to the next keyframe, stream copy after
+    /// (H.264 with closed GOPs only).
     Smart,
 }
 
@@ -692,16 +706,24 @@ mod tests {
     }
 
     #[test]
-    fn only_known_codecs_are_re_encoded() {
+    fn only_h264_is_re_encoded() {
         let p = |codec: &str| VideoParams { codec: codec.into(), pix_fmt: Some("yuv420p".into()), width: 640, height: 360, ..Default::default() };
-        let (args, bsf) = head_encoder(&VideoParams { profile: Some("High".into()), ..p("h264") }).unwrap();
+        let args = head_encoder(&VideoParams { profile: Some("High".into()), ..p("h264") }).unwrap();
         assert!(args.windows(2).any(|w| w == ["-c:v", "libx264"]));
         assert!(args.windows(2).any(|w| w == ["-profile:v", "high"]));
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "yuv420p"]));
         assert!(args.windows(2).any(|w| w == ["-s", "640x360"]));
-        assert_eq!(bsf, Some("h264_mp4toannexb"));
-        assert!(head_encoder(&p("hevc")).is_some());
+        assert!(head_encoder(&p("hevc")).is_none());
+        assert!(head_encoder(&p("mpeg4")).is_none());
         assert!(head_encoder(&p("prores")).is_none());
+    }
+
+    #[test]
+    fn nal_unit_types_are_read_from_the_trace() {
+        let log = "[trace_headers @ 0x1] 3           nal_unit_type                                           00111 = 7\n\
+                   [trace_headers @ 0x1] Sequence Parameter Set\n\
+                   [trace_headers @ 0x1] 3           nal_unit_type                                           00101 = 5\n";
+        assert_eq!(nal_types(log), vec![7, 5]);
     }
 
     fn has_encoder(name: &str) -> bool {
@@ -835,6 +857,7 @@ mod tests {
         let out = tmp.path().join("trimmed.mp4");
         assert_eq!(keyframe_at_or_before(&src, 13.3).await.unwrap(), 12.0);
         let cut = trim_checked(&src, 13.3, 30.0, &out).await;
+        assert_eq!(cut.method, CutMethod::Keyframe);
         assert!((cut.start - 12.0).abs() < 0.1, "snapped to the keyframe, got {}", cut.start);
         assert!((duration_of(&out) - 18.0).abs() < 0.15, "{}", duration_of(&out));
     }
@@ -849,6 +872,7 @@ mod tests {
         let out = tmp.path().join("trimmed.mp4");
         assert_eq!(keyframe_at_or_before(&src, 13.37).await.unwrap(), 10.0);
         let cut = trim_checked(&src, 13.37, 35.0, &out).await;
+        assert_eq!(cut.method, CutMethod::Smart, "closed-GOP H.264 is cut exactly");
         assert!((cut.start - 13.37).abs() < 0.05, "{}", cut.start);
         assert!((duration_of(&out) - 21.63).abs() < 0.15, "{}", duration_of(&out));
         // The original's keyframe at 20 s is where it should be if the cut
@@ -888,6 +912,7 @@ mod tests {
         assert!((keyframe_at_or_before(&src, 13.37).await.unwrap() - 10.0).abs() < 0.05);
 
         let exact = trim_checked(&src, 13.37, 30.0, &tmp.path().join("exact.ts")).await;
+        assert_eq!(exact.method, CutMethod::Smart);
         assert!((exact.start - 13.37).abs() < 0.05, "{}", exact.start);
         let snapped = trim_checked(&src, 11.0, 30.0, &tmp.path().join("snapped.ts")).await;
         assert!((snapped.start - 10.0).abs() < 0.1, "{}", snapped.start);
@@ -918,7 +943,48 @@ mod tests {
         let snapped = trim_checked(&src, 12.5, 30.0, &tmp.path().join("snapped.mp4")).await;
         assert!((snapped.start - 11.7).abs() < 0.1, "{}", snapped.start);
         let exact = trim_checked(&src, 10.0, 30.0, &tmp.path().join("exact.mp4")).await;
+        assert_eq!(exact.method, CutMethod::Smart);
         assert!((exact.start - 10.0).abs() < 0.05, "{}", exact.start);
+    }
+
+    /// Open-GOP H.264: the keyframe after the start isn't an IDR picture,
+    /// so the cut snaps to the keyframe before it.
+    #[tokio::test]
+    async fn open_gop_h264_snaps_to_a_keyframe() {
+        if !x264_for_tests() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = x264(10);
+        args.extend(["-x264-params", "open-gop=1"].map(String::from));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let src = fixture(tmp.path(), "open.mp4", &args, &[]);
+        let st = file_start(&src).await.unwrap();
+        assert!(!is_idr(&src, st, 20.0).await.unwrap(), "an open-GOP keyframe");
+        let cut = trim_checked(&src, 13.37, 35.0, &tmp.path().join("trimmed.mp4")).await;
+        assert_eq!(cut.method, CutMethod::Keyframe);
+        assert!((cut.start - 10.0).abs() < 0.1, "{}", cut.start);
+
+        let closed = clip(tmp.path(), 10);
+        assert!(is_idr(&closed, 0.0, 20.0).await.unwrap(), "a closed-GOP keyframe");
+    }
+
+    /// HEVC is always cut at a keyframe.
+    #[tokio::test]
+    async fn hevc_snaps_to_a_keyframe() {
+        if !x264_for_tests() {
+            return;
+        }
+        if !has_encoder("libx265") {
+            eprintln!("skipping: ffmpeg has no libx265");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let args = ["-c:v", "libx265", "-x265-params", "keyint=300:min-keyint=300:scenecut=0:log-level=error"];
+        let src = fixture(tmp.path(), "hevc.mp4", &args, &[]);
+        let cut = trim_checked(&src, 13.37, 35.0, &tmp.path().join("trimmed.mp4")).await;
+        assert_eq!(cut.method, CutMethod::Keyframe);
+        assert!((cut.start - 10.0).abs() < 0.1, "{}", cut.start);
     }
 
     /// The transcript counts from the file's start even when the sound

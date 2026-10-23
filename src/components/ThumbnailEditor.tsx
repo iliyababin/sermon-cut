@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { useCanvasEditor } from "@/hooks/useCanvasEditor";
+import { useCanvasEditor, type ImageLoad } from "@/hooks/useCanvasEditor";
 import { readImageBase64, processCustomThumbnail } from "@/lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
 import { LocalImage } from "./LocalImage";
@@ -36,8 +36,9 @@ export function ThumbnailEditor({
     Math.max(0, thumbnailOptions.findIndex((o) => o.id === selectedSource))
   );
   const [customImagePath, setCustomImagePath] = useState<string | null>(null);
-  // The image actually on the canvas; the crop is saved from this one.
-  const [displayedPath, setDisplayedPath] = useState<string | null>(null);
+  // The file being loaded for the current selection; Apply waits until it's
+  // the one on the canvas.
+  const [wantedPath, setWantedPath] = useState<string | null>(null);
   const [applyColorGrading, setApplyColorGrading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,8 +54,12 @@ export function ThumbnailEditor({
     reset,
     getCropRect,
     imageLoaded,
+    loadedKey,
     handlers,
   } = useCanvasEditor({ aspectRatio: 16 / 9 });
+  // The image on the canvas, once it's the selected one; the crop is cut
+  // from this file.
+  const displayedPath = loadedKey !== null && loadedKey === wantedPath ? loadedKey : null;
 
   // Load the chosen source: a generated option's plain crop (no logo or
   // grading burned in) when there is one, else the option itself.
@@ -68,28 +73,35 @@ export function ThumbnailEditor({
       candidates.push(option.render_from);
       if (option.path !== option.render_from) candidates.push(option.path);
     }
+    setWantedPath(null);
     if (candidates.length === 0) return;
 
+    let load: ImageLoad | null = null;
     (async () => {
       for (const [i, path] of candidates.entries()) {
         try {
           const base64 = await readImageBase64(path);
           if (cancelled) return;
-          loadImage(base64);
-          setDisplayedPath(path);
-          setError(i === 0 ? null : "Using the processed thumbnail (the plain crop wasn't found)");
-          return;
+          setWantedPath(path);
+          load = loadImage(base64, path);
+          const result = await load.done;
+          if (result === "superseded" || cancelled) return;
+          if (result === "loaded") {
+            setError(i === 0 ? null : "Using the processed thumbnail (the plain crop wasn't found)");
+            return;
+          }
         } catch (err) {
           console.error("Failed to load image:", err);
         }
       }
       if (!cancelled) {
-        setDisplayedPath(null);
+        setWantedPath(null);
         setError("Failed to load image");
       }
     })();
     return () => {
       cancelled = true;
+      load?.cancel();
     };
   }, [sourceType, selectedAiIndex, customImagePath, thumbnailOptions, loadImage]);
 
@@ -327,7 +339,7 @@ export function ThumbnailEditor({
           </button>
           <button
             onClick={handleApplyAndSave}
-            disabled={isSaving || !imageLoaded}
+            disabled={isSaving || !displayedPath}
             className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 flex items-center gap-2 transition-colors"
           >
             {isSaving ? (

@@ -11,7 +11,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { LocalImage } from "./LocalImage";
-import { useCanvasEditor } from "@/hooks/useCanvasEditor";
+import { useCanvasEditor, type ImageLoad } from "@/hooks/useCanvasEditor";
 import { getDefaultTemplate } from "@/templates";
 import { renderSingleThumbnail } from "@/lib/thumbnailRenderer";
 import { splitTitleIntoLines } from "@/lib/utils";
@@ -42,22 +42,34 @@ export function ThumbnailGenerator() {
     reset,
     getCropRect,
     imageLoaded,
+    loadedKey,
     handlers,
   } = useCanvasEditor({ aspectRatio: 16 / 9 });
+  // The crop belongs to the image on the canvas, which must be the picked one.
+  const imageReady = imagePath !== null && loadedKey === imagePath;
 
   // Load image into canvas when imagePath changes
   useEffect(() => {
     if (!imagePath) return;
+    let cancelled = false;
+    let load: ImageLoad | null = null;
     (async () => {
       try {
         const base64 = await readImageBase64(imagePath);
-        loadImage(base64);
-        setError(null);
+        if (cancelled) return;
+        load = loadImage(base64, imagePath);
+        const result = await load.done;
+        if (cancelled || result === "superseded") return;
+        setError(result === "loaded" ? null : "Failed to load image");
       } catch (err) {
         console.error("Failed to load image:", err);
-        setError("Failed to load image");
+        if (!cancelled) setError("Failed to load image");
       }
     })();
+    return () => {
+      cancelled = true;
+      load?.cancel();
+    };
   }, [imagePath, loadImage]);
 
   const handlePickImage = async () => {
@@ -72,7 +84,7 @@ export function ThumbnailGenerator() {
   };
 
   const handleGenerate = async () => {
-    if (!imagePath || !title.trim()) return;
+    if (!imagePath || !title.trim() || !imageReady) return;
 
     const cropRect = getCropRect();
     if (!cropRect) {
@@ -125,7 +137,7 @@ export function ThumbnailGenerator() {
     }
   };
 
-  const canGenerate = !!imagePath && !!title.trim() && !rendering && imageLoaded;
+  const canGenerate = !!imagePath && !!title.trim() && !rendering && imageReady;
   const zoomPercent = Math.round(zoom * 100);
 
   return (

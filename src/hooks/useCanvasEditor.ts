@@ -13,6 +13,16 @@ interface ImageDimensions {
   height: number;
 }
 
+/** How a `loadImage` call ended: on the canvas, failed to decode, or
+ * replaced by a later load (or cancelled) before it finished. */
+export type LoadResult = "loaded" | "failed" | "superseded";
+
+export interface ImageLoad {
+  done: Promise<LoadResult>;
+  /** Stop this load from reaching the canvas (if it hasn't yet). */
+  cancel: () => void;
+}
+
 /**
  * A crop editor on a canvas. The state is the crop itself, in image pixels,
  * always kept inside the image (`clampCropToImage`); the canvas draws the
@@ -38,6 +48,10 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [imageLoaded, setImageLoaded] = useState(false);
+  // The key of the image on the canvas, set only when the latest load
+  // finishes, so it always names what's drawn and cropped.
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const loads = useRef(0);
 
   /** The crop made valid for the loaded image. */
   const clampToImage = useCallback(
@@ -50,21 +64,42 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
     [aspectRatio, maxZoom]
   );
 
-  // Load image from path (base64 data URL); starts on the whole image.
+  /** Load an image (a data URL) onto the canvas, starting on the whole
+   * image; `key` names it (e.g. its file path) in `loadedKey` once it's
+   * shown. Only the latest load ever reaches the canvas: one started
+   * earlier that finishes later is dropped, so the crop always belongs to
+   * the image `loadedKey` names. Until it's shown, `loadedKey` is null. */
   const loadImage = useCallback(
-    (imageDataUrl: string) => {
+    (imageDataUrl: string, key: string = imageDataUrl): ImageLoad => {
+      const token = ++loads.current;
+      setLoadedKey(null);
+      let settle: (r: LoadResult) => void = () => {};
+      const done = new Promise<LoadResult>((resolve) => (settle = resolve));
       const img = new Image();
       img.onload = () => {
+        if (token !== loads.current) return settle("superseded");
         imageRef.current = img;
         setImageDimensions({ width: img.width, height: img.height });
         setCrop(defaultCrop(img.width, img.height, aspectRatio));
         setImageLoaded(true);
+        setLoadedKey(key);
+        settle("loaded");
       };
       img.onerror = () => {
+        if (token !== loads.current) return settle("superseded");
         console.error("Failed to load image");
+        imageRef.current = null;
         setImageLoaded(false);
+        settle("failed");
       };
       img.src = imageDataUrl;
+      return {
+        done,
+        cancel: () => {
+          if (token === loads.current) loads.current++;
+          settle("superseded");
+        },
+      };
     },
     [aspectRatio]
   );
@@ -251,6 +286,7 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
     reset,
     getCropRect,
     imageLoaded,
+    loadedKey,
     imageDimensions,
     handlers: {
       onMouseDown: handleMouseDown,

@@ -103,6 +103,18 @@ def shape_analysis(analysis: dict) -> dict:
         value = analysis.get(key)
         return parse_time_to_seconds(value) if value else None
 
+    if analysis.get("sermon_found") is False:
+        # Nothing to cut: every field is null and `reason` says why.
+        reason = analysis.get("reason")
+        return {
+            "sermon_start": None,
+            "sermon_end": None,
+            "title": None,
+            "description": None,
+            "chapters": None,
+            "reason": reason if isinstance(reason, str) else None,
+        }
+
     return {
         "sermon_start": seconds("sermon_start"),
         "sermon_end": seconds("sermon_end"),
@@ -137,3 +149,70 @@ def run_analysis_safely(analyze_fn, *args, **kwargs):
         print(f"[ERROR] Analysis failed: {e}")
         traceback.print_exc()
         return None, f"{type(e).__name__}: {e}"
+
+
+# --- OpenRouter client -----------------------------------------------------
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# The client timeout is the deadline. A hung request raises
+# openai.APITimeoutError, which run_analysis_safely turns into analysis_error
+# with the transcript kept. (A ThreadPoolExecutor `with` block would not work
+# as a deadline: leaving it waits for the hung thread.)
+OPENROUTER_TIMEOUT_SECONDS = 120
+OPENROUTER_MAX_RETRIES = 1
+
+
+def openrouter_client_kwargs(api_key: str) -> dict:
+    """Keyword arguments for `openai.OpenAI(...)`."""
+    return {
+        "base_url": OPENROUTER_BASE_URL,
+        "api_key": api_key,
+        "timeout": OPENROUTER_TIMEOUT_SECONDS,
+        "max_retries": OPENROUTER_MAX_RETRIES,
+    }
+
+
+# --- Request size cap ------------------------------------------------------
+
+# Base64 audio of a long service is well under this; anything bigger is
+# rejected before it is buffered in full or parsed.
+MAX_BODY_BYTES = 300 * 1024 * 1024
+
+
+class BodyTooLarge(Exception):
+    """The request body is over the cap."""
+
+    def __init__(self, cap: int):
+        super().__init__(f"Request body is larger than {cap // (1024 * 1024)} MB")
+        self.cap = cap
+
+
+def declared_length(header_value):
+    """Content-Length as an int, or None when missing or not a valid number."""
+    if header_value is None:
+        return None
+    try:
+        value = int(str(header_value).strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+async def read_body_capped(content_length, chunks, cap: int = MAX_BODY_BYTES) -> bytes:
+    """Read an async iterable of byte chunks, refusing more than `cap` bytes.
+
+    Raises BodyTooLarge before reading anything when Content-Length is over
+    the cap, and otherwise stops as soon as the streamed total passes the cap
+    (whether Content-Length was missing or wrong).
+    """
+    declared = declared_length(content_length)
+    if declared is not None and declared > cap:
+        raise BodyTooLarge(cap)
+    buf = bytearray()
+    async for chunk in chunks:
+        if not chunk:
+            continue
+        if len(buf) + len(chunk) > cap:
+            raise BodyTooLarge(cap)
+        buf.extend(chunk)
+    return bytes(buf)

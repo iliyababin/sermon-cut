@@ -64,6 +64,14 @@ pub async fn process_video(lib: State<'_, LibraryHandle>, app_handle: AppHandle,
     Ok(())
 }
 
+/// Transcribe and process a video again, keeping the review typed so far.
+#[tauri::command]
+pub async fn reprocess_video(lib: State<'_, LibraryHandle>, app_handle: AppHandle, video_id: String) -> Result<(), String> {
+    lib.reprocess(&video_id).await?;
+    changed(&app_handle);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn cancel_processing(lib: State<'_, LibraryHandle>, app_handle: AppHandle, video_id: String) -> Result<(), String> {
     lib.cancel(&video_id)?;

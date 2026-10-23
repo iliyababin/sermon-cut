@@ -11,8 +11,6 @@ import {
   youtubeListPlaylists,
   getSettings,
   youtubeUploadVideo,
-  processVideo,
-  resetVideo,
   saveReview,
   cancelUpload,
   errorMessage,
@@ -21,6 +19,7 @@ import {
   UPLOAD_CANCELLED_MAYBE_FINISHED,
   forgetUploadSession,
   UPLOAD_CHECK_FAILED,
+  reprocessVideo,
 } from "@/lib/tauri";
 import { UploadWarnings } from "./UploadWarnings";
 import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
@@ -415,7 +414,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
   const handleReprocess = async () => {
     const confirmed = await ask(
-      "This re-transcribes the video and regenerates all suggestions and thumbnails. Your edits here are replaced. Continue?",
+      "This transcribes the video again and makes new suggestions, a new cut and new thumbnails. Your trim and thumbnail choices are replaced.\n\nThe title, description and speaker you typed are kept. Continue?",
       { title: "Reprocess", kind: "warning", okLabel: "Reprocess", cancelLabel: "Cancel" }
     );
     if (!confirmed) return;
@@ -423,10 +422,10 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     try {
       setIsReprocessing(true);
       setActionError(null);
-      dirty.current = false;
-      // Reset deletes the saved transcript, so processing transcribes again.
-      await resetVideo(video.id);
-      await processVideo(video.id);
+      // What was typed is kept, so it's saved first.
+      if (!(await flush())) throw new Error(lastSaveError.current ?? "Couldn't save your changes");
+      // The old transcript goes, so processing transcribes again.
+      await reprocessVideo(video.id);
       onBack();
     } catch (err) {
       setActionError(`Couldn't reprocess: ${errorMessage(err)}`);

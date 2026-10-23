@@ -537,4 +537,20 @@ describe("ReviewScreen", () => {
     expect(reprocess.disabled).toBe(true);
     expect(reprocess.title).toBe("Wait for the upload to finish");
   });
+
+  it("Reprocess says the typed text is kept, saves it first, and keeps it", async () => {
+    vi.mocked(ask).mockClear();
+    const onBack = vi.fn();
+    render(<ReviewScreen video={video()} onBack={onBack} />);
+    const title = (await screen.findByDisplayValue(TITLE)) as HTMLInputElement;
+    fireEvent.change(title, { target: { value: "Typed Title" } });
+    fireEvent.click(screen.getByRole("button", { name: /reprocess/i }));
+    await waitFor(() => expect(onBack).toHaveBeenCalled());
+    const [text] = vi.mocked(ask).mock.calls[0];
+    expect(text).toContain("The title, description and speaker you typed are kept.");
+    // Saved before the reprocess, which keeps it; nothing is reset.
+    const order = invoke.mock.calls.map(([c]) => c).filter((c) => ["save_review", "reprocess_video", "reset_video"].includes(c));
+    expect(order).toEqual(["save_review", "reprocess_video"]);
+    expect((calls("save_review")[0][1] as { title: string }).title).toBe("Typed Title");
+  });
 });

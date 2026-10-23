@@ -267,6 +267,7 @@ fn main() {
             library::commands::rescan_library,
             library::commands::get_video,
             library::commands::process_video,
+            library::commands::reprocess_video,
             library::commands::cancel_processing,
             library::commands::reset_video,
             library::commands::hide_video,

@@ -36,6 +36,12 @@ export async function processVideo(videoId: string): Promise<void> {
   return invoke("process_video", { videoId });
 }
 
+/** Transcribe and process again; the title, description and speaker typed
+ * in the review are kept. */
+export async function reprocessVideo(videoId: string): Promise<void> {
+  return invoke("reprocess_video", { videoId });
+}
+
 export async function cancelProcessing(videoId: string): Promise<void> {
   return invoke("cancel_processing", { videoId });
 }

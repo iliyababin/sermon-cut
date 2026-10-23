@@ -2123,6 +2123,27 @@ impl Library {
         manifest::remove_video_dir(paths, id)
     }
 
+    /// Process a video again from a new transcription: its saved transcript
+    /// goes (under the video's lock, never `inner`), then it is queued. The
+    /// results so far stay until the new ones are committed, and the review
+    /// typed so far (title, description, speaker) is kept (`commit_job`).
+    pub async fn reprocess(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        let dir = self.with_entry(id, |g, paths| {
+            g.require_idle(id)?;
+            paths.video_dir(id)
+        })?;
+        let lock = self.video_lock(id);
+        blocking(move || {
+            let _v = hold(&lock);
+            match std::fs::remove_file(dir.join("transcript.json")) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Couldn't remove the old transcript: {}", e)),
+                _ => Ok(()),
+            }
+        })
+        .await??;
+        self.enqueue(id).await
+    }
+
     /// Back to New: delete what processing made. Keeps upload history.
     /// Blocking (deletes files): call it from a blocking thread.
     pub fn reset(&self, id: &str) -> Result<(), String> {
@@ -3605,12 +3626,28 @@ mod tests {
         let tmp_dir = lib.inner().paths.as_ref().unwrap().tmp_dir();
         assert!(std::fs::read_dir(&tmp_dir).map(|d| d.count()).unwrap_or(0) == 0, "the work folder is gone");
 
-        // Again (e.g. Reprocess without reset): the saved transcript is
-        // used; Modal isn't asked again and no audio is extracted.
+        // Again (e.g. Retry): the saved transcript is used; Modal isn't
+        // asked again and no audio is extracted.
         let again: &'static FakeTools = Box::leak(Box::default());
         run(again).await;
         assert_eq!(*again.calls.lock().unwrap(), ["trim 12-50", "thumbnails from 11.5 for The Hope We Have"]);
         assert_eq!(bodies.lock().unwrap().len(), 1);
+
+        // Reprocess: transcribed again, and the review typed meanwhile kept.
+        let typed = Review { title: Some("My Title".into()), description: Some("Mine".into()), preacher: Some("P".into()), ..Default::default() };
+        lib.save_review(&id, typed, None).unwrap();
+        lib.reprocess(&id).await.unwrap();
+        assert!(manifest::load_transcript(&dir).is_none());
+        assert!(lib.reprocess(&id).await.is_err(), "already queued");
+        let (started, _token) = lib.start_next().unwrap();
+        let fresh: &'static FakeTools = Box::leak(Box::default());
+        let result = lib.run_job_with(&app_state, &started, &|_, _, _| {}, fresh).await;
+        lib.finish_job(&id, &Some(result.clone()));
+        result.unwrap();
+        assert_eq!(fresh.calls.lock().unwrap()[0], "extract_audio");
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+        let review = manifest::load_video_data(&dir).review;
+        assert_eq!((review.title.as_deref(), review.description.as_deref()), (Some("My Title"), Some("Mine")));
     }
 
     /// A writable library with one processed video that has two generated

@@ -1875,11 +1875,8 @@ impl Library {
             if !fingerprint_matches(&now, &entry.fingerprint) {
                 return Err(FILE_CHANGED.to_string());
             }
-            let (to, staged) = (dir.join(&name), out.clone());
-            blocking(move || std::fs::rename(&staged, &to)).await?.map_err(|e| format!("Failed to save the trimmed video: {}", e))?;
-            if let Some(old) = self.record_trim(id, &dir, &name, actual, end)? {
-                let _ = std::fs::remove_file(dir.join(old));
-            }
+            let (lib, id, dir, work) = (self.clone(), id.to_string(), dir.clone(), staging.clone());
+            blocking(move || lib.record_trim(&id, &dir, &work, &name, actual, end)).await??;
             Ok((actual, end))
         }
         .await;
@@ -1887,20 +1884,25 @@ impl Library {
         result
     }
 
-    /// Record a new cut in video.json, under the lock like every other
-    /// video.json edit (the review screen saves while a trim runs). Returns
-    /// the cut it replaced, to delete.
-    fn record_trim(&self, id: &str, dir: &Path, name: &str, start: f64, end: f64) -> Result<Option<String>, String> {
+    /// Swap the new cut staged in `staging` in and record its times in
+    /// video.json, together, through the commit journal: a crash or error
+    /// midway leaves the old cut with its old times. Under the video's lock
+    /// like every other video.json edit (the review screen saves while a
+    /// trim runs). The cut it replaces goes.
+    fn record_trim(&self, id: &str, dir: &Path, staging: &Path, name: &str, start: f64, end: f64) -> Result<(), String> {
         let lock = self.video_lock(id);
         let _v = hold(&lock);
-        let mut data = manifest::load_video_data(dir);
-        let old = data.trimmed_file.replace(name.to_string()).filter(|old| old != name);
-        data.trim_start = Some(start);
-        data.trim_end = Some(end);
-        manifest::save_video_data(dir, &data)?;
+        let old = manifest::load_video_data(dir).trimmed_file;
+        let replaces = |n: &str| n == name || old.as_deref() == Some(n);
+        swap_in_outputs_where(dir, staging, &replaces, || {
+            let mut data = manifest::load_video_data(dir);
+            data.trimmed_file = Some(name.to_string());
+            data.trim_start = Some(start);
+            data.trim_end = Some(end);
+            manifest::save_video_data(dir, &data)
+        })
         // An upload session of the old cut is kept: the next upload asks
         // YouTube about it first (it may have finished; INVARIANTS #8, #9).
-        Ok(old)
     }
 
     /// A still of the original video at `time`, for the trim panel when the
@@ -3548,11 +3550,12 @@ mod tests {
     #[test]
     fn a_trim_keeps_review_edits_saved_meanwhile() {
         let (_t, lib, id, dir) = processed_library();
-        std::fs::write(dir.join("trimmed_new.mp4"), b"cut").unwrap();
+        let staging = tempfile::tempdir_in(dir.parent().unwrap()).unwrap();
+        std::fs::write(staging.path().join("trimmed_new.mp4"), b"cut").unwrap();
         let lock = lib.video_lock(&id);
         let guard = hold(&lock);
         std::thread::scope(|s| {
-            let trim = s.spawn(|| lib.record_trim(&id, &dir, "trimmed_new.mp4", 4.0, 20.0));
+            let trim = s.spawn(|| lib.record_trim(&id, &dir, staging.path(), "trimmed_new.mp4", 4.0, 20.0));
             std::thread::sleep(std::time::Duration::from_millis(100));
             assert!(!trim.is_finished(), "waits for the lock");
             // save_review, which holds the video's lock, runs meanwhile.
@@ -3565,6 +3568,42 @@ mod tests {
         let data = manifest::load_video_data(&dir);
         assert_eq!(data.review.title.as_deref(), Some("Edited"));
         assert_eq!((data.trimmed_file.as_deref(), data.trim_start, data.trim_end), (Some("trimmed_new.mp4"), Some(4.0), Some(20.0)));
+    }
+
+    /// A video with a cut at 2–10 s, and a new cut (5–20 s) staged.
+    fn trim_fixture() -> (tempfile::TempDir, Arc<Library>, String, PathBuf, tempfile::TempDir) {
+        let (t, lib, id, dir) = processed_library();
+        std::fs::write(dir.join("trimmed.mp4"), b"old cut").unwrap();
+        let mut data = manifest::load_video_data(&dir);
+        (data.trimmed_file, data.trim_start, data.trim_end) = (Some("trimmed.mp4".into()), Some(2.0), Some(10.0));
+        manifest::save_video_data(&dir, &data).unwrap();
+        let staging = tempfile::tempdir_in(dir.parent().unwrap()).unwrap();
+        std::fs::write(staging.path().join("trimmed.mp4"), b"new cut").unwrap();
+        (t, lib, id, dir, staging)
+    }
+
+    fn cut_and_times(dir: &Path) -> (Vec<u8>, Option<f64>, Option<f64>) {
+        let data = manifest::load_video_data(dir);
+        (std::fs::read(dir.join(data.trimmed_file.unwrap())).unwrap(), data.trim_start, data.trim_end)
+    }
+
+    #[test]
+    fn a_re_trim_swaps_the_cut_and_its_times_together() {
+        let (_t, lib, id, dir, staging) = trim_fixture();
+        lib.record_trim(&id, &dir, staging.path(), "trimmed.mp4", 5.0, 20.0).unwrap();
+        assert_eq!(cut_and_times(&dir), (b"new cut".to_vec(), Some(5.0), Some(20.0)));
+        assert!(!dir.join(COMMIT_BACKUP).exists());
+        assert!(dir.join("thumbnail_option_1.jpg").exists(), "only the cut is replaced");
+
+        // A crash at any point before the times are written: the old cut
+        // and the old times, together.
+        for steps in 0..=2 {
+            let (_t, _lib, _id, dir, staging) = trim_fixture();
+            crash_after_where(&dir, staging.path(), steps, &|n| n == "trimmed.mp4");
+            recover_commit(&dir);
+            assert_eq!(cut_and_times(&dir), (b"old cut".to_vec(), Some(2.0), Some(10.0)), "after {steps} moves");
+            assert!(dir.join("thumbnail_option_1.jpg").exists());
+        }
     }
 
     /// What a scan sees for a file in the library folder.

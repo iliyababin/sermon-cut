@@ -386,7 +386,7 @@ pub async fn youtube_upload_video(
     // Privacy and playlist as chosen next to Upload; the settings fill in
     // anything not sent.
     let options = UploadOptions::resolve(&state.lock().await.settings, privacy, playlist_id)?;
-    let mut job = lib.begin_upload(&video_id, thumbnail_source, render_key)?;
+    let mut job = lib.begin_upload(&video_id, thumbnail_source, render_key).await?;
     changed(&app_handle);
     let library: &Library = &lib;
 
@@ -512,7 +512,7 @@ pub async fn retry_thumbnail(
     app_handle: AppHandle,
     video_id: String,
 ) -> Result<Vec<UploadWarning>, String> {
-    let (youtube_id, thumbnail, busy) = lib.begin_thumbnail_retry(&video_id)?;
+    let (youtube_id, thumbnail, busy) = lib.begin_thumbnail_retry(&video_id).await?;
     let result = async {
         let tokens = crate::commands::AppTokens { state: &state, app: &app_handle };
         let endpoints = upload::Endpoints::youtube();

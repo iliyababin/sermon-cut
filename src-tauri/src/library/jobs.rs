@@ -91,7 +91,10 @@ impl Library {
         };
 
         // Quick re-check now (size + mtime); the job re-hashes before and after.
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("Can't read {}: {}", path.display(), e))?;
+        let stat = path.clone();
+        let meta = blocking(move || std::fs::symlink_metadata(stat))
+            .await?
+            .map_err(|e| format!("Can't read {}: {}", path.display(), e))?;
         if meta.len() != expected.size || fsutil::mtime_ms(&meta) != expected.mtime_ms {
             return Err(FILE_CHANGED.into());
         }
@@ -475,7 +478,7 @@ impl Library {
         end: f64,
         on_step: &(dyn Fn(f32, &str) + Send + Sync),
     ) -> Result<(f64, f64), String> {
-        let (_busy, paths, entry, _data) = self.begin_op(id)?;
+        let (_busy, paths, entry, _data) = self.begin_op(id).await?;
         if !matches!(entry.status, EntryStatus::ReadyForReview | EntryStatus::Done) {
             return Err("Process the video before changing where it starts and ends".into());
         }
@@ -486,12 +489,9 @@ impl Library {
         if !start.is_finite() || !end.is_finite() || start < 0.0 || end - start < 1.0 {
             return Err("The end must be at least a second after the start".into());
         }
-        let dir = paths.ensure_video_dir(id)?;
         let video_path = paths.original(&entry.file_name)?;
-        paths.ensure_dir(&paths.tmp_dir())?;
-        let staging = paths.tmp_dir().join(format!("trim-{}", id));
-        let _ = std::fs::remove_dir_all(&staging);
-        std::fs::create_dir(&staging).map_err(|e| format!("Failed to create work folder: {}", e))?;
+        let (work_paths, video) = (paths.clone(), id.to_string());
+        let (dir, staging) = blocking(move || fresh_work_dir(&work_paths, &video, &format!("trim-{}", video))).await??;
 
         let result = async {
             let name = trimmed_name(&entry.file_name);
@@ -508,7 +508,7 @@ impl Library {
             Ok((actual, end))
         }
         .await;
-        let _ = std::fs::remove_dir_all(&staging);
+        remove_work_dir(&staging).await;
         result
     }
 

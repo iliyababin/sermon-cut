@@ -195,6 +195,23 @@ fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl s
 }
 
 
+/// An empty work folder `name` in the library's temp folder (emptied if a
+/// crash left it), plus the video's folder. Blocking.
+fn fresh_work_dir(paths: &LibraryPaths, id: &str, name: &str) -> Result<(PathBuf, PathBuf), String> {
+    let dir = paths.ensure_video_dir(id)?;
+    paths.ensure_dir(&paths.tmp_dir())?;
+    let staging = paths.tmp_dir().join(name);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir(&staging).map_err(|e| format!("Failed to create work folder: {}", e))?;
+    Ok((dir, staging))
+}
+
+/// Delete a work folder, off the async workers.
+async fn remove_work_dir(staging: &Path) {
+    let staging = staging.to_path_buf();
+    let _ = blocking(move || std::fs::remove_dir_all(staging)).await;
+}
+
 /// Outcome of a lock heartbeat.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeartbeatOutcome {
@@ -926,8 +943,9 @@ impl Library {
     }
 
     /// Mark an id busy for an operation that runs outside the lock, until
-    /// the returned guard is dropped.
-    fn begin_op(&self, id: &str) -> Result<(BusyGuard<'_>, LibraryPaths, Entry, VideoData), String> {
+    /// the returned guard is dropped. video.json is read on a blocking
+    /// thread.
+    async fn begin_op(&self, id: &str) -> Result<(BusyGuard<'_>, LibraryPaths, Entry, VideoData), String> {
         let (paths, e) = self.with_entry(id, |g, paths| {
             g.require_not_updating()?;
             g.require_idle(id)?;
@@ -936,7 +954,8 @@ impl Library {
             Ok((paths.clone(), e))
         })?;
         let busy = BusyGuard { lib: self, id: id.to_string() };
-        let data = manifest::load_video_data(&paths.video_dir(id)?);
+        let dir = paths.video_dir(id)?;
+        let data = blocking(move || manifest::load_video_data(&dir)).await?;
         Ok((busy, paths, e, data))
     }
 
@@ -1049,20 +1068,20 @@ mod tests {
     #[tokio::test]
     async fn update_is_refused_while_busy_and_blocks_new_work() {
         let (_t, lib, id, _dir) = processed_library();
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         let err = lib.begin_update().unwrap_err();
         assert!(err.contains("a YouTube upload"), "{err}");
         lib.finish_upload(&id, job, None, &public());
 
         lib.begin_update().unwrap();
-        assert_eq!(lib.begin_upload(&id, None, None).err().as_deref(), Some(UPDATING));
+        assert_eq!(lib.begin_upload(&id, None, None).await.err().as_deref(), Some(UPDATING));
         assert_eq!(lib.enqueue(&id).await.unwrap_err(), UPDATING);
         assert!(lib.inner().queue.is_empty());
         assert!(lib.work_in_progress().is_none());
 
         // A failed install lets work start again.
         lib.end_update();
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         lib.finish_upload(&id, job, None, &public());
     }
 
@@ -1393,7 +1412,7 @@ mod tests {
     fn busy_guard_frees_the_video_on_panic() {
         let (_t, lib, id, _dir) = processed_library();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _busy = lib.begin_op(&id).unwrap();
+            let _busy = lib.mark_busy(&id, |_| Ok(())).unwrap();
             assert!(lib.inner().busy.contains(&id));
             panic!("thumbnail pipeline crashed");
         }));
@@ -1449,7 +1468,7 @@ mod tests {
         let (_t, lib, id, _dir) = processed_library();
         let other = tempfile::tempdir().unwrap();
         let folder = other.path().to_string_lossy().to_string();
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         assert!(lib.switch(folder.clone()).await.is_err());
         lib.finish_upload(&id, job, None, &public());
         lib.switch(folder).await.unwrap();

@@ -328,11 +328,11 @@ mod tests {
     use super::*;
     use super::super::tests::{outcome, processed_library, public};
 
-    #[test]
-    fn detail_mentions_an_upload_of_the_same_file_under_another_entry() {
+    #[tokio::test]
+    async fn detail_mentions_an_upload_of_the_same_file_under_another_entry() {
         let (_t, lib, id, _dir) = processed_library();
         assert_eq!(lib.detail(&id).unwrap().duplicate_upload, None);
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         lib.finish_upload(&id, job, Some(&outcome("abc", vec![])), &public());
         // Its own upload isn't a duplicate.
         assert_eq!(lib.detail(&id).unwrap().duplicate_upload, None);

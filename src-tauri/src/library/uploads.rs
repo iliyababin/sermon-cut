@@ -5,20 +5,23 @@ impl Library {
     /// is `thumbnail_source`'s render when its key is `render_key` (what the
     /// review screen showed), else the source itself; with no source given,
     /// the selected one's render. Its bytes are read now: renders are allowed
-    /// during an upload and replace (delete) the file it came from.
-    pub fn begin_upload(
+    /// during an upload and replace (delete) the file it came from. The
+    /// files are read on a blocking thread.
+    pub async fn begin_upload(
         &self,
         id: &str,
         thumbnail_source: Option<String>,
         render_key: Option<String>,
     ) -> Result<UploadJob<'_>, String> {
-        let (busy, paths, entry, data) = self.begin_op(id)?;
+        let (busy, paths, entry, data) = self.begin_op(id).await?;
         type Prepared = (PathBuf, Option<(PathBuf, Vec<u8>)>, Option<Vec<crate::state::TranscriptSegment>>);
-        let prepare = || -> Result<Prepared, String> {
-            let dir = paths.video_dir(id)?;
+        let (video, hash) = (id.to_string(), entry.fingerprint.hash.clone());
+        let file_name = entry.file_name.clone();
+        let prepare = move || -> Result<Prepared, String> {
+            let dir = paths.video_dir(&video)?;
             let video_path = match data.trimmed_file.as_ref().map(|n| dir.join(n)).filter(|p| p.exists()) {
                 Some(p) => p,
-                None => paths.original(&entry.file_name)?,
+                None => paths.original(&file_name)?,
             };
             let thumbnail = match resolve_thumbnail(&dir, &data, thumbnail_source.as_deref(), render_key.as_deref())? {
                 Some(p) => {
@@ -27,13 +30,11 @@ impl Library {
                 }
                 None => None,
             };
-            let segments = manifest::load_transcript(&dir)
-                .filter(|t| t.file_hash == entry.fingerprint.hash)
-                .map(|t| t.transcription.segments);
+            let segments = manifest::load_transcript(&dir).filter(|t| t.file_hash == hash).map(|t| t.transcription.segments);
             Ok((video_path, thumbnail, segments))
         };
         // On an error, dropping the guard frees the video again.
-        let (video_path, thumbnail, segments) = prepare()?;
+        let (video_path, thumbnail, segments) = blocking(prepare).await??;
         let cancel = CancellationToken::new();
         let active = ActiveUpload { percent: 0, cancel: cancel.clone() };
         self.inner().uploads.insert(id.to_string(), active);
@@ -153,9 +154,10 @@ impl Library {
     /// For "Set thumbnail again": the last upload's YouTube id and the
     /// thumbnail to send (the selected one), with the video marked busy.
     /// Finish with `finish_thumbnail_retry`.
-    pub fn begin_thumbnail_retry(&self, id: &str) -> Result<(String, PathBuf, BusyGuard<'_>), String> {
-        let (busy, paths, entry, data) = self.begin_op(id)?;
-        let prepare = || -> Result<(String, PathBuf), String> {
+    pub async fn begin_thumbnail_retry(&self, id: &str) -> Result<(String, PathBuf, BusyGuard<'_>), String> {
+        let (busy, paths, entry, data) = self.begin_op(id).await?;
+        let video = id.to_string();
+        let prepare = move || -> Result<(String, PathBuf), String> {
             let video_id = entry
                 .uploads
                 .last()
@@ -163,11 +165,11 @@ impl Library {
                 .video_id
                 .clone()
                 .ok_or("This upload was made by an older version of Sermon Cut. Set the thumbnail in YouTube Studio instead.")?;
-            let dir = paths.video_dir(id)?;
+            let dir = paths.video_dir(&video)?;
             let thumbnail = resolve_thumbnail(&dir, &data, None, None)?.ok_or("This video has no thumbnail to send.")?;
             Ok((video_id, thumbnail))
         };
-        let (video_id, thumbnail) = prepare()?;
+        let (video_id, thumbnail) = blocking(prepare).await??;
         Ok((video_id, thumbnail, busy))
     }
 
@@ -267,8 +269,8 @@ mod tests {
     use super::*;
     use super::super::tests::{outcome, processed_library, public};
 
-    #[test]
-    fn upload_is_tracked_until_it_finishes() {
+    #[tokio::test]
+    async fn upload_is_tracked_until_it_finishes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("lib");
         std::fs::create_dir(&root).unwrap();
@@ -288,14 +290,14 @@ mod tests {
         };
         assert!(lib.work_in_progress().is_none());
 
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Uploading);
         assert_eq!(v.upload_progress, Some(0));
         assert!(v.busy);
         assert_eq!(lib.work_in_progress().as_deref(), Some("a YouTube upload"));
         // A second upload, a reset or a trash can't start meanwhile.
-        assert!(lib.begin_upload(&id, None, None).is_err());
+        assert!(lib.begin_upload(&id, None, None).await.is_err());
         assert!(lib.reset(&id).is_err());
 
         lib.set_upload_progress(&id, 42);
@@ -310,7 +312,7 @@ mod tests {
         assert!(lib.work_in_progress().is_none());
 
         // A failed upload goes back to how it was, with nothing recorded.
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         lib.finish_upload(&id, job, None, &public());
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.status, ViewStatus::Done);
@@ -318,10 +320,10 @@ mod tests {
         assert!(!v.busy);
     }
 
-    #[test]
-    fn upload_session_persists_and_is_cleared_on_success() {
+    #[tokio::test]
+    async fn upload_session_persists_and_is_cleared_on_success() {
         let (_t, lib, id, _dir) = processed_library();
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         let options = public();
         let store = EntrySession { lib: &lib, id: &id, options: &options };
         let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
@@ -334,7 +336,7 @@ mod tests {
         reopened.open_blocking(true);
         assert_eq!(reopened.upload_session(&id), Some(session.clone()));
 
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         lib.finish_upload(&id, job, Some(&outcome("abc", vec![])), &public());
         assert_eq!(lib.upload_session(&id), None);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
@@ -359,7 +361,7 @@ mod tests {
     async fn quitting_during_the_post_upload_steps_keeps_the_upload_recorded() {
         let (_t, lib, id, _dir) = processed_library();
         let server = crate::upload::test_server::MockServer::start().await;
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         let options = public();
         let store = EntrySession { lib: &lib, id: &id, options: &options };
         let cfg = crate::upload::UploadConfig { endpoints: crate::upload::Endpoints::at(&server.base), ..Default::default() };
@@ -390,12 +392,12 @@ mod tests {
         assert_eq!(server.with(|s| s.creates), 1);
     }
 
-    #[test]
-    fn an_upload_session_can_be_forgotten_when_not_uploading() {
+    #[tokio::test]
+    async fn an_upload_session_can_be_forgotten_when_not_uploading() {
         let (_t, lib, id, _dir) = processed_library();
         let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
         lib.set_upload_session(&id, Some(&session));
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         assert!(lib.forget_upload_session(&id).is_err(), "not during an upload");
         assert_eq!(lib.upload_session(&id), Some(session));
         lib.finish_upload(&id, job, None, &public());
@@ -408,10 +410,10 @@ mod tests {
         lib.forget_upload_session(&id).unwrap();
     }
 
-    #[test]
-    fn a_finished_upload_is_recorded_before_the_post_upload_steps() {
+    #[tokio::test]
+    async fn a_finished_upload_is_recorded_before_the_post_upload_steps() {
         let (_t, lib, id, _dir) = processed_library();
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         let options = UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PL1".into()) };
         let store = EntrySession { lib: &lib, id: &id, options: &options };
         let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
@@ -438,33 +440,33 @@ mod tests {
         assert_eq!(v.uploads[0].warnings, vec![captions]);
     }
 
-    #[test]
-    fn cancel_reaches_the_running_upload() {
+    #[tokio::test]
+    async fn cancel_reaches_the_running_upload() {
         let (_t, lib, id, _dir) = processed_library();
         assert!(lib.cancel_upload(&id).is_err());
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         lib.cancel_upload(&id).unwrap();
         assert!(job.cancel.is_cancelled());
         lib.finish_upload(&id, job, None, &public());
         assert!(lib.cancel_upload(&id).is_err());
     }
 
-    #[test]
-    fn thumbnail_retry_uses_the_stored_video_id_and_clears_its_warning() {
+    #[tokio::test]
+    async fn thumbnail_retry_uses_the_stored_video_id_and_clears_its_warning() {
         let (_t, lib, id, dir) = processed_library();
         let thumb = UploadWarning { kind: WarningKind::Thumbnail, message: "t".into() };
         let captions = UploadWarning { kind: WarningKind::Captions, message: "c".into() };
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         lib.finish_upload(&id, job, Some(&outcome("vid9", vec![thumb.clone(), captions.clone()])), &public());
 
-        let (video_id, path, busy) = lib.begin_thumbnail_retry(&id).unwrap();
+        let (video_id, path, busy) = lib.begin_thumbnail_retry(&id).await.unwrap();
         assert_eq!(video_id, "vid9");
         assert_eq!(path, dir.join("thumbnail_option_2.jpg"));
         // Busy meanwhile.
-        assert!(lib.begin_upload(&id, None, None).is_err());
+        assert!(lib.begin_upload(&id, None, None).await.is_err());
         // A failure keeps the warning.
         assert_eq!(lib.finish_thumbnail_retry(busy, &id, &video_id, false), vec![thumb, captions.clone()]);
-        let (video_id, _, busy) = lib.begin_thumbnail_retry(&id).unwrap();
+        let (video_id, _, busy) = lib.begin_thumbnail_retry(&id).await.unwrap();
         assert_eq!(lib.finish_thumbnail_retry(busy, &id, &video_id, true), vec![captions.clone()]);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads[0].warnings, vec![captions]);
@@ -496,10 +498,43 @@ mod tests {
         assert_eq!(UploadOptions::resolve(&crate::state::Settings::default(), None, None).unwrap().privacy, "public");
     }
 
+    /// The files an upload starts from are read off the async workers. On a
+    /// one-thread runtime, a read there that blocks (a FIFO with no writer
+    /// yet) would stop the very task that writes it.
     #[test]
-    fn upload_record_keeps_privacy_and_playlist() {
+    fn begin_upload_reads_its_files_off_the_async_workers() {
+        for name in ["video.json", "transcript.json"] {
+            let (_t, lib, id, dir) = processed_library();
+            let fifo = dir.join(name);
+            let _ = std::fs::remove_file(&fifo);
+            assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (lib, write_to) = (lib.clone(), fifo.clone());
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let ok = rt.block_on(async {
+                    let writer = tokio::spawn(async move {
+                        tokio::task::spawn_blocking(move || std::fs::write(&write_to, b"{}")).await
+                    });
+                    let ok = lib.begin_upload(&id, None, None).await.is_ok();
+                    let _ = writer.await;
+                    ok
+                });
+                let _ = tx.send(ok);
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+            if result.is_err() {
+                // Let the stuck read finish.
+                let _ = std::fs::write(&fifo, b"{}");
+            }
+            assert_eq!(result, Ok(true), "{name} was read on the async worker");
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_record_keeps_privacy_and_playlist() {
         let (_t, lib, id, _dir) = processed_library();
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         let options = UploadOptions { privacy: "unlisted".into(), playlist_id: Some("PL1".into()) };
         lib.finish_upload(&id, job, Some(&outcome("y", vec![])), &options);
         let v = lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();

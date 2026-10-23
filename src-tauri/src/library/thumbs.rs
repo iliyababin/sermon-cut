@@ -2,10 +2,15 @@ use super::*;
 
 impl Library {
     pub async fn regenerate_thumbnails(self: &Arc<Self>, id: &str) -> Result<Vec<String>, String> {
-        let (_busy, paths, entry, data) = self.begin_op(id)?;
+        let (_busy, paths, entry, data) = self.begin_op(id).await?;
         async {
-            let dir = paths.ensure_video_dir(id)?;
-            let transcript = manifest::load_transcript(&dir).map(|t| t.transcription);
+            let (work_paths, video) = (paths.clone(), id.to_string());
+            let (dir, staging, transcript) = blocking(move || {
+                let (dir, staging) = fresh_work_dir(&work_paths, &video, &format!("thumbs-{}", video))?;
+                let transcript = manifest::load_transcript(&dir).map(|t| t.transcription);
+                Ok::<_, String>((dir, staging, transcript))
+            })
+            .await??;
             let start = data.trim_start.or(transcript.as_ref().and_then(|t| t.sermon_start)).unwrap_or(0.0);
             let end = data
                 .trim_end
@@ -19,10 +24,6 @@ impl Library {
                 .or(transcript.and_then(|t| t.suggested_title))
                 .unwrap_or_else(|| entry.display_title());
 
-            paths.ensure_dir(&paths.tmp_dir())?;
-            let staging = paths.tmp_dir().join(format!("thumbs-{}", id));
-            let _ = std::fs::remove_dir_all(&staging);
-            std::fs::create_dir(&staging).map_err(|e| format!("Failed to create work folder: {}", e))?;
             let video_path = paths.original(&entry.file_name)?;
             let generated =
                 crate::thumbnail::generate_thumbnail_options(&video_path, start, end, &title, &staging, 10).await;
@@ -35,7 +36,7 @@ impl Library {
             let names = match names {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = std::fs::remove_dir_all(&staging);
+                    remove_work_dir(&staging).await;
                     return Err(e);
                 }
             };
@@ -49,7 +50,7 @@ impl Library {
             })
             .await
             .and_then(|r| r);
-            let _ = std::fs::remove_dir_all(&staging);
+            remove_work_dir(&staging).await;
             committed?;
             Ok(names.iter().map(|n| path_string(&dir.join(n))).collect())
         }
@@ -63,9 +64,10 @@ impl Library {
         crop: crate::thumbnail::CropRect,
         grading: bool,
     ) -> Result<String, String> {
-        let (_busy, paths, _entry, _data) = self.begin_op(id)?;
+        let (_busy, paths, _entry, _data) = self.begin_op(id).await?;
         async {
-            let dir = paths.ensure_video_dir(id)?;
+            let (dir_paths, video) = (paths.clone(), id.to_string());
+            let dir = blocking(move || dir_paths.ensure_video_dir(&video)).await??;
             let path = crate::thumbnail::process_custom_thumbnail(&source, &dir, &crop, grading).await?;
             let name = file_in_dir(&dir, &path)?;
             // Under the video's lock, on a blocking thread, never `inner`
@@ -565,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn renders_are_allowed_during_upload_but_not_processing() {
         let (_t, lib, id, _dir) = processed_library();
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         rendered(&lib, &id, "thumbnail_option_1.jpg", "k", png()).await.unwrap();
         lib.finish_upload(&id, job, None, &public());
 
@@ -585,21 +587,21 @@ mod tests {
         let (_t, lib, id, dir) = processed_library();
         let render = rendered(&lib, &id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
 
-        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some(test_key(&dir, "thumbnail_option_2.jpg", "k"))).unwrap();
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some(test_key(&dir, "thumbnail_option_2.jpg", "k"))).await.unwrap();
         assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
         lib.finish_upload(&id, job, None, &public());
 
         // A stale key falls back to the source itself.
-        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("old".into())).unwrap();
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some("old".into())).await.unwrap();
         assert_eq!(job.thumbnail_path, Some(dir.join("thumbnail_option_2.jpg")));
         lib.finish_upload(&id, job, None, &public());
 
         // No source given: the selected one's render.
-        let job = lib.begin_upload(&id, None, None).unwrap();
+        let job = lib.begin_upload(&id, None, None).await.unwrap();
         assert_eq!(job.thumbnail_path.as_deref(), Some(Path::new(&render)));
         lib.finish_upload(&id, job, None, &public());
 
-        assert!(lib.begin_upload(&id, Some("/etc/passwd".into()), None).is_err());
+        assert!(lib.begin_upload(&id, Some("/etc/passwd".into()), None).await.is_err());
         assert!(!lib.inner().busy.contains(&id), "a refused upload doesn't stay busy");
     }
 
@@ -608,7 +610,7 @@ mod tests {
         let (_t, lib, id, dir) = processed_library();
         let render = rendered(&lib, &id, "thumbnail_option_2.jpg", "k", png()).await.unwrap();
         let sent = std::fs::read(&render).unwrap();
-        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some(test_key(&dir, "thumbnail_option_2.jpg", "k"))).unwrap();
+        let job = lib.begin_upload(&id, Some("thumbnail_option_2.jpg".into()), Some(test_key(&dir, "thumbnail_option_2.jpg", "k"))).await.unwrap();
 
         // The title changes mid-upload: a new render replaces (deletes) the old one.
         let mut other = image::RgbImage::new(8, 8);

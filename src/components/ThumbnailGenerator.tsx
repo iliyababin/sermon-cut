@@ -22,6 +22,7 @@ import {
   saveStandaloneThumbnail,
   copyFile,
   errorMessage,
+  getSettings,
 } from "@/lib/tauri";
 
 export function ThumbnailGenerator() {
@@ -105,11 +106,14 @@ export function ThumbnailGenerator() {
       // 2. Render the template overlay on the cropped image
       const template = getDefaultTemplate();
       const titleLines = singleLine ? [title.trim()] : splitTitleIntoLines(title.trim());
+      // The logo chosen in Settings, if any.
+      const logoPath = (await getSettings().catch(() => null))?.logo_path ?? null;
       const imageData = await renderSingleThumbnail(
         template,
         croppedPath,
         titleLines,
         speakerName.trim(),
+        { logoPath },
       );
 
       // 3. Save the final composited thumbnail (not tied to a library video)

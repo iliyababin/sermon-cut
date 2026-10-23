@@ -156,6 +156,24 @@ describe("ReviewScreen", () => {
     expect(headers.headers["x-render-key"]).toBe(renderKey(options[0], { title: "a", preacher: PREACHER, singleLine: false }));
   });
 
+  it("draws the logo from Settings, and a render without it is stale", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "get_settings"
+        ? Promise.resolve({ upload_privacy: "public", youtube_playlist_id: null, logo_path: "/me/logo.png" })
+        : base(cmd, args)
+    );
+    // The stored renders were made with the built-in mark (redone after
+    // the debounce).
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    await waitFor(() => expect(calls("save_rendered_thumbnail")).toHaveLength(options.length), { timeout: 5000 });
+    expect(renderThumbnailBatch.mock.calls[0][4]).toEqual({ logoPath: "/me/logo.png" });
+    const headers = (calls("save_rendered_thumbnail")[0] as unknown[])[2] as { headers: Record<string, string> };
+    expect(headers.headers["x-render-key"]).toBe(
+      renderKey(options[0], { title: TITLE, preacher: PREACHER, singleLine: false, logo: "/me/logo.png" })
+    );
+  });
+
   it("sends one upload for a double-click", async () => {
     render(<ReviewScreen video={video()} onBack={() => {}} />);
     const upload = await screen.findByRole("button", { name: /upload/i });

@@ -2341,6 +2341,7 @@ impl Library {
         source: &str,
         render_key: &str,
         template_version: u32,
+        logo: &str,
         image_bytes: Vec<u8>,
     ) -> Result<String, String> {
         if !valid_render_key(render_key) {
@@ -2354,7 +2355,7 @@ impl Library {
             if !data.thumbnail_options.contains(&source) {
                 return Err("That thumbnail is no longer one of this video's options".into());
             }
-            check_render_key(&dir, &data, &source, template_version, render_key)?;
+            check_render_key(&dir, &data, &source, template_version, logo, render_key)?;
             Ok(dir)
         })?;
 
@@ -2381,7 +2382,7 @@ impl Library {
             if !data.thumbnail_options.contains(&source) {
                 return Err("That thumbnail is no longer one of this video's options".into());
             }
-            check_render_key(&dir, &data, &source, template_version, render_key)?;
+            check_render_key(&dir, &data, &source, template_version, logo, render_key)?;
             std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("Failed to save thumbnail: {}", e))?;
             data.renders.retain(|r| r.source != source);
             data.renders.push(Render {
@@ -2960,7 +2961,7 @@ fn render_from(dir: &Path, id: &str) -> (PathBuf, String) {
 /// Refuse a render whose key isn't the one the saved review gives for this
 /// source now: it was drawn with a title, speaker or image that has changed
 /// since. Keys, not counters: inputs that go A→B→A make A's render current.
-fn check_render_key(dir: &Path, data: &VideoData, source: &str, template_version: u32, key: &str) -> Result<(), String> {
+fn check_render_key(dir: &Path, data: &VideoData, source: &str, template_version: u32, logo: &str, key: &str) -> Result<(), String> {
     let (_, version) = render_from(dir, source);
     let r = &data.review;
     let expected = manifest::render_key(
@@ -2970,6 +2971,7 @@ fn check_render_key(dir: &Path, data: &VideoData, source: &str, template_version
         r.single_line,
         source,
         &version,
+        logo,
     );
     if expected != key {
         return Err(STALE_RENDER.into());
@@ -2977,7 +2979,7 @@ fn check_render_key(dir: &Path, data: &VideoData, source: &str, template_version
     Ok(())
 }
 
-const STALE_RENDER: &str = "The title, speaker or image changed while the thumbnail was being drawn. It will be drawn again.";
+const STALE_RENDER: &str = "The title, speaker, logo or image changed while the thumbnail was being drawn. It will be drawn again.";
 
 /// Which file to send to YouTube as the thumbnail (see `begin_upload`).
 fn resolve_thumbnail(
@@ -3620,7 +3622,7 @@ mod tests {
     /// `title` (and the speaker "P").
     fn test_key(dir: &Path, source: &str, title: &str) -> String {
         let (_, version) = render_from(dir, source);
-        manifest::render_key(TV, title, "P", false, source, &version)
+        manifest::render_key(TV, title, "P", false, source, &version, "")
     }
 
     /// Save the review with `title`, then a render of `source` made from it.
@@ -3628,7 +3630,7 @@ mod tests {
         // Refused while the video is processing, as the render then is.
         let _ = lib.save_review(id, Review { title: Some(title.into()), preacher: Some("P".into()), ..Default::default() }, None);
         let dir = lib.inner().paths.clone().unwrap().video_dir(id).unwrap();
-        lib.save_rendered_thumbnail(id, source, &test_key(&dir, source, title), TV, bytes).await
+        lib.save_rendered_thumbnail(id, source, &test_key(&dir, source, title), TV, "", bytes).await
     }
 
     #[tokio::test]
@@ -3638,25 +3640,33 @@ mod tests {
         let review = |title: &str| Review { title: Some(title.into()), preacher: Some("P".into()), ..Default::default() };
         let key_a = test_key(&dir, source, "A");
         lib.save_review(&id, review("A"), None).unwrap();
-        lib.save_rendered_thumbnail(&id, source, &key_a, TV, png()).await.unwrap();
+        lib.save_rendered_thumbnail(&id, source, &key_a, TV, "", png()).await.unwrap();
 
         // The title became B: a render of A is stale.
         lib.save_review(&id, review("B"), None).unwrap();
-        let err = lib.save_rendered_thumbnail(&id, source, &key_a, TV, png()).await.unwrap_err();
+        let err = lib.save_rendered_thumbnail(&id, source, &key_a, TV, "", png()).await.unwrap_err();
         assert_eq!(err, STALE_RENDER);
         assert_eq!(lib.detail(&id).unwrap().renders[0].render_key, key_a, "the stored render is kept");
 
         // And back to A: A's render is current again.
         lib.save_review(&id, review("A"), None).unwrap();
-        lib.save_rendered_thumbnail(&id, source, &key_a, TV, png()).await.unwrap();
+        lib.save_rendered_thumbnail(&id, source, &key_a, TV, "", png()).await.unwrap();
         // So is a render made with the speaker on one line, once saved so.
         let one_line = Review { single_line: true, ..review("A") };
         lib.save_review(&id, one_line, None).unwrap();
         let (_, version) = render_from(&dir, source);
-        let key = manifest::render_key(TV, "A", "P", true, source, &version);
-        lib.save_rendered_thumbnail(&id, source, &key, TV, png()).await.unwrap();
-        assert!(lib.save_rendered_thumbnail(&id, source, &key, TV + 1, png()).await.is_err(), "another template");
+        let key = manifest::render_key(TV, "A", "P", true, source, &version, "");
+        lib.save_rendered_thumbnail(&id, source, &key, TV, "", png()).await.unwrap();
+        assert!(lib.save_rendered_thumbnail(&id, source, &key, TV + 1, "", png()).await.is_err(), "another template");
         assert_eq!(rendered_files(&dir).len(), 1);
+
+        // A logo chosen in Settings: a render without it is stale, one
+        // drawn with it is current.
+        let logo = "/Users/me/Pictures/logo.png";
+        assert_eq!(lib.save_rendered_thumbnail(&id, source, &key, TV, logo, png()).await.unwrap_err(), STALE_RENDER);
+        let with_logo = manifest::render_key(TV, "A", "P", true, source, &version, logo);
+        assert_ne!(with_logo, key);
+        lib.save_rendered_thumbnail(&id, source, &with_logo, TV, logo, png()).await.unwrap();
     }
 
     fn rendered_files(dir: &Path) -> Vec<String> {
@@ -3755,9 +3765,9 @@ mod tests {
         lib.inner().queue.clear();
 
         // Not one of the options, or a key that isn't plain ASCII.
-        assert!(lib.save_rendered_thumbnail(&id, "../../x.jpg", "k", TV, png()).await.is_err());
-        assert!(lib.save_rendered_thumbnail(&id, "other.jpg", "k", TV, png()).await.is_err());
-        assert!(lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k/../", TV, png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "../../x.jpg", "k", TV, "", png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "other.jpg", "k", TV, "", png()).await.is_err());
+        assert!(lib.save_rendered_thumbnail(&id, "thumbnail_option_1.jpg", "k/../", TV, "", png()).await.is_err());
     }
 
     #[test]

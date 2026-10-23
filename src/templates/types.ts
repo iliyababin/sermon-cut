@@ -23,4 +23,7 @@ export interface TemplateData {
   backgroundUrl: string;
   titleLines: string[];
   speakerName: string;
+  /** The user's logo (a URL the webview can load), drawn instead of the
+   * template's own mark. */
+  logoUrl?: string | null;
 }

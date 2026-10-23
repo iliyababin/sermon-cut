@@ -51,6 +51,14 @@ describe("sccy-default template", () => {
     const { root } = render();
     const letters = [...root.querySelectorAll("svg text")].map((t) => t.textContent);
     expect(letters).toEqual(["S", "C", "C", "Y"]);
+    expect(root.querySelector("[data-role=logo]")).toBeNull();
+  });
+
+  it("draws the user's logo instead, when there is one", () => {
+    const { root } = render({ logoUrl: "asset://localhost/%2FUsers%2Fme%2Flogo.png" });
+    const logo = root.querySelector<HTMLImageElement>("img[data-role=logo]")!;
+    expect(logo.getAttribute("src")).toBe("asset://localhost/%2FUsers%2Fme%2Flogo.png");
+    expect(root.querySelector("svg")).toBeNull();
   });
 });
 

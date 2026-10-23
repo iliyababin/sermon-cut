@@ -205,6 +205,7 @@ pub async fn frame_still(
 #[tauri::command]
 pub async fn save_rendered_thumbnail(
     lib: State<'_, LibraryHandle>,
+    state: State<'_, AppStateHandle>,
     app_handle: AppHandle,
     request: tauri::ipc::Request<'_>,
 ) -> Result<String, String> {
@@ -215,7 +216,9 @@ pub async fn save_rendered_thumbnail(
         .parse::<u32>()
         .map_err(|_| "Invalid x-template-version header".to_string())?;
     let bytes = raw_image(request.body())?;
-    let result = lib.save_rendered_thumbnail(&video_id, &source, &render_key, template_version, bytes).await;
+    // The logo is drawn too, so it is part of the key.
+    let logo = state.lock().await.settings.logo_path.clone().unwrap_or_default();
+    let result = lib.save_rendered_thumbnail(&video_id, &source, &render_key, template_version, &logo, bytes).await;
     // The card shows the selected render.
     changed(&app_handle);
     result

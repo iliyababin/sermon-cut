@@ -50,6 +50,8 @@ export interface RenderOptions {
   onProgress?: (current: number, total: number) => void;
   /** File path to a URL the webview can load; Tauri's asset protocol by default. */
   resolveUrl?: (path: string) => string;
+  /** The user's logo image (a file path), drawn instead of the built-in mark. */
+  logoPath?: string | null;
 }
 
 /** Draw the template over each image and return the results as JPEG bytes. */
@@ -82,10 +84,12 @@ export async function renderThumbnailBatch(
         backgroundUrl: resolveUrl(baseImagePaths[i]),
         titleLines,
         speakerName,
+        logoUrl: options.logoPath ? resolveUrl(options.logoPath) : null,
       };
       const root = template.render(host, data);
       template.fit?.(root, data);
       await loadImage(data.backgroundUrl);
+      if (data.logoUrl) await loadImage(data.logoUrl);
 
       const canvas = await html2canvas(root, {
         width: template.width,

@@ -311,10 +311,18 @@ pub struct Review {
 /// The key of a template render made from these inputs; the same as the
 /// webview's `renderKey` (src/components/review/renderKey.ts): cyrb53 over
 /// the inputs as a JSON array, as hex. A shared test vector keeps them in
-/// step.
-pub fn render_key(template_version: u32, title: &str, preacher: &str, single_line: bool, source: &str, version: &str) -> String {
-    let json = serde_json::to_string(&(template_version, title, js_trim(preacher), single_line, source, version))
-        .unwrap_or_default();
+/// step. `logo` is the logo image's path ("" for the built-in mark); it is
+/// left out of the array when empty, so renders made before it counted keep
+/// their keys.
+pub fn render_key(template_version: u32, title: &str, preacher: &str, single_line: bool, source: &str, version: &str, logo: &str) -> String {
+    let inputs = (template_version, title, js_trim(preacher), single_line, source, version);
+    let json = if logo.is_empty() {
+        serde_json::to_string(&inputs)
+    } else {
+        let (a, b, c, d, e, f) = inputs;
+        serde_json::to_string(&(a, b, c, d, e, f, logo))
+    }
+    .unwrap_or_default();
     cyrb53(&json)
 }
 
@@ -931,11 +939,16 @@ mod tests {
         assert!(dir.join(&newer).exists());
     }
 
+    /// The same vector is in src/components/review/renderKey.test.ts.
+    const LOGO_VECTOR: &str = "16230bb67d4301";
+
     #[test]
     fn render_key_matches_the_webview() {
         // The same vector is in src/components/review/renderKey.test.ts.
-        let key = render_key(4, "Héllo \"world\"\n\t😀 \\ </>", "\u{a0}Pastor Ü\u{feff} ", true, "custom_thumbnail_1.jpg", "1730000000000");
+        let key = render_key(4, "Héllo \"world\"\n\t😀 \\ </>", "\u{a0}Pastor Ü\u{feff} ", true, "custom_thumbnail_1.jpg", "1730000000000", "");
         assert_eq!(key, "1a4ef5393622d8");
+        let with_logo = render_key(4, "Héllo", "P", false, "custom_thumbnail_1.jpg", "1", "/Users/me/Pictures/Lögo 1.png");
+        assert_eq!(with_logo, LOGO_VECTOR);
         assert_eq!(js_trim("\u{85}x\u{feff}"), "\u{85}x");
     }
 

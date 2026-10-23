@@ -6,6 +6,8 @@ export interface RenderInputs {
   title: string;
   preacher: string;
   singleLine: boolean;
+  /** The logo image's path from Settings; none (or "") is the built-in mark. */
+  logo?: string | null;
 }
 
 /** Everything that goes into a template render of `option`, hashed. Two
@@ -14,7 +16,9 @@ export interface RenderInputs {
  * The backend computes the same key from the saved review (see
  * `manifest::render_key`) and refuses a render whose key differs, so the two
  * must stay in step; a shared test vector checks it. The title goes in as
- * typed, not split into lines: bump TEMPLATE_VERSION when the split changes. */
+ * typed, not split into lines: bump TEMPLATE_VERSION when the split changes.
+ * The logo is left out when there is none, so renders made before it
+ * counted keep their keys. */
 export function renderKey(option: Pick<ThumbnailOption, "id" | "version">, inputs: RenderInputs): string {
   return renderKeyFor(TEMPLATE_VERSION, option, inputs);
 }
@@ -24,9 +28,9 @@ export function renderKeyFor(
   option: Pick<ThumbnailOption, "id" | "version">,
   inputs: RenderInputs,
 ): string {
-  return hash(
-    JSON.stringify([templateVersion, inputs.title, inputs.preacher.trim(), inputs.singleLine, option.id, option.version]),
-  );
+  const parts: unknown[] = [templateVersion, inputs.title, inputs.preacher.trim(), inputs.singleLine, option.id, option.version];
+  if (inputs.logo) parts.push(inputs.logo);
+  return hash(JSON.stringify(parts));
 }
 
 /** cyrb53: a fast 53-bit string hash, as hex. Not cryptographic. */

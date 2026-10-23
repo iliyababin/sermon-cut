@@ -138,11 +138,14 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     () => (singleLine ? [title.trim()] : splitTitleIntoLines(title)).filter((l) => l),
     [title, singleLine]
   );
-  const canRender = titleLines.length > 0 && preacher.trim() !== "";
+  // The logo chosen in Settings (null: the built-in mark); undefined until
+  // read, and nothing is rendered before then.
+  const [logo, setLogo] = useState<string | null | undefined>(undefined);
+  const canRender = titleLines.length > 0 && preacher.trim() !== "" && logo !== undefined;
   const keys = useMemo(() => {
-    const inputs = { title, preacher, singleLine };
+    const inputs = { title, preacher, singleLine, logo };
     return Object.fromEntries(thumbnailOptions.map((o) => [o.id, renderKey(o, inputs)]));
-  }, [thumbnailOptions, title, preacher, singleLine]);
+  }, [thumbnailOptions, title, preacher, singleLine, logo]);
   // A render that failed doesn't block uploading: the plain image is used.
   const {
     renders,
@@ -158,7 +161,9 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     enabled: canRender,
     initial: video.renders,
     render: async (option) => {
-      const [result] = await renderThumbnailBatch(getDefaultTemplate(), [option.render_from], titleLines, preacher);
+      const [result] = await renderThumbnailBatch(getDefaultTemplate(), [option.render_from], titleLines, preacher, {
+        logoPath: logo,
+      });
       return result.imageData;
     },
     // The backend checks each render's key against the saved title, speaker
@@ -302,6 +307,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
     loadYoutube();
     getSettings()
       .then((s) => {
+        setLogo(s.logo_path ?? null);
         const recent = s.recent_preachers ?? [];
         setRecentPreachers(recent);
         if (video.review.preacher == null && !preacherTouched.current && recent[0]) {
@@ -312,8 +318,22 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         setPrivacy(s.upload_privacy);
         setPlaylistId(s.youtube_playlist_id ?? "");
       })
-      .catch(console.error);
+      .catch((err) => {
+        console.error(err);
+        setLogo(null);
+      });
   }, []);
+
+  // Back on this screen (e.g. from Settings): the logo may have changed.
+  const wasActive = useRef(active);
+  useEffect(() => {
+    if (active && !wasActive.current) {
+      getSettings()
+        .then((s) => setLogo(s.logo_path ?? null))
+        .catch(console.error);
+    }
+    wasActive.current = active;
+  }, [active]);
 
   // Listen for upload progress
   useEffect(() => {

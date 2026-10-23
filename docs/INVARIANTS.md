@@ -38,7 +38,8 @@ this file in the same commit and say why.
 
 7. Thumbnail options are identified by their source file name, which never
    changes. A render is valid only while its `render_key` matches the current
-   title, preacher, layout, template version and source. The backend computes
+   title, preacher, layout, template version, source and logo (the logo's
+   path from Settings, left out of the key when there is none). The backend computes
    the key from the saved review and refuses a render that doesn't match;
    `manifest::render_key` and the webview's `renderKey` must agree (a shared
    test vector checks it).

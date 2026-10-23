@@ -398,7 +398,7 @@ export function Settings() {
               Logo Overlay
             </label>
             <p className="text-sm text-muted-foreground mb-3">
-              Add a logo to generated thumbnails. A gradient fade will be applied on the left side for visibility.
+              Drawn at the top left of every thumbnail, in place of the SCCY mark. Thumbnails already made are drawn again with it.
             </p>
 
             {settings.logo_path ? (

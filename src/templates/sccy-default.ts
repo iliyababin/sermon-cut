@@ -88,6 +88,16 @@ function logo(): SVGElement {
   ]);
 }
 
+/** The user's logo, kept within the box the built-in mark uses (wider if
+ * it's a wide one), drawn at full strength. */
+function customLogo(url: string): HTMLElement {
+  const img = el("img", { display: "block", maxWidth: "240px", maxHeight: "96px", width: "auto", height: "auto" });
+  img.src = url;
+  img.alt = "";
+  img.dataset.role = "logo";
+  return el("div", { position: "absolute", top: "70px", left: "60px", zIndex: "3" }, [img]);
+}
+
 const fill = { position: "absolute", top: "0", left: "0", height: "100%" } as const;
 
 export const sccyDefault: TemplateConfig = {
@@ -166,9 +176,11 @@ export const sccyDefault: TemplateConfig = {
             "linear-gradient(to right, rgba(5, 8, 13, 0.6) 0%, rgba(5, 8, 13, 0.4) 40%, rgba(5, 8, 13, 0) 100%)",
           zIndex: "2",
         }),
-        el("div", { position: "absolute", top: "80px", left: "60px", width: "99px", opacity: "0.50", zIndex: "3" }, [
-          logo(),
-        ]),
+        data.logoUrl
+          ? customLogo(data.logoUrl)
+          : el("div", { position: "absolute", top: "80px", left: "60px", width: "99px", opacity: "0.50", zIndex: "3" }, [
+              logo(),
+            ]),
         el(
           "div",
           {

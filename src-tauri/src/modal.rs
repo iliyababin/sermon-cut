@@ -143,6 +143,10 @@ struct Limits {
     /// it doubles, up to `max_backoff`.
     backoff: Duration,
     max_backoff: Duration,
+    /// The least time between two requests for the result, even when the
+    /// server redirects at once (it doubles while it keeps doing so, up to
+    /// `max_backoff`), so a misbehaving server isn't asked in a tight loop.
+    min_poll: Duration,
 }
 
 impl Default for Limits {
@@ -152,6 +156,7 @@ impl Default for Limits {
             poll: Duration::from_secs(5 * 60),
             backoff: Duration::from_secs(2),
             max_backoff: Duration::from_secs(30),
+            min_poll: Duration::from_secs(1),
         }
     }
 }
@@ -195,13 +200,18 @@ async fn transcribe_with(
     let origin = reqwest::Url::parse(api_url).map_err(|e| format!("Invalid server URL: {}", e))?;
     let (mut status, mut location, mut bytes) = read(response).await?;
     let mut wait = limits.backoff;
+    let mut gap = limits.min_poll;
+    let mut last_ask = tokio::time::Instant::now();
     while let Some(next) = redirect_target(status, location.as_deref(), &origin)? {
         // Ask for the result until there's an answer worth reading.
         loop {
+            // Never sooner than `gap` after the last ask.
+            tokio::time::sleep_until((last_ask + gap).min(deadline)).await;
             let left = remaining();
             if left.is_zero() {
                 return Err(TIMED_OUT.into());
             }
+            last_ask = tokio::time::Instant::now();
             // The key goes only to the server it's for.
             let mut request = client.get(next.clone()).timeout(left.min(limits.poll));
             if next.origin() == origin.origin() {
@@ -211,6 +221,8 @@ async fn transcribe_with(
                 Ok(response) if !response.status().is_server_error() => match read(response).await {
                     Ok(answer) => {
                         (status, location, bytes) = answer;
+                        // Answered at once: wait longer before the next ask.
+                        gap = if last_ask.elapsed() < gap { (gap * 2).min(limits.max_backoff.max(limits.min_poll)) } else { limits.min_poll };
                         break;
                     }
                     Err(e) => e,
@@ -430,6 +442,7 @@ mod tests {
             poll: Duration::from_millis(500),
             backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(50),
+            min_poll: Duration::from_millis(10),
         }
     }
 
@@ -557,6 +570,26 @@ mod tests {
         let seen = methods(&seen);
         assert_eq!(seen.iter().filter(|m| m.starts_with("POST")).count(), 1);
         assert!(seen.len() > 2, "asked again meanwhile: {seen:?}");
+    }
+
+    /// A server that redirects at once, every time, is asked at most about
+    /// once per `min_poll`, backing off, never in a tight loop.
+    #[tokio::test]
+    async fn an_immediate_redirect_is_not_polled_in_a_tight_loop() {
+        let (url, seen) = mock(|_, _, _| Act::Reply(reply("303 See Other", "Location: /result/1\r\n", ""))).await;
+        let limits = Limits {
+            overall: Duration::from_millis(1500),
+            min_poll: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(400),
+            ..fast()
+        };
+        let started = std::time::Instant::now();
+        let err = transcribe_with(&client(Duration::from_secs(5)), &url, None, b"{}".to_vec(), &NO_WAIT, &limits).await.unwrap_err();
+        assert_eq!(err, TIMED_OUT);
+        assert!(started.elapsed() >= Duration::from_millis(1400));
+        let gets = methods(&seen).iter().filter(|m| m.starts_with("GET")).count();
+        // 0.1 s, then 0.2, 0.4, 0.4, 0.4 s apart: about 5.
+        assert!((2..=7).contains(&gets), "{gets} polls in 1.5 s");
     }
 
     #[tokio::test]

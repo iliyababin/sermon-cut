@@ -101,8 +101,8 @@ pub async fn get_settings(state: State<'_, AppStateHandle>) -> Result<SettingsVi
 }
 
 /// Apply the edited settings. `seq` increases with every save the webview
-/// makes; a save older than one already applied is ignored. Returns the
-/// settings as they now are.
+/// makes in one session (`epoch`); a field's value older than one already
+/// applied to that field is ignored. Returns the settings as they now are.
 #[tauri::command]
 pub async fn save_settings(
     state: State<'_, AppStateHandle>,
@@ -110,11 +110,13 @@ pub async fn save_settings(
     app_handle: AppHandle,
     patch: SettingsPatch,
     seq: u64,
+    epoch: String,
 ) -> Result<SettingsView, String> {
     let library = lib.inner().clone();
     let result = apply_settings_patch(
         &state,
         patch,
+        &epoch,
         seq,
         |folder| lib.check_switch(folder),
         |folder| async move { library.switch(folder).await },
@@ -132,7 +134,8 @@ pub async fn save_settings(
 /// isn't using.
 pub async fn apply_settings_patch<C, S, F>(
     state: &AppStateHandle,
-    patch: SettingsPatch,
+    mut patch: SettingsPatch,
+    epoch: &str,
     seq: u64,
     check_switch: C,
     switch: S,
@@ -144,10 +147,9 @@ where
 {
     let (old_folder, new_folder) = {
         let mut s = state.lock().await;
-        if seq <= s.settings_seq {
+        if !patch.drop_stale(&mut s.settings_seq, epoch, seq) {
             return Ok(s.settings.view());
         }
-        s.settings_seq = seq;
 
         let mut next = s.settings.clone();
         next.apply(&patch);
@@ -648,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn patch_keeps_sign_in() {
         let state = state_with_auth();
-        let view = apply_settings_patch(&state, patch(serde_json::json!({"download_quality": "720p"})), 1, |_| Ok(()), ok_switch)
+        let view = apply_settings_patch(&state, patch(serde_json::json!({"download_quality": "720p"})), "e", 1, |_| Ok(()), ok_switch)
             .await
             .unwrap();
         assert_eq!(view.download_quality, "720p");
@@ -661,14 +663,53 @@ mod tests {
     #[tokio::test]
     async fn stale_seq_is_ignored() {
         let state = state_with_auth();
-        apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "new"})), 5, |_| Ok(()), ok_switch)
+        apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "new"})), "e", 5, |_| Ok(()), ok_switch)
             .await
             .unwrap();
-        let view = apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "old"})), 4, |_| Ok(()), ok_switch)
+        let view = apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "old"})), "e", 4, |_| Ok(()), ok_switch)
             .await
             .unwrap();
         assert_eq!(view.modal_api_url, "new");
         assert_eq!(state.lock().await.settings.modal_api_url, "new");
+    }
+
+    #[tokio::test]
+    async fn different_fields_out_of_order_both_apply() {
+        let state = state_with_auth();
+        apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "new"})), "e", 2, |_| Ok(()), ok_switch)
+            .await
+            .unwrap();
+        let view = apply_settings_patch(&state, patch(serde_json::json!({"download_quality": "720p"})), "e", 1, |_| Ok(()), ok_switch)
+            .await
+            .unwrap();
+        assert_eq!((view.modal_api_url.as_str(), view.download_quality.as_str()), ("new", "720p"));
+
+        // In one save, only the field already newer is dropped.
+        let view = apply_settings_patch(
+            &state,
+            patch(serde_json::json!({"modal_api_url": "older", "logo_path": "/l.png"})),
+            "e",
+            1,
+            |_| Ok(()),
+            ok_switch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.modal_api_url, "new");
+        assert_eq!(view.logo_path.as_deref(), Some("/l.png"));
+    }
+
+    #[tokio::test]
+    async fn a_new_epoch_numbers_saves_from_the_start() {
+        let state = state_with_auth();
+        apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "a"})), "first", 9, |_| Ok(()), ok_switch)
+            .await
+            .unwrap();
+        // The webview reloaded: its counter starts again.
+        let view = apply_settings_patch(&state, patch(serde_json::json!({"modal_api_url": "b"})), "second", 1, |_| Ok(()), ok_switch)
+            .await
+            .unwrap();
+        assert_eq!(view.modal_api_url, "b");
     }
 
     #[tokio::test]
@@ -678,6 +719,7 @@ mod tests {
         let err = apply_settings_patch(
             &state,
             patch(serde_json::json!({"output_folder": "/new", "download_quality": "480p"})),
+            "e",
             1,
             |_| Ok(()),
             |folder| {
@@ -702,6 +744,7 @@ mod tests {
         let err = apply_settings_patch(
             &state,
             patch(serde_json::json!({"output_folder": "/new", "download_quality": "480p"})),
+            "e",
             1,
             |_| Err("wait".to_string()),
             |_| async { panic!("must not switch") },

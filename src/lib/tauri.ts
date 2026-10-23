@@ -129,19 +129,21 @@ export async function getSettings(): Promise<Settings> {
   return invoke("get_settings");
 }
 
-// Increases with every save, also across a reload of the webview, so the
-// backend can drop a save that arrives after a newer one.
+// Increases with every save, so the backend can drop a field's value that
+// arrives after a newer one. The epoch is new with every load of the
+// webview, whose counter starts again; the backend starts over with it.
 let lastSettingsSeq = 0;
+const settingsEpoch = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 export function nextSettingsSeq(): number {
-  lastSettingsSeq = Math.max(Date.now(), lastSettingsSeq + 1);
+  lastSettingsSeq += 1;
   return lastSettingsSeq;
 }
 
 /** Save only the given fields. Resolves with the settings as they now are.
  * Pass a `seq` from nextSettingsSeq() to tell responses apart. */
 export async function saveSettings(patch: SettingsPatch, seq = nextSettingsSeq()): Promise<Settings> {
-  return invoke("save_settings", { patch, seq });
+  return invoke("save_settings", { patch, seq, epoch: settingsEpoch });
 }
 
 export async function resetState(): Promise<void> {

@@ -196,6 +196,53 @@ pub struct SettingsPatch {
     pub auto_process: Option<bool>,
 }
 
+impl SettingsPatch {
+    /// Drop each field a save numbered `seq` or later has already set, and
+    /// note `seq` for the others. Returns whether anything is left.
+    pub fn drop_stale(&mut self, applied: &mut SettingsSeq, epoch: &str, seq: u64) -> bool {
+        if applied.epoch != epoch {
+            // A new webview session numbers its saves from the start again.
+            applied.epoch = epoch.to_string();
+            applied.fields.clear();
+        }
+        // Lists every field: this stops compiling when one is added and not
+        // listed in `fields!` too.
+        let SettingsPatch {
+            download_quality: _,
+            output_folder: _,
+            modal_api_url: _,
+            modal_api_key: _,
+            logo_path: _,
+            youtube_playlist_id: _,
+            auto_process: _,
+        } = self;
+        let mut left = false;
+        macro_rules! fields {
+            ($($f:ident),*) => {$(
+                if self.$f.is_some() {
+                    let last = applied.fields.entry(stringify!($f)).or_insert(0);
+                    if seq <= *last {
+                        self.$f = None;
+                    } else {
+                        *last = seq;
+                        left = true;
+                    }
+                }
+            )*};
+        }
+        fields!(download_quality, output_folder, modal_api_url, modal_api_key, logo_path, youtube_playlist_id, auto_process);
+        left
+    }
+}
+
+/// Which settings save was applied last, per field, for one webview session
+/// (`epoch`).
+#[derive(Debug, Default)]
+pub struct SettingsSeq {
+    pub epoch: String,
+    pub fields: std::collections::HashMap<&'static str, u64>,
+}
+
 /// The transcription server (backend/app.py, deployed on Modal).
 pub const DEFAULT_MODAL_API_URL: &str = "https://iliyababin--youtube-clipper-transcribe-audio.us-east.modal.run";
 
@@ -298,9 +345,10 @@ pub struct AppState {
     pub legacy_videos: serde_json::Map<String, serde_json::Value>,
     /// One-time messages for the library screen.
     pub notices: Vec<String>,
-    /// The newest settings save applied this run; older ones are ignored so
-    /// saves that arrive out of order can't undo a later edit.
-    pub settings_seq: u64,
+    /// The newest settings save applied to each field; an older value for
+    /// the same field is ignored, so saves that arrive out of order can't
+    /// undo a later edit.
+    pub settings_seq: SettingsSeq,
     /// The video whose review last added a new name to
     /// `recent_preachers`, and that name (see `remember_preacher`).
     pub preacher_draft: Option<(String, String)>,
@@ -425,7 +473,7 @@ impl AppState {
             settings,
             legacy_videos: persisted.videos,
             notices: persisted.notices,
-            settings_seq: 0,
+            settings_seq: SettingsSeq::default(),
             preacher_draft: None,
         }
     }

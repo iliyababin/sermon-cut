@@ -150,6 +150,35 @@ describe("Settings autosave", () => {
     expect(quality.value).toBe("480p");
   });
 
+  it("keeps both fields when their saves answer out of order", async () => {
+    // The backend applied the newer save (another field) first.
+    const answers: Array<(s: SettingsType) => void> = [];
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "save_settings" ? new Promise((r) => answers.push(r)) : base(cmd, args)
+    );
+    render(<Settings />);
+    const quality = (await screen.findByLabelText("Default Quality")) as HTMLSelectElement;
+    const toggle = screen.getByLabelText(/Process new videos automatically/) as HTMLInputElement;
+    fireEvent.change(quality, { target: { value: "720p" } });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(saves()).toHaveLength(2));
+    const [first, second] = saves();
+    expect(first.patch).toEqual({ download_quality: "720p" });
+    expect(second.patch).toEqual({ auto_process: true });
+    expect(second.seq).toBe(first.seq + 1);
+    answers[1]({ ...initial, auto_process: true });
+    await new Promise((r) => setTimeout(r, 20));
+    answers[0]({ ...initial, download_quality: "720p", auto_process: true });
+    await screen.findByText("Saved");
+    expect(quality.value).toBe("720p");
+    expect(toggle.checked).toBe(true);
+    // The 720p answer was taken: going back to "best" is a change to save.
+    fireEvent.change(quality, { target: { value: "best" } });
+    await waitFor(() => expect(saves()).toHaveLength(3));
+    expect(saves()[2].patch).toEqual({ download_quality: "best" });
+  });
+
   it("shows the settings and tools folders", async () => {
     render(<Settings />);
     await screen.findByText("/data/sermon-cut");

@@ -35,7 +35,7 @@ export function Settings() {
 
   // Autosave: each field is saved on its own, AUTOSAVE_DELAY_MS after the
   // last change to it (or at once for picks and on blur). Every save gets a
-  // newer seq, so the backend ignores one that arrives late.
+  // newer seq, so the backend ignores a field's value that arrives late.
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<Field, string>>>({});
   const [savesInFlight, setSavesInFlight] = useState(0);
   const [savedOnce, setSavedOnce] = useState(false);
@@ -44,7 +44,8 @@ export function Settings() {
   const edited = useRef<SettingsType | null>(null);
   // Fields waiting to be saved; null: until flushField (Enter or blur).
   const timers = useRef(new Map<Field, ReturnType<typeof setTimeout> | null>());
-  const newestApplied = useRef(0);
+  // Per field: the newest save whose answer was taken.
+  const newestApplied = useRef(new Map<Field, number>());
 
   useEffect(() => {
     edited.current = settings;
@@ -135,9 +136,11 @@ export function Settings() {
     setSavesInFlight((n) => n + 1);
     try {
       const updated = await saveSettings(patch, seq);
-      if (seq < newestApplied.current) return;
-      newestApplied.current = seq;
-      saved.current = updated;
+      if (seq < (newestApplied.current.get(field) ?? 0)) return;
+      newestApplied.current.set(field, seq);
+      // Each save owns its field. The answer's other fields may predate a
+      // save of theirs that the backend applied first.
+      saved.current = { ...(saved.current ?? updated), [field]: updated[field] };
       // Show the value as saved (e.g. trimmed), unless it was edited since.
       const sent = current[field];
       setSettings((s) =>

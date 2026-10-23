@@ -2991,11 +2991,7 @@ fn file_in_dir(dir: &Path, path: &str) -> Result<String, String> {
         .map(|n| n.to_string_lossy().to_string())
         .filter(|n| super::is_valid_file_name(n))
         .ok_or_else(|| format!("Invalid file: {}", path))?;
-    let parent_ok = p
-        .parent()
-        .and_then(|parent| parent.canonicalize().ok())
-        .zip(dir.canonicalize().ok())
-        .is_some_and(|(a, b)| a == b);
+    let parent_ok = fsutil::is_directly_in(p, dir);
     if !parent_ok || !dir.join(&name).is_file() {
         return Err(format!("{} isn't one of this video's files", path));
     }

@@ -4,7 +4,7 @@ use super::Fingerprint;
 use serde::{de::DeserializeOwned, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
@@ -219,6 +219,58 @@ fn move_file_with(src: &Path, dst: &Path, rename: impl Fn(&Path, &Path) -> io::R
     }
 }
 
+/// `path` made absolute and free of symlinks, for a path that may not
+/// exist yet (e.g. a copy's destination). The deepest part that exists is
+/// canonicalised (resolving any symlink in it; a dangling one fails) and
+/// the rest appended. None for a relative path, a `..` (or anything but a
+/// plain name) in the part that doesn't exist, or a part of that rest that
+/// has turned into a symlink by the time it's checked.
+pub fn resolve(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    // symlink_metadata: a dangling symlink counts as existing, so it's
+    // canonicalised (and refused) rather than treated as a plain new name.
+    while fs::symlink_metadata(&existing).is_err() {
+        match existing.components().next_back()? {
+            Component::Normal(name) => rest.push(name.to_os_string()),
+            Component::CurDir => {}
+            _ => return None,
+        }
+        existing = existing.parent()?.to_path_buf();
+    }
+    let mut resolved = fs::canonicalize(&existing).ok()?;
+    for name in rest.into_iter().rev() {
+        resolved.push(name);
+        // Created meanwhile as a symlink: it could lead anywhere.
+        if fs::symlink_metadata(&resolved).is_ok_and(|m| m.file_type().is_symlink()) {
+            return None;
+        }
+    }
+    Some(resolved)
+}
+
+/// `path`, resolved (see `resolve`), if it is `root` or inside it once
+/// symlinks and `..` are resolved in both; the one containment check every
+/// path from the webview goes through (docs/INVARIANTS.md #11). Use the
+/// path it returns, not the original.
+pub fn resolve_within(path: &Path, root: &Path) -> Option<PathBuf> {
+    let resolved = resolve(path)?;
+    let root = resolve(root)?;
+    resolved.starts_with(&root).then_some(resolved)
+}
+
+/// Whether `path`'s real parent folder is `dir` (a file directly in it).
+pub fn is_directly_in(path: &Path, dir: &Path) -> bool {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    match (parent.and_then(resolve), resolve(dir)) {
+        (Some(parent), Some(dir)) => parent == dir,
+        _ => false,
+    }
+}
+
 /// Is an ISO-BMFF file (mp4/mov/m4v) complete? Walks the top-level boxes:
 /// a copy still in progress has a last box that runs past the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +345,56 @@ mod tests {
         v.extend_from_slice(kind);
         v.extend(std::iter::repeat(0u8).take(payload));
         v
+    }
+
+    #[test]
+    fn resolve_within_resolves_dots_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("sub/a.jpg"), b"x").unwrap();
+        fs::write(outside.join("secret"), b"x").unwrap();
+        let within = |p: &Path| resolve_within(p, &root).is_some();
+
+        let real_root = root.canonicalize().unwrap();
+        assert_eq!(resolve_within(&root.join("sub/a.jpg"), &root), Some(real_root.join("sub/a.jpg")));
+        assert!(within(&root));
+        // Not there yet (a copy's destination), in a folder not there yet.
+        assert_eq!(resolve_within(&root.join("new/dir/b.jpg"), &root), Some(real_root.join("new/dir/b.jpg")));
+        assert!(!within(&outside.join("new.jpg")));
+        // `..` out of the root, existing or not; `..` in what doesn't exist.
+        assert!(!within(&root.join("sub/../../outside/secret")));
+        assert!(!within(&root.join("missing/../../outside/x")));
+        assert!(!within(&root.join("missing/../sub/a.jpg")));
+        assert!(within(&root.join("sub/../sub/a.jpg")));
+        // Relative paths and look-alike prefixes.
+        assert!(!within(Path::new("lib/sub/a.jpg")));
+        fs::create_dir_all(tmp.path().join("lib2")).unwrap();
+        assert!(!within(&tmp.path().join("lib2/x")));
+
+        assert!(is_directly_in(&root.join("sub/a.jpg"), &root.join("sub")));
+        assert!(!is_directly_in(&root.join("sub/a.jpg"), &root));
+        assert!(!is_directly_in(Path::new("a.jpg"), &root));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // A symlink inside the root that points out of it.
+            symlink(&outside, root.join("escape")).unwrap();
+            assert!(!within(&root.join("escape/secret")));
+            assert!(!within(&root.join("escape/new.jpg")));
+            // Its real parent is `outside`, not the root.
+            assert!(!is_directly_in(&root.join("escape/secret"), &root));
+            // A dangling symlink as the destination itself.
+            symlink(outside.join("nope"), root.join("dangling")).unwrap();
+            assert!(!within(&root.join("dangling")));
+            // A root reached through a symlink still counts.
+            symlink(&root, tmp.path().join("alias")).unwrap();
+            assert!(within(&tmp.path().join("alias/sub/a.jpg")));
+            assert!(resolve_within(&root.join("sub/a.jpg"), &tmp.path().join("alias")).is_some());
+        }
     }
 
     #[test]

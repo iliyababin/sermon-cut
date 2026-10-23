@@ -38,8 +38,7 @@ pub struct Failed {
 }
 
 fn is_inside(paths: &LibraryPaths, file: &Path) -> bool {
-    let parent = file.parent().and_then(|p| p.canonicalize().ok());
-    parent.as_deref() == Some(paths.root.as_path())
+    super::fsutil::is_directly_in(file, &paths.root)
 }
 
 fn move_into(src: &str, dir: &Path) -> Result<Option<String>, String> {

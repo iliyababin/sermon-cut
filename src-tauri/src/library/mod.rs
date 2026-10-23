@@ -335,12 +335,7 @@ impl LibraryPaths {
         if !meta.file_type().is_file() {
             return Err(format!("{} is not a regular file", path.display()));
         }
-        let parent = path
-            .parent()
-            .and_then(|p| p.canonicalize().ok())
-            .ok_or_else(|| format!("Can't resolve {}", path.display()))?;
-        let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
-        if parent != root {
+        if !fsutil::is_directly_in(path, &self.root) {
             return Err(format!("{} is outside the library folder", path.display()));
         }
         Ok(())

@@ -3,7 +3,8 @@ use crate::state::{AppState, Settings, SettingsPatch, SettingsView, VideoInfo};
 use crate::upload::{TokenSource, UploadError};
 use crate::youtube_dl;
 use futures::future::BoxFuture;
-use std::path::{Component, Path, PathBuf};
+use crate::library::fsutil::{resolve, resolve_within};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
@@ -22,45 +23,9 @@ pub fn allow_user_paths(app_handle: &AppHandle, library_root: Option<&Path>, set
     }
 }
 
-/// `path` made absolute and free of symlinks, for a path that may not exist
-/// yet (e.g. a copy's destination): the deepest part that exists is
-/// canonicalised (resolving any symlink in it, even a dangling one, which
-/// then fails) and the rest appended. None for a relative path or one that
-/// climbs out with `..` past what exists.
-fn resolve_for_check(path: &Path) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut existing = path.to_path_buf();
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    // symlink_metadata: a dangling symlink counts as existing, so it's
-    // canonicalised (and refused) rather than treated as a plain new name.
-    while std::fs::symlink_metadata(&existing).is_err() {
-        match existing.components().next_back()? {
-            Component::Normal(name) => rest.push(name.to_os_string()),
-            Component::CurDir => {}
-            _ => return None,
-        }
-        existing = existing.parent()?.to_path_buf();
-    }
-    let mut resolved = std::fs::canonicalize(&existing).ok()?;
-    for name in rest.into_iter().rev() {
-        resolved.push(name);
-    }
-    Some(resolved)
-}
-
-/// Whether `path` is inside one of `roots` once symlinks and `..` are
-/// resolved, so neither can lead out of them. Roots that don't exist yet
-/// are resolved the same way.
+/// Whether `path` is inside one of `roots` (see `fsutil::resolve_within`).
 pub fn is_within(path: &Path, roots: &[PathBuf]) -> bool {
-    let Some(resolved) = resolve_for_check(path) else {
-        return false;
-    };
-    roots
-        .iter()
-        .filter_map(|root| resolve_for_check(root))
-        .any(|root| resolved.starts_with(&root))
+    roots.iter().any(|root| resolve_within(path, root).is_some())
 }
 
 /// What a file command does with a path.
@@ -97,7 +62,7 @@ fn is_state_file(path: &Path) -> bool {
             n == "state.json" || n.starts_with("state.json.") || n == "state.v0.json" || n.starts_with(".state.json")
         })
     };
-    named(path) || resolve_for_check(path).is_some_and(|p| named(&p))
+    named(path) || resolve(path).is_some_and(|p| named(&p))
 }
 
 /// Whether a file command may use `path`: inside `roots`, or picked by the

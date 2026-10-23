@@ -64,6 +64,42 @@ pub struct KnownFile {
     pub duration: Option<f64>,
 }
 
+// Counts candidate comparisons in tests, so a test can check that matching
+// stays close to linear without timing anything.
+#[cfg(test)]
+thread_local! {
+    static COMPARISONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn compared() {
+    #[cfg(test)]
+    COMPARISONS.with(|c| c.set(c.get() + 1));
+}
+
+/// Known files by name, for a lookup per listed file.
+struct KnownIndex<'a> {
+    by_key: HashMap<&'a str, Vec<&'a KnownFile>>,
+}
+
+impl<'a> KnownIndex<'a> {
+    fn new(known: &'a [KnownFile]) -> Self {
+        let mut by_key: HashMap<&str, Vec<&KnownFile>> = HashMap::new();
+        for k in known {
+            by_key.entry(k.key.as_str()).or_default().push(k);
+        }
+        KnownIndex { by_key }
+    }
+
+    /// The known file with this name, size and mtime.
+    fn unchanged(&self, key: &str, size: u64, mtime_ms: i64) -> Option<&'a KnownFile> {
+        self.by_key.get(key)?.iter().copied().find(|k| {
+            compared();
+            k.size == size && k.mtime_ms == mtime_ms
+        })
+    }
+}
+
 pub fn known_files(entries: &[Entry]) -> Vec<KnownFile> {
     entries
         .iter()
@@ -97,6 +133,7 @@ pub fn observe(
     let wall_now = now_ms();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let known = KnownIndex::new(known);
 
     for dirent in std::fs::read_dir(root)? {
         let Ok(dirent) = dirent else { continue };
@@ -116,10 +153,7 @@ pub fn observe(
         seen.insert(name.clone());
 
         let key = match_key(&name);
-        if let Some(k) = known
-            .iter()
-            .find(|k| k.key == key && k.size == size && k.mtime_ms == mtime_ms)
-        {
+        if let Some(k) = known.unchanged(&key, size, mtime_ms) {
             out.push(FileObs {
                 name,
                 size,
@@ -196,7 +230,10 @@ pub fn observe(
         if item.hash.is_none() {
             match fsutil::content_hash(&path, size) {
                 Ok(h) => item.hash = Some(h),
+                // Same as a failed probe: a file that has held still for a
+                // while and still can't be read is unreadable, not copying.
                 Err(_) => {
+                    obs.state = if long_unchanged { ObsState::Unreadable } else { ObsState::Copying };
                     out.push(obs);
                     continue;
                 }
@@ -272,7 +309,12 @@ pub fn reconcile(
         let pick = {
             let unchanged = |e: &Entry| e.fingerprint.size == o.size && e.fingerprint.mtime_ms == o.mtime_ms;
             let same_content = |e: &Entry| o.hash.as_ref().is_some_and(|h| *h == e.fingerprint.hash);
-            let find = |test: &dyn Fn(&Entry) -> bool| candidates.iter().copied().find(|i| test(&entries[*i]));
+            let find = |test: &dyn Fn(&Entry) -> bool| {
+                candidates.iter().copied().find(|i| {
+                    compared();
+                    test(&entries[*i])
+                })
+            };
             find(&unchanged)
                 .or_else(|| find(&same_content))
                 .or_else(|| find(&|e| was_present(e, o)))
@@ -323,6 +365,14 @@ pub fn reconcile(
     }
 
     // Pass 2: renames (same content as an entry whose file is gone), then new files.
+    let mut by_content: HashMap<(&str, u64), Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if !claimed.contains(&i) {
+            by_content.entry((e.fingerprint.hash.as_str(), e.fingerprint.size)).or_default().push(i);
+        }
+    }
+    let mut renamed_to: Vec<(usize, &FileObs)> = Vec::new();
+    let mut new_files: Vec<&FileObs> = Vec::new();
     for o in unmatched {
         match o.state {
             ObsState::Copying => {
@@ -336,20 +386,25 @@ pub fn reconcile(
             ObsState::Ready => {}
         }
         let Some(hash) = o.hash.as_ref() else { continue };
-        let renamed = (0..entries.len()).find(|i| {
-            !claimed.contains(i)
-                && entries[*i].fingerprint.hash == *hash
-                && entries[*i].fingerprint.size == o.size
+        let renamed = by_content.get_mut(&(hash.as_str(), o.size)).and_then(|c| {
+            compared();
+            (!c.is_empty()).then(|| c.remove(0))
         });
-        if let Some(i) = renamed {
-            claimed.insert(i);
-            let e = &mut entries[i];
-            e.file_name = o.name.clone();
-            e.fingerprint.mtime_ms = o.mtime_ms;
-            r.present.insert(e.id.clone());
-            r.changed = true;
-            continue;
+        match renamed {
+            Some(i) => renamed_to.push((i, o)),
+            None => new_files.push(o),
         }
+    }
+    for (i, o) in renamed_to {
+        claimed.insert(i);
+        let e = &mut entries[i];
+        e.file_name = o.name.clone();
+        e.fingerprint.mtime_ms = o.mtime_ms;
+        r.present.insert(e.id.clone());
+        r.changed = true;
+    }
+    for o in new_files {
+        let Some(hash) = o.hash.as_ref() else { continue };
         let entry = Entry::new(
             o.name.clone(),
             Fingerprint {
@@ -743,6 +798,58 @@ mod tests {
         let probe = |_: &Path| None;
         let obs = observe(tmp.path(), &[], &mut ScanCache::default(), &probe, Duration::ZERO).unwrap();
         assert_eq!(obs[0].state, ObsState::Unreadable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unhashable_settled_file_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("locked.webm");
+        write_settled(&path, b"data");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The probe is faked as working, so only the hash fails.
+        let probe = |_: &Path| Some(1.0);
+        let obs = observe(tmp.path(), &[], &mut ScanCache::default(), &probe, Duration::ZERO).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(obs[0].state, ObsState::Unreadable);
+    }
+
+    fn comparisons() -> u64 {
+        COMPARISONS.with(|c| c.get())
+    }
+
+    #[test]
+    fn matching_5000_files_stays_linear() {
+        const N: usize = 5000;
+        let mut entries: Vec<Entry> = (0..N).map(|i| entry(&format!("v{i}.mp4"), 100 + i as u64, 1, &format!("h{i}"))).collect();
+        // Most files unchanged, a tenth renamed, a tenth new.
+        let mut obs: Vec<FileObs> = Vec::new();
+        for i in 0..N {
+            let name = if i % 10 == 0 { format!("renamed {i}.mp4") } else { format!("v{i}.mp4") };
+            obs.push(ready(&name, 100 + i as u64, 1, &format!("h{i}")));
+        }
+        for i in 0..N / 10 {
+            obs.push(ready(&format!("new{i}.mp4"), 1, 2, &format!("n{i}")));
+        }
+
+        let before = comparisons();
+        let r = reconcile(&mut entries, &obs, &HashSet::new(), None);
+        let used = comparisons() - before;
+        assert_eq!(entries.len(), N + N / 10);
+        assert_eq!(r.present.len(), N + N / 10);
+        assert!(entries.iter().any(|e| e.file_name == "renamed 10.mp4"));
+        // A scan over every entry for every file would be N² = 25M.
+        assert!(used <= 3 * (N as u64 + N as u64 / 10), "{used} comparisons");
+
+        let known = known_files(&entries);
+        let index = KnownIndex::new(&known);
+        let before = comparisons();
+        for o in &obs {
+            assert!(index.unchanged(&match_key(&o.name), o.size, o.mtime_ms).is_some());
+        }
+        let used = comparisons() - before;
+        assert!(used <= obs.len() as u64, "{used} comparisons");
     }
 
     #[test]

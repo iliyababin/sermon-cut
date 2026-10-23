@@ -1372,7 +1372,7 @@ impl Library {
         }
 
         let mut state = app_state.lock().await;
-        if let Err(e) = AppState::backup_pre_library_state() {
+        if let Err(e) = state.backup_pre_library_state() {
             eprintln!("[migrate] {}", e);
             return;
         }

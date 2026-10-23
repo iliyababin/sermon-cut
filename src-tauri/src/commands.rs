@@ -695,7 +695,7 @@ mod tests {
     use crate::state::YouTubeAuth;
 
     fn state_with_auth() -> AppStateHandle {
-        let mut s = AppState::default();
+        let mut s = AppState::for_test();
         s.settings.output_folder = "/old".into();
         s.settings.upload_privacy = "private".into();
         s.settings.youtube_auth = Some(YouTubeAuth {
@@ -707,7 +707,7 @@ mod tests {
 
     /// Signed in as channel UC1 with an access token that has expired.
     fn state_with_expired_token() -> AppStateHandle {
-        let mut s = AppState::default();
+        let mut s = AppState::for_test();
         s.settings.youtube_auth = Some(YouTubeAuth {
             access_token: Some("old".into()),
             refresh_token: Some("r1".into()),

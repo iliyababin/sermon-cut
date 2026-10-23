@@ -356,6 +356,10 @@ pub struct AppState {
     /// The video whose review last added a new name to
     /// `recent_preachers`, and that name (see `remember_preacher`).
     pub preacher_draft: Option<(String, String)>,
+    /// Where this state is saved: the file it was loaded from. None means
+    /// the app's own state.json (which tests may not use; they give each
+    /// state its own file, see `for_test`).
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,9 +391,7 @@ fn backup_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 fn get_state_file_path() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sermon-cut-test-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("state.json")
+    panic!("a test saved an AppState with no file of its own; build it with AppState::for_test()")
 }
 
 impl AppState {
@@ -424,9 +426,29 @@ impl AppState {
         Self::load_from(&get_state_file_path())
     }
 
+    /// The state in the file at `path`, saved back there.
+    fn load_from(path: &Path) -> Self {
+        let mut state = Self::read_from(path);
+        state.file = Some(path.to_path_buf());
+        state
+    }
+
+    /// A state of its own for a test, saved to a fresh temporary file.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("sermon-cut-test-{}-{}", std::process::id(), n));
+        AppState { file: Some(dir.join("state.json")), ..AppState::default() }
+    }
+
+    fn file(&self) -> PathBuf {
+        self.file.clone().unwrap_or_else(get_state_file_path)
+    }
+
     /// Read state.json. An unreadable one is moved aside and the last good
     /// copy (state.json.bak) is used instead, with a notice either way.
-    fn load_from(path: &Path) -> Self {
+    fn read_from(path: &Path) -> Self {
         let backup = backup_path(path);
         match std::fs::read(path) {
             Ok(contents) => match serde_json::from_slice::<PersistedState>(&contents) {
@@ -483,11 +505,12 @@ impl AppState {
             notices: persisted.notices,
             settings_seq: SettingsSeq::default(),
             preacher_draft: None,
+            file: None,
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        self.save_to(&get_state_file_path())
+        self.save_to(&self.file())
     }
 
     /// Write state.json (owner-only: it holds the YouTube sign-in). The
@@ -526,8 +549,8 @@ impl AppState {
 
     /// Before dropping the old videos from state.json, keep a copy of the
     /// original file (once: a later run must not overwrite the real original).
-    pub fn backup_pre_library_state() -> Result<(), String> {
-        backup_pre_library_state_at(&get_state_file_path())
+    pub fn backup_pre_library_state(&self) -> Result<(), String> {
+        backup_pre_library_state_at(&self.file())
     }
 }
 
@@ -774,6 +797,27 @@ mod tests {
             .find(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-"))
             .unwrap();
         assert_eq!(mode(&aside.path()), 0o600);
+    }
+
+    #[test]
+    fn a_state_saves_back_to_the_file_it_came_from() {
+        let (mut a, mut b) = (AppState::for_test(), AppState::for_test());
+        assert_ne!(a.file, b.file);
+        a.settings.download_quality = "720p".into();
+        b.settings.download_quality = "480p".into();
+        a.save().unwrap();
+        b.save().unwrap();
+        let again = AppState::load_from(a.file.as_ref().unwrap());
+        assert_eq!(again.settings.download_quality, "720p");
+        assert_eq!(again.file, a.file);
+        again.save().unwrap();
+        assert_eq!(AppState::load_from(b.file.as_ref().unwrap()).settings.download_quality, "480p");
+    }
+
+    #[test]
+    #[should_panic(expected = "AppState::for_test")]
+    fn a_test_state_without_a_file_never_reaches_the_real_one() {
+        let _ = AppState::default().save();
     }
 
     #[test]

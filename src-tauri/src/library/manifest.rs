@@ -309,6 +309,36 @@ pub struct Review {
 /// speaker and logo drawn over a source image).
 pub const RENDERED_PREFIX: &str = "thumbnail_rendered_";
 
+/// A new render's file name. It carries the source's name (without the
+/// extension) and a fresh id, so the source can be told from the name
+/// alone: v0.4.0 rewrites video.json keeping only `selected_thumbnail`.
+pub fn render_file_name(source: &str) -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let named = format!("{}{}_{}.jpg", RENDERED_PREFIX, file_stem(source), id);
+    if named.len() <= 255 {
+        named
+    } else {
+        format!("{}{}.jpg", RENDERED_PREFIX, id)
+    }
+}
+
+fn file_stem(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(stem, _)| stem)
+}
+
+/// The one source among `options` that a render's file name (see
+/// `render_file_name`) says it was made from.
+fn render_source<'a>(file: &str, options: &'a [String]) -> Option<&'a String> {
+    let rest = file.strip_prefix(RENDERED_PREFIX)?.strip_suffix(".jpg")?;
+    let (stem, id) = rest.rsplit_once('_')?;
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut matching = options.iter().filter(|o| file_stem(o) == stem);
+    let source = matching.next()?;
+    matching.next().is_none().then_some(source)
+}
+
 /// A template render of one thumbnail source. `render_key` is computed by
 /// the webview from everything that went into it (template version, title,
 /// speaker, layout, source), so an unchanged render is reused, not redone.
@@ -378,14 +408,21 @@ impl VideoData {
             self.selected_source = None;
         }
         if self.selected_source.is_none() {
-            // Written by v0.4.0: its selection is a file name, which may be a
-            // source (kept) or a render of an unknown source (dropped).
-            self.selected_source = self
-                .selected_thumbnail
-                .as_ref()
-                .filter(|s| options.contains(s))
-                .or(self.thumbnail_options.first())
-                .cloned();
+            // Written by v0.4.0, which keeps only `selected_thumbnail`: a
+            // source, or a render whose name says its source (which then
+            // stays that source's render). Else the first source.
+            let chosen = self.selected_thumbnail.as_ref().and_then(|s| match options.contains(s) {
+                true => Some(s.clone()),
+                false => render_source(s, &self.thumbnail_options).cloned(),
+            });
+            if let (Some(source), Some(file)) = (&chosen, &self.selected_thumbnail) {
+                if file != source && self.render_for(source).is_none() && dir.join(file).is_file() {
+                    // No key: the review screen renders it again when it next
+                    // shows it, and keeps this one until then.
+                    self.renders.push(Render { source: source.clone(), file: file.clone(), render_key: String::new() });
+                }
+            }
+            self.selected_source = chosen.or(self.thumbnail_options.first().cloned());
         }
         self.selected_thumbnail = self.derived_selection(dir);
     }
@@ -759,6 +796,45 @@ mod tests {
         std::fs::write(tmp.path().join("video.json"), json.to_string()).unwrap();
         let d = load_video_data(tmp.path());
         assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
+    }
+
+    #[test]
+    fn v040_selection_of_a_render_keeps_its_source_and_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let options = ["thumbnail_option_1.jpg", "thumbnail_option_2.jpg", "custom_thumbnail_7.jpg"];
+        for f in options {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let render = render_file_name("thumbnail_option_2.jpg");
+        assert!(render.starts_with("thumbnail_rendered_thumbnail_option_2_"), "{render}");
+        std::fs::write(dir.join(&render), b"r").unwrap();
+        // How v0.4.0 writes video.json back: no renders, no selected_source.
+        let json = serde_json::json!({"thumbnail_options": options, "selected_thumbnail": render});
+        std::fs::write(dir.join("video.json"), json.to_string()).unwrap();
+
+        let d = load_video_data(dir);
+        assert_eq!(d.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
+        assert_eq!(d.render_for("thumbnail_option_2.jpg").map(|r| r.file.as_str()), Some(render.as_str()));
+        assert_eq!(d.selected_thumbnail.as_deref(), Some(render.as_str()));
+        save_video_data(dir, &d).unwrap();
+        assert!(dir.join(&render).exists(), "the selected render is kept");
+        let again = load_video_data(dir);
+        assert_eq!(again.selected_source.as_deref(), Some("thumbnail_option_2.jpg"));
+
+        // A custom source's render too.
+        let custom = render_file_name("custom_thumbnail_7.jpg");
+        std::fs::write(dir.join(&custom), b"r").unwrap();
+        let json = serde_json::json!({"thumbnail_options": options, "selected_thumbnail": custom});
+        std::fs::write(dir.join("video.json"), json.to_string()).unwrap();
+        assert_eq!(load_video_data(dir).selected_source.as_deref(), Some("custom_thumbnail_7.jpg"));
+
+        // A render name that names no source: the first one.
+        for name in [render_file_name("gone.jpg"), "thumbnail_rendered_1_200.jpg".to_string()] {
+            let json = serde_json::json!({"thumbnail_options": options, "selected_thumbnail": name});
+            std::fs::write(dir.join("video.json"), json.to_string()).unwrap();
+            assert_eq!(load_video_data(dir).selected_source.as_deref(), Some("thumbnail_option_1.jpg"), "{name}");
+        }
     }
 
     #[test]

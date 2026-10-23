@@ -2096,7 +2096,7 @@ impl Library {
         // Named here, never by the webview. Written under a temp name (swept
         // on the next open if we crash) so cleanup can't take it before it's
         // recorded.
-        let name = format!("{}{}.jpg", RENDERED_PREFIX, uuid::Uuid::new_v4().simple());
+        let name = manifest::render_file_name(&source);
         let tmp = dir.join(format!("{}{}", name, fsutil::TMP_MARKER));
         let out = tmp.clone();
         blocking(move || crate::thumbnail::save_for_youtube(&image_bytes, &out)).await??;

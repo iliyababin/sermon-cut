@@ -440,7 +440,7 @@ pub async fn crop_standalone_thumbnail(
             let _ = std::fs::remove_file(e.path());
         }
     }
-    crate::thumbnail::process_custom_thumbnail(&source_image_path, &dir, &crop_rect, false, None)
+    crate::thumbnail::process_custom_thumbnail(&source_image_path, &dir, &crop_rect, false)
         .await
 }
 

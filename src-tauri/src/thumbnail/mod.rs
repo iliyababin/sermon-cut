@@ -313,13 +313,13 @@ pub async fn generate_thumbnail_options(
     .await
 }
 
-/// Process a custom image as a thumbnail with crop, color grading, and logo overlay.
+/// Process a custom image as a thumbnail: crop, and optionally colour grade.
+/// No logo: the template draws it.
 pub async fn process_custom_thumbnail(
     source_path: &str,
     output_dir: &Path,
     crop_rect: &CropRect,
     apply_color_grading_flag: bool,
-    logo_path: Option<&str>,
 ) -> Result<String, String> {
     let source = Path::new(source_path);
     if !source.exists() {
@@ -363,11 +363,6 @@ pub async fn process_custom_thumbnail(
     if apply_color_grading_flag {
         println!("[thumbnail] Applying color grading");
         grading::apply_color_grading(&mut result);
-    }
-
-    if let Some(lp) = logo_path {
-        println!("[thumbnail] Applying logo overlay from: {}", lp);
-        logo::apply_logo_overlay(&mut result, lp);
     }
 
     // Within YouTube's limits: a phone photo crop is far bigger than 1280×720.

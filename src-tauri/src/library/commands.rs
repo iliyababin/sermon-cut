@@ -112,25 +112,13 @@ pub async fn regenerate_thumbnails(
 #[tauri::command]
 pub async fn process_custom_thumbnail(
     lib: State<'_, LibraryHandle>,
-    state: State<'_, AppStateHandle>,
     app_handle: AppHandle,
     video_id: String,
     source_image_path: String,
     crop_rect: CropRect,
     apply_color_grading: bool,
-    apply_logo_overlay: bool,
 ) -> Result<String, String> {
-    let result = lib
-        .custom_thumbnail(
-            &app_handle,
-            &state,
-            &video_id,
-            source_image_path,
-            crop_rect,
-            apply_color_grading,
-            apply_logo_overlay,
-        )
-        .await;
+    let result = lib.custom_thumbnail(&video_id, source_image_path, crop_rect, apply_color_grading).await;
     changed(&app_handle);
     result
 }

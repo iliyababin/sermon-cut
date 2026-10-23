@@ -204,15 +204,13 @@ export async function processCustomThumbnail(
   videoId: string,
   sourceImagePath: string,
   cropRect: CropRect,
-  applyColorGrading: boolean,
-  applyLogoOverlay: boolean
+  applyColorGrading: boolean
 ): Promise<string> {
   return invoke("process_custom_thumbnail", {
     videoId,
     sourceImagePath,
     cropRect,
     applyColorGrading,
-    applyLogoOverlay,
   });
 }
 

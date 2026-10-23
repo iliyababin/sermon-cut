@@ -1627,32 +1627,31 @@ impl Library {
 
     pub async fn custom_thumbnail(
         self: &Arc<Self>,
-        app: &AppHandle,
-        app_state: &AppStateHandle,
         id: &str,
         source: String,
         crop: crate::thumbnail::CropRect,
         grading: bool,
-        with_logo: bool,
     ) -> Result<String, String> {
         let (_busy, paths, _entry, _data) = self.begin_op(id)?;
         async {
-            let logo = if with_logo {
-                effective_logo(app, app_state.lock().await.settings.logo_path.clone())
-            } else {
-                None
-            };
             let dir = paths.ensure_video_dir(id)?;
-            let path = crate::thumbnail::process_custom_thumbnail(&source, &dir, &crop, grading, logo.as_deref()).await?;
+            let path = crate::thumbnail::process_custom_thumbnail(&source, &dir, &crop, grading).await?;
             let name = file_in_dir(&dir, &path)?;
-            let _g = self.inner();
-            let mut data = manifest::load_video_data(&dir);
-            if !data.thumbnail_options.contains(&name) {
-                data.thumbnail_options.insert(0, name.clone());
+            let pruned = {
+                let _g = self.inner();
+                let mut data = manifest::load_video_data(&dir);
+                if !data.thumbnail_options.contains(&name) {
+                    data.thumbnail_options.insert(0, name.clone());
+                }
+                // The selection is by id, so adding a source never moves it; the
+                // review screen selects the new one itself.
+                let pruned = prune_custom_thumbnails(&mut data.thumbnail_options, data.selected_source.as_deref());
+                manifest::save_video_data(&dir, &data)?;
+                pruned
+            };
+            for old in pruned {
+                let _ = std::fs::remove_file(dir.join(old));
             }
-            // The selection is by id, so adding a source never moves it; the
-            // review screen selects the new one itself.
-            manifest::save_video_data(&dir, &data)?;
             Ok(path_string(&dir.join(name)))
         }
         .await
@@ -2119,6 +2118,28 @@ fn resolve_thumbnail(
 }
 
 /// Resolve a path the frontend sent back to a file directly inside `dir`.
+/// Custom thumbnails kept per video, besides the selected one.
+const KEEP_CUSTOM_THUMBNAILS: usize = 3;
+
+/// Drop all but the newest custom thumbnails (they're added at the front)
+/// and the selected one from `options`; returns the dropped names.
+fn prune_custom_thumbnails(options: &mut Vec<String>, selected: Option<&str>) -> Vec<String> {
+    let mut customs = 0;
+    let mut pruned = Vec::new();
+    options.retain(|name| {
+        if !name.starts_with("custom_thumbnail_") {
+            return true;
+        }
+        customs += 1;
+        if customs <= KEEP_CUSTOM_THUMBNAILS || Some(name.as_str()) == selected {
+            return true;
+        }
+        pruned.push(name.clone());
+        false
+    });
+    pruned
+}
+
 fn file_in_dir(dir: &Path, path: &str) -> Result<String, String> {
     let p = Path::new(path);
     let name = p
@@ -2872,6 +2893,35 @@ mod tests {
         assert_eq!(raw_variant("thumbnail_option_3.jpg").as_deref(), Some("thumbnail_option_3_raw.jpg"));
         assert_eq!(raw_variant("thumbnail_option_3_raw.jpg"), None);
         assert_eq!(raw_variant("custom_thumbnail_1.jpg"), None);
+    }
+
+    #[test]
+    fn custom_thumbnails_keep_three_newest_and_the_selected_one() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut options = names(&[
+            "custom_thumbnail_5.jpg",
+            "custom_thumbnail_4.jpg",
+            "custom_thumbnail_3.jpg",
+            "custom_thumbnail_2.jpg",
+            "custom_thumbnail_1.jpg",
+            "thumbnail_option_1.jpg",
+        ]);
+        let pruned = prune_custom_thumbnails(&mut options, Some("custom_thumbnail_1.jpg"));
+        assert_eq!(pruned, names(&["custom_thumbnail_2.jpg"]));
+        assert_eq!(
+            options,
+            names(&[
+                "custom_thumbnail_5.jpg",
+                "custom_thumbnail_4.jpg",
+                "custom_thumbnail_3.jpg",
+                "custom_thumbnail_1.jpg",
+                "thumbnail_option_1.jpg",
+            ])
+        );
+        // Generated options are never pruned.
+        let mut options = names(&["thumbnail_option_1.jpg", "thumbnail_option_2.jpg"]);
+        assert!(prune_custom_thumbnails(&mut options, None).is_empty());
+        assert_eq!(options.len(), 2);
     }
 
     #[test]

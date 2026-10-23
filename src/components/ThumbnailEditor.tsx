@@ -3,6 +3,7 @@ import { useCanvasEditor } from "@/hooks/useCanvasEditor";
 import { readImageBase64, processCustomThumbnail } from "@/lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
 import { LocalImage } from "./LocalImage";
+import type { ThumbnailOption } from "@/lib/types";
 import {
   X,
   ZoomIn,
@@ -16,8 +17,9 @@ import {
 
 interface ThumbnailEditorProps {
   videoId: string;
-  thumbnailOptions: string[];
-  selectedThumbnail: string | null;
+  thumbnailOptions: ThumbnailOption[];
+  /** The selected option's id. */
+  selectedSource: string | null;
   onSave: (newThumbnailPath: string) => void;
   onClose: () => void;
 }
@@ -25,15 +27,18 @@ interface ThumbnailEditorProps {
 export function ThumbnailEditor({
   videoId,
   thumbnailOptions,
-  selectedThumbnail,
+  selectedSource,
   onSave,
   onClose,
 }: ThumbnailEditorProps) {
   const [sourceType, setSourceType] = useState<"ai" | "custom">("ai");
-  const [selectedAiIndex, setSelectedAiIndex] = useState(0);
+  const [selectedAiIndex, setSelectedAiIndex] = useState(() =>
+    Math.max(0, thumbnailOptions.findIndex((o) => o.id === selectedSource))
+  );
   const [customImagePath, setCustomImagePath] = useState<string | null>(null);
-  const [applyColorGrading, setApplyColorGrading] = useState(true);
-  const [applyLogoOverlay, setApplyLogoOverlay] = useState(true);
+  // The image actually on the canvas; the crop is saved from this one.
+  const [displayedPath, setDisplayedPath] = useState<string | null>(null);
+  const [applyColorGrading, setApplyColorGrading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -75,71 +80,42 @@ export function ThumbnailEditor({
     return () => observer.disconnect();
   }, [canvasRef]);
 
-  // Check if a thumbnail path is an AI-generated one (has a raw variant)
-  const isAiThumbnail = (path: string): boolean => {
-    return /thumbnail_option_\d+\.(jpg|jpeg)$/i.test(path);
-  };
-
-  // Get the raw version path for an AI thumbnail (without color grading/logo)
-  const getRawPath = (processedPath: string): string => {
-    // thumbnail_option_1.jpg -> thumbnail_option_1_raw.jpg
-    return processedPath.replace(/\.(jpg|jpeg)$/i, "_raw.jpg");
-  };
-
-  // Load initial image
+  // Load the chosen source: a generated option's plain crop (no logo or
+  // grading burned in) when there is one, else the option itself.
   useEffect(() => {
-    const loadInitialImage = async () => {
-      let pathToLoad: string | null = null;
-      let tryRawFallback = false;
+    let cancelled = false;
+    const candidates: string[] = [];
+    if (sourceType === "custom" && customImagePath) {
+      candidates.push(customImagePath);
+    } else if (sourceType === "ai" && thumbnailOptions[selectedAiIndex]) {
+      const option = thumbnailOptions[selectedAiIndex];
+      candidates.push(option.render_from);
+      if (option.path !== option.render_from) candidates.push(option.path);
+    }
+    if (candidates.length === 0) return;
 
-      if (sourceType === "custom" && customImagePath) {
-        pathToLoad = customImagePath;
-      } else if (sourceType === "ai" && thumbnailOptions.length > 0) {
-        const processedPath = thumbnailOptions[selectedAiIndex];
-        // Only try the raw version for AI-generated thumbnails, not custom ones
-        if (isAiThumbnail(processedPath)) {
-          pathToLoad = getRawPath(processedPath);
-          tryRawFallback = true;
-        } else {
-          pathToLoad = processedPath;
-        }
-      }
-
-      if (pathToLoad) {
+    (async () => {
+      for (const [i, path] of candidates.entries()) {
         try {
-          const base64 = await readImageBase64(pathToLoad);
+          const base64 = await readImageBase64(path);
+          if (cancelled) return;
           loadImage(base64);
-          setError(null);
+          setDisplayedPath(path);
+          setError(i === 0 ? null : "Using the processed thumbnail (the plain crop wasn't found)");
+          return;
         } catch (err) {
           console.error("Failed to load image:", err);
-          // If raw version doesn't exist, fall back to processed version
-          if (tryRawFallback) {
-            try {
-              const base64 = await readImageBase64(thumbnailOptions[selectedAiIndex]);
-              loadImage(base64);
-              setError("Using processed thumbnail (raw version not found)");
-            } catch {
-              setError("Failed to load image");
-            }
-          } else {
-            setError("Failed to load image");
-          }
         }
       }
-    };
-
-    loadInitialImage();
-  }, [sourceType, selectedAiIndex, customImagePath, thumbnailOptions, loadImage]);
-
-  // Initialize selected AI index based on current selection
-  useEffect(() => {
-    if (selectedThumbnail) {
-      const index = thumbnailOptions.indexOf(selectedThumbnail);
-      if (index >= 0) {
-        setSelectedAiIndex(index);
+      if (!cancelled) {
+        setDisplayedPath(null);
+        setError("Failed to load image");
       }
-    }
-  }, [selectedThumbnail, thumbnailOptions]);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sourceType, selectedAiIndex, customImagePath, thumbnailOptions, loadImage]);
 
   const handleUploadCustom = useCallback(async () => {
     try {
@@ -169,21 +145,8 @@ export function ThumbnailEditor({
 
   const handleApplyAndSave = useCallback(async () => {
     const cropRect = getCropRect();
-    if (!cropRect) {
+    if (!cropRect || !displayedPath) {
       setError("No image loaded");
-      return;
-    }
-
-    // Use raw version for AI thumbnails, custom path for uploads
-    let sourcePath: string;
-    if (sourceType === "custom" && customImagePath) {
-      sourcePath = customImagePath;
-    } else if (thumbnailOptions[selectedAiIndex]) {
-      const selected = thumbnailOptions[selectedAiIndex];
-      // Only use raw version for AI-generated thumbnails (not custom ones)
-      sourcePath = isAiThumbnail(selected) ? getRawPath(selected) : selected;
-    } else {
-      setError("No source image selected");
       return;
     }
 
@@ -191,12 +154,12 @@ export function ThumbnailEditor({
       setIsSaving(true);
       setError(null);
 
+      // The crop was made on the displayed image, so it's cut from that one.
       const newThumbnailPath = await processCustomThumbnail(
         videoId,
-        sourcePath,
+        displayedPath,
         cropRect,
-        applyColorGrading,
-        applyLogoOverlay
+        applyColorGrading
       );
 
       onSave(newThumbnailPath);
@@ -206,17 +169,7 @@ export function ThumbnailEditor({
     } finally {
       setIsSaving(false);
     }
-  }, [
-    videoId,
-    sourceType,
-    customImagePath,
-    thumbnailOptions,
-    selectedAiIndex,
-    getCropRect,
-    applyColorGrading,
-    applyLogoOverlay,
-    onSave,
-  ]);
+  }, [videoId, displayedPath, getCropRect, applyColorGrading, onSave]);
 
   const zoomPercent = Math.round(zoom * 100);
 
@@ -343,9 +296,9 @@ export function ThumbnailEditor({
               </button>
 
               {/* AI Options */}
-              {thumbnailOptions.map((path, index) => (
+              {thumbnailOptions.map((option, index) => (
                 <button
-                  key={path}
+                  key={option.id}
                   onClick={() => handleSelectAiOption(index)}
                   className={`relative aspect-video w-24 rounded-lg border-2 overflow-hidden transition-colors ${
                     sourceType === "ai" && selectedAiIndex === index
@@ -354,7 +307,7 @@ export function ThumbnailEditor({
                   }`}
                 >
                   <LocalImage
-                    path={path}
+                    path={option.path}
                     alt={`AI Option ${index + 1}`}
                     className="w-full h-full object-cover"
                   />
@@ -378,15 +331,6 @@ export function ThumbnailEditor({
                 className="w-4 h-4 rounded border-input"
               />
               <span className="text-sm">Apply color grading</span>
-            </label>
-            <label className="flex items-center gap-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={applyLogoOverlay}
-                onChange={(e) => setApplyLogoOverlay(e.target.checked)}
-                className="w-4 h-4 rounded border-input"
-              />
-              <span className="text-sm">Include logo overlay</span>
             </label>
           </div>
 

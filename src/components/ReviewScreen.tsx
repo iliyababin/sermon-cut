@@ -607,7 +607,12 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
                 <h3 className="font-semibold">Thumbnails</h3>
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={() => setIsEditorOpen(true)}
+                    onClick={() => {
+                      // Saving a custom thumbnail prunes old ones but keeps the
+                      // selected one, so the library should know which that is.
+                      void flush();
+                      setIsEditorOpen(true);
+                    }}
                     disabled={thumbnailOptions.length === 0}
                     className="text-sm px-3 py-1.5 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 flex items-center gap-1.5 transition-colors"
                   >
@@ -787,8 +792,8 @@ export function ReviewScreen({ video, onBack }: ReviewScreenProps) {
       {isEditorOpen && (
         <ThumbnailEditor
           videoId={video.id}
-          thumbnailOptions={thumbnailOptions.map((o) => o.path)}
-          selectedThumbnail={selectedOption?.path ?? null}
+          thumbnailOptions={thumbnailOptions}
+          selectedSource={selectedOption?.id ?? null}
           onSave={handleThumbnailEditorSave}
           onClose={() => setIsEditorOpen(false)}
         />

@@ -1,6 +1,5 @@
 mod color;
 mod crop;
-mod debug;
 mod fit;
 mod frames;
 mod grading;
@@ -68,9 +67,9 @@ pub fn save_for_youtube(bytes: &[u8], output_path: &Path) -> Result<(), String> 
     std::fs::write(output_path, &jpeg).map_err(|e| format!("Failed to write {}: {}", output_path.display(), e))
 }
 
-/// Core pipeline: detect → score → pick best → crop → grade → logo → save.
-///
-/// Returns `(final_image_path, debug_image_path_if_any)`.
+/// Core pipeline: extract frames → detect → score → pick best → crop →
+/// grade → logo → save. Frame extraction is async (ffmpeg); the rest is CPU
+/// work and runs on a blocking thread.
 async fn run_pipeline(
     video_path: &str,
     start_time: f64,
@@ -82,26 +81,50 @@ async fn run_pipeline(
 ) -> Result<Vec<String>, String> {
     let model_path = find_model_path()?;
 
-    // Candidate frames are only needed during this run (60 full-size PNGs),
-    // so keep them in a temp dir that's deleted when we return.
+    // Candidate frames are only needed during this run, so keep them in a
+    // temp dir that's deleted when we return.
     let temp_dir_holder = tempfile::tempdir()
         .map_err(|e| format!("Failed to create temp dir: {}", e))?;
     let frame_dir = temp_dir_holder.path().to_path_buf();
 
-    // Step 1: Extract candidate frames
     let frame_data =
         frames::extract_candidate_frames(video_path, start_time, end_time, NUM_CANDIDATES, &frame_dir).await?;
 
-    // Step 2: Run YOLO + scoring on each frame
+    let output_dir = output_dir.to_path_buf();
+    let output_stem = output_stem.to_string();
+    let logo_path = logo_path.map(str::to_string);
+    let result = tokio::task::spawn_blocking(move || {
+        pick_and_save(&model_path, &frame_data, &output_dir, &output_stem, logo_path.as_deref(), count)
+    })
+    .await
+    .map_err(|e| format!("Thumbnail task failed: {}", e))?;
+    drop(temp_dir_holder);
+    result
+}
+
+/// The blocking part of the pipeline, over already-extracted frames.
+fn pick_and_save(
+    model_path: &Path,
+    frame_data: &[(f64, PathBuf)],
+    output_dir: &Path,
+    output_stem: &str,
+    logo_path: Option<&str>,
+    count: u32,
+) -> Result<Vec<String>, String> {
+    if frame_data.is_empty() {
+        return Err("No frames could be extracted for thumbnails".into());
+    }
+
+    // Run YOLO + scoring on each frame
     let mut all_scored: Vec<(PathBuf, ScoredDetection)> = Vec::new();
 
-    for (timestamp, frame_path) in &frame_data {
+    for (timestamp, frame_path) in frame_data {
         let img = match load_image(frame_path) {
             Ok(i) => i,
             Err(_) => continue,
         };
 
-        let detections = match yolo::detect(&model_path, &img) {
+        let detections = match yolo::detect(model_path, &img) {
             Ok(d) => d,
             Err(e) => {
                 println!("[thumbnail] YOLO error on frame at {:.0}s: {}", timestamp, e);
@@ -115,29 +138,18 @@ async fn run_pipeline(
         }
     }
 
-    // Stats
-    let valid_count = all_scored
-        .iter()
-        .filter(|(_, s)| s.status == DetectionStatus::Valid)
-        .count();
-    let not_facing = all_scored
-        .iter()
-        .filter(|(_, s)| s.status == DetectionStatus::NotFacing)
-        .count();
-    let sitting = all_scored
-        .iter()
-        .filter(|(_, s)| s.status == DetectionStatus::Sitting)
-        .count();
+    let count_of = |status| all_scored.iter().filter(|(_, s)| s.status == status).count();
     println!(
         "[thumbnail] Detection summary: {} valid, {} not facing, {} sitting",
-        valid_count, not_facing, sitting
+        count_of(DetectionStatus::Valid),
+        count_of(DetectionStatus::NotFacing),
+        count_of(DetectionStatus::Sitting)
     );
 
     // Filter to valid detections only, sort by score desc
     let mut valid: Vec<(PathBuf, ScoredDetection)> = all_scored
-        .iter()
+        .into_iter()
         .filter(|(_, s)| s.status == DetectionStatus::Valid)
-        .cloned()
         .collect();
     valid.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -145,15 +157,13 @@ async fn run_pipeline(
     let mut selected: Vec<(PathBuf, ScoredDetection)> = Vec::new();
     let mut used_frames = std::collections::HashSet::new();
 
-    for (path, scored) in &valid {
+    for (path, scored) in valid {
         if selected.len() >= count as usize {
             break;
         }
-        if used_frames.contains(path) {
-            continue;
+        if used_frames.insert(path.clone()) {
+            selected.push((path, scored));
         }
-        selected.push((path.clone(), scored.clone()));
-        used_frames.insert(path.clone());
     }
 
     // Fallback: no valid detections
@@ -206,31 +216,6 @@ async fn run_pipeline(
             save_jpeg(&raw_cropped, &raw_path)?;
         }
 
-        // Generate debug image
-        let detections_for_frame: Vec<&ScoredDetection> = all_scored
-            .iter()
-            .filter(|(p, _)| p == frame_path)
-            .map(|(_, s)| s)
-            .collect();
-
-        let debug_img = debug::render_debug(
-            &img,
-            &detections_for_frame
-                .iter()
-                .map(|s| (*s).clone())
-                .collect::<Vec<_>>(),
-            Some(scored),
-            &person_crop,
-        );
-
-        let debug_name = if count > 1 {
-            format!("{}thumbnail_option_{}_debug.jpg", output_stem, idx + 1)
-        } else {
-            format!("{}thumbnail_debug.jpg", output_stem)
-        };
-        let debug_path = output_dir.join(&debug_name);
-        save_jpeg(&debug_img, &debug_path)?;
-
         // Crop → grade → logo
         let mut result = crop_image(&img, &person_crop);
         grading::apply_color_grading(&mut result);
@@ -252,10 +237,11 @@ async fn run_pipeline(
         output_paths.push(abs.to_string_lossy().to_string());
 
         println!(
-            "[thumbnail] Generated thumbnail {}/{}: score={:.3}",
+            "[thumbnail] Generated thumbnail {}/{}: score={:.3} {}",
             idx + 1,
             selected.len(),
-            scored.score
+            scored.score,
+            scored.details
         );
     }
 

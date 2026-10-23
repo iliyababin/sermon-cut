@@ -31,8 +31,6 @@ urlencoding = "2.1"
 ort = "2.0.0-rc.11"
 ndarray = "0.17"
 image = { version = "0.25", features = ["jpeg", "png"] }
-imageproc = "0.25"
-ab_glyph = "0.2"
 tempfile = "3.14"
 tauri-plugin-updater = "2.0"
 tauri-plugin-process = "2.0"

@@ -115,9 +115,24 @@ pub async fn set_thumbnail(
     path: &Path,
 ) -> Result<(), UploadError> {
     let data = tokio::fs::read(path).await.map_err(|e| UploadError::File(e.to_string()))?;
-    let mime = match content_type(path) {
-        "image/png" => "image/png",
-        _ => "image/jpeg",
+    // Within YouTube's limits (1280×720, under 2 MB), in memory: the file
+    // stays as the user made it.
+    let copy = data.clone();
+    let fitted = tokio::task::spawn_blocking(move || crate::thumbnail::fit_for_youtube(&copy))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+    let (data, mime) = match fitted {
+        Ok(jpeg) => (jpeg, "image/jpeg"),
+        Err(e) => {
+            // Let YouTube judge it; a refusal becomes an upload warning.
+            println!("[upload] Sending the thumbnail as it is ({})", e);
+            let mime = match content_type(path) {
+                "image/png" => "image/png",
+                _ => "image/jpeg",
+            };
+            (data, mime)
+        }
     };
     println!("[upload] Setting thumbnail for {} ({} bytes)", video_id, data.len());
     let resp = http

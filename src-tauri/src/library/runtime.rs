@@ -1688,7 +1688,7 @@ impl Library {
         let name = format!("{}{}.jpg", RENDERED_PREFIX, uuid::Uuid::new_v4().simple());
         let tmp = dir.join(format!("{}{}", name, fsutil::TMP_MARKER));
         let out = tmp.clone();
-        blocking(move || crate::thumbnail::save_png_as_jpeg(&png_bytes, &out)).await??;
+        blocking(move || crate::thumbnail::save_for_youtube(&png_bytes, &out)).await??;
 
         let committed = self.with_entry(id, |g, _| {
             // Processing may have started (or the options changed) meanwhile.

@@ -136,8 +136,8 @@ export function ThumbnailGenerator() {
     if (!savedPath) return;
 
     const destination = await save({
-      defaultPath: "thumbnail.png",
-      filters: [{ name: "PNG Image", extensions: ["png"] }],
+      defaultPath: "thumbnail.jpg",
+      filters: [{ name: "JPEG Image", extensions: ["jpg", "jpeg"] }],
     });
 
     if (destination) {

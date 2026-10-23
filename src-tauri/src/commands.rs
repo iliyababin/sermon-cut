@@ -444,17 +444,22 @@ pub async fn crop_standalone_thumbnail(
         .await
 }
 
-/// Save a thumbnail rendered in the Thumbnail tab, as the PNG it is.
+/// Save a thumbnail rendered in the Thumbnail tab, as a JPEG within
+/// YouTube's limits so the exported file can be uploaded as is.
 #[tauri::command]
 pub async fn save_standalone_thumbnail(
     app_handle: AppHandle,
     image_data: Vec<u8>,
 ) -> Result<String, String> {
     let path = standalone_dir(&app_handle)?.join(format!(
-        "thumbnail_{}.png",
+        "thumbnail_{}.jpg",
         chrono::Utc::now().timestamp_millis()
     ));
-    std::fs::write(&path, &image_data).map_err(|e| format!("Failed to save thumbnail: {}", e))?;
+    let out = path.clone();
+    tokio::task::spawn_blocking(move || crate::thumbnail::save_for_youtube(&image_data, &out))
+        .await
+        .map_err(|e| format!("Background task failed: {}", e))?
+        .map_err(|e| format!("Failed to save thumbnail: {}", e))?;
     Ok(path.to_string_lossy().to_string())
 }
 

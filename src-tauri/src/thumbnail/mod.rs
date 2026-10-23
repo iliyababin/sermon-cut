@@ -1,6 +1,7 @@
 mod color;
 mod crop;
 mod debug;
+mod fit;
 mod frames;
 mod grading;
 mod logo;
@@ -8,6 +9,7 @@ mod scoring;
 mod yolo;
 
 pub use crop::CropRect;
+pub use fit::fit_for_youtube;
 
 use image::RgbImage;
 use scoring::{score_detection, DetectionStatus, ScoredDetection};
@@ -59,13 +61,11 @@ fn save_jpeg(img: &RgbImage, path: &Path) -> Result<(), String> {
     std::fs::write(path, &buf).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
-/// Decode PNG bytes (as produced by html2canvas in the webview) and re-encode
-/// them as a JPEG, so rendered template thumbnails match the pipeline's format.
-pub fn save_png_as_jpeg(png_bytes: &[u8], output_path: &Path) -> Result<(), String> {
-    let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)
-        .map_err(|e| format!("Failed to decode PNG: {}", e))?;
-    let rgb = img.to_rgb8();
-    save_jpeg(&rgb, output_path)
+/// Save image bytes (a template render from the webview) as a JPEG within
+/// YouTube's thumbnail limits.
+pub fn save_for_youtube(bytes: &[u8], output_path: &Path) -> Result<(), String> {
+    let jpeg = fit_for_youtube(bytes)?;
+    std::fs::write(output_path, &jpeg).map_err(|e| format!("Failed to write {}: {}", output_path.display(), e))
 }
 
 /// Core pipeline: detect → score → pick best → crop → grade → logo → save.
@@ -370,7 +370,10 @@ pub async fn process_custom_thumbnail(
         logo::apply_logo_overlay(&mut result, lp);
     }
 
-    save_jpeg(&result, &output_path)?;
+    // Within YouTube's limits: a phone photo crop is far bigger than 1280×720.
+    let jpeg = fit::encode_for_youtube(&result)?;
+    std::fs::write(&output_path, &jpeg)
+        .map_err(|e| format!("Failed to write {}: {}", output_path.display(), e))?;
     println!(
         "[thumbnail] Saved custom thumbnail to: {}",
         output_path.display()

@@ -316,34 +316,7 @@ pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
 #[tauri::command]
 pub async fn open_file(app_handle: AppHandle, lib: State<'_, LibraryHandle>, path: String) -> Result<(), String> {
     let path = check_path(&app_handle, &lib, &path, Access::Open)?;
-    println!("[open_file] Opening file: {}", path.display());
-
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {}", e))?;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {}", e))?;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {}", e))?;
-    }
-
-    Ok(())
+    crate::tools::os_open(crate::tools::OsOpen::File(&path))
 }
 
 #[tauri::command]
@@ -355,51 +328,10 @@ pub async fn open_folder(app_handle: AppHandle, lib: State<'_, LibraryHandle>, p
 /// Open a folder (or a file's folder) in the file manager, unchecked: for
 /// paths the backend chose itself.
 pub fn open_folder_path(path: String) -> Result<(), String> {
-    println!("[open_folder] Requested path: {}", path);
-
-    let folder_path = std::path::Path::new(&path);
-
-    // Get parent directory if path is a file
-    let folder = if folder_path.is_file() {
-        folder_path.parent().unwrap_or(folder_path)
-    } else {
-        folder_path
-    };
-
-    println!("[open_folder] Opening folder: {}", folder.display());
-
-    #[cfg(target_os = "linux")]
-    {
-        let result = std::process::Command::new("xdg-open")
-            .arg(folder)
-            .spawn();
-
-        match result {
-            Ok(_) => println!("[open_folder] xdg-open spawned successfully"),
-            Err(e) => {
-                println!("[open_folder] xdg-open failed: {}", e);
-                return Err(format!("Failed to open folder: {}", e));
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(folder)
-            .spawn()
-            .map_err(|e| format!("Failed to open folder: {}", e))?;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("explorer")
-            .arg(folder)
-            .spawn()
-            .map_err(|e| format!("Failed to open folder: {}", e))?;
-    }
-
-    Ok(())
+    let path = Path::new(&path);
+    // A file: its folder.
+    let folder = if path.is_file() { path.parent().unwrap_or(path) } else { path };
+    crate::tools::os_open(crate::tools::OsOpen::Folder(folder))
 }
 
 /// Safe to call repeatedly (e.g. after every scan, in case the library's

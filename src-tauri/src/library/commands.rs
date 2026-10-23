@@ -271,13 +271,7 @@ pub async fn open_library_folder(lib: State<'_, LibraryHandle>) -> Result<(), St
 }
 
 fn reveal(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg("-R").arg(path).spawn();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
-    #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
-    result.map(|_| ()).map_err(|e| format!("Failed to open Finder: {}", e))
+    crate::tools::os_open(crate::tools::OsOpen::Reveal(path))
 }
 
 #[tauri::command]

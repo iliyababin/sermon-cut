@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 #[cfg(target_os = "macos")]
@@ -136,4 +137,83 @@ pub fn ffmpeg_for_tests() -> bool {
     }
     eprintln!("skipping: {} not found", missing.join(" and "));
     false
+}
+
+/// Something to show with the system's own apps.
+#[derive(Debug, Clone, Copy)]
+pub enum OsOpen<'a> {
+    /// A web page, in the default browser.
+    Url(&'a str),
+    /// A file, in its default app.
+    File(&'a Path),
+    /// A folder, in the file manager.
+    Folder(&'a Path),
+    /// A file, selected in its folder in the file manager (on Linux, its
+    /// folder is opened).
+    Reveal(&'a Path),
+}
+
+/// The program and arguments that show `target` on this system.
+fn os_open_command(target: OsOpen<'_>) -> (&'static str, Vec<OsString>) {
+    let os = |s: &str| OsString::from(s);
+    if cfg!(target_os = "macos") {
+        match target {
+            OsOpen::Url(url) => ("open", vec![os(url)]),
+            OsOpen::File(p) | OsOpen::Folder(p) => ("open", vec![p.into()]),
+            OsOpen::Reveal(p) => ("open", vec![os("-R"), p.into()]),
+        }
+    } else if cfg!(target_os = "windows") {
+        match target {
+            OsOpen::Url(url) => ("rundll32", vec![os("url.dll,FileProtocolHandler"), os(url)]),
+            OsOpen::File(p) => ("cmd", vec![os("/C"), os("start"), os(""), p.into()]),
+            OsOpen::Folder(p) => ("explorer", vec![p.into()]),
+            OsOpen::Reveal(p) => {
+                let mut select = os("/select,");
+                select.push(p);
+                ("explorer", vec![select])
+            }
+        }
+    } else {
+        match target {
+            OsOpen::Url(url) => ("xdg-open", vec![os(url)]),
+            OsOpen::File(p) | OsOpen::Folder(p) => ("xdg-open", vec![p.into()]),
+            OsOpen::Reveal(p) => ("xdg-open", vec![p.parent().unwrap_or(p).into()]),
+        }
+    }
+}
+
+/// Show `target` with the system's own apps (browser, default app, file
+/// manager). Doesn't wait for them.
+pub fn os_open(target: OsOpen<'_>) -> Result<(), String> {
+    let (program, args) = os_open_command(target);
+    std::process::Command::new(program).args(args).spawn().map(|_| ()).map_err(|e| {
+        let what = match target {
+            OsOpen::Url(_) => "the browser",
+            OsOpen::File(_) => "the file",
+            OsOpen::Folder(_) => "the folder",
+            OsOpen::Reveal(_) => "the file manager",
+        };
+        format!("Failed to open {}: {}", what, e)
+    })
+}
+
+#[cfg(test)]
+mod os_open_tests {
+    use super::*;
+
+    #[test]
+    fn each_target_has_its_command() {
+        let p = Path::new("/lib/Sunday service.mp4");
+        let args = |t| os_open_command(t).1.into_iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>();
+        if cfg!(target_os = "macos") {
+            assert_eq!(os_open_command(OsOpen::Reveal(p)).0, "open");
+            assert_eq!(args(OsOpen::Reveal(p)), ["-R", "/lib/Sunday service.mp4"]);
+            assert_eq!(args(OsOpen::File(p)), ["/lib/Sunday service.mp4"]);
+            assert_eq!(args(OsOpen::Url("https://youtu.be/x")), ["https://youtu.be/x"]);
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(args(OsOpen::Reveal(p)), ["/lib"]);
+        }
+        // The path is one argument, never split or read as an option.
+        assert_eq!(args(OsOpen::Folder(p)).last().unwrap(), "/lib/Sunday service.mp4");
+    }
 }

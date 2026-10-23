@@ -121,15 +121,7 @@ impl OAuthFlow {
 }
 
 fn open_in_browser(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
-    result.map(|_| ()).map_err(|e| format!("Failed to open browser: {}", e))
+    crate::tools::os_open(crate::tools::OsOpen::Url(url))
 }
 
 /// Only one sign-in listens at a time: starting one cancels the one before

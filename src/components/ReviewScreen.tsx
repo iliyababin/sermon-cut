@@ -19,6 +19,8 @@ import {
   youtubeUpdateMetadata,
   UPLOAD_CANCELLED,
   UPLOAD_CANCELLED_MAYBE_FINISHED,
+  forgetUploadSession,
+  UPLOAD_CHECK_FAILED,
 } from "@/lib/tauri";
 import { UploadWarnings } from "./UploadWarnings";
 import { renderThumbnailBatch } from "@/lib/thumbnailRenderer";
@@ -518,6 +520,30 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
   const handleUpload = () => dispatch({ type: "upload", ready: uploadReady });
 
+  // The earlier upload attempt can't be checked with YouTube, again and
+  // again (e.g. it was made from another account): offer to forget it.
+  const [checkFailures, setCheckFailures] = useState(0);
+  useEffect(() => {
+    if (phase.kind === "error") setCheckFailures((n) => (phase.message === UPLOAD_CHECK_FAILED ? n + 1 : 0));
+    else if (phase.kind === "done") setCheckFailures(0);
+  }, [phase]);
+  const [forgetError, setForgetError] = useState<string | null>(null);
+  const handleForgetEarlier = async () => {
+    const yes = await ask(
+      "Sermon Cut couldn't check the earlier upload attempt with YouTube (for example, it was made while signed in to another account).\n\nForget it and start a new upload? If that earlier upload did finish, this makes a second, duplicate video on YouTube.",
+      { title: "Forget the earlier upload attempt", kind: "warning", okLabel: "Forget and Upload Anew", cancelLabel: "Cancel" }
+    );
+    if (!yes) return;
+    try {
+      setForgetError(null);
+      await forgetUploadSession(video.id);
+      setCheckFailures(0);
+      handleUpload();
+    } catch (err) {
+      setForgetError(errorMessage(err, "Couldn't forget the earlier upload attempt"));
+    }
+  };
+
   // An earlier upload had finished: give that video the current title and
   // description (videos.update).
   const [updatingMetadata, setUpdatingMetadata] = useState(false);
@@ -800,13 +826,24 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
             <AlertCircle className="w-6 h-6 text-destructive" />
             <span className="text-destructive">{phase.message}</span>
           </div>
-          <button
-            onClick={handleUpload}
-            disabled={!uploadReady}
-            className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
-          >
-            Retry
-          </button>
+          <div className="flex items-center gap-2">
+            {checkFailures >= 2 && (
+              <button
+                onClick={handleForgetEarlier}
+                disabled={!uploadReady}
+                className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 disabled:opacity-50 transition-colors"
+              >
+                Forget the earlier upload attempt
+              </button>
+            )}
+            <button
+              onClick={handleUpload}
+              disabled={!uploadReady}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
+            >
+              Retry
+            </button>
+          </div>
         </div>
       )}
 
@@ -831,6 +868,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
         </div>
       )}
       {saveError && <ErrorBanner className="mx-4 mt-4" message={saveError} />}
+      {forgetError && <ErrorBanner className="mx-4 mt-4" message={forgetError} onDismiss={() => setForgetError(null)} />}
       {actionError && (
         <ErrorBanner
           className="mx-4 mt-4"

@@ -2490,6 +2490,24 @@ impl Library {
         g.save_logged();
     }
 
+    /// Forget the stored upload session at the user's word, when it can't be
+    /// checked with YouTube (e.g. it belongs to another account). The one
+    /// way a session goes without a definite answer (docs/INVARIANTS.md #8):
+    /// the next upload starts a new one, which may duplicate the earlier
+    /// upload if that had finished. Refused while the video is busy.
+    pub fn forget_upload_session(&self, id: &str) -> Result<(), String> {
+        let mut g = self.inner();
+        g.writable()?;
+        if g.is_busy(id) {
+            return Err("Wait until this video's upload or processing has stopped.".into());
+        }
+        let e = g.entry_mut(id)?;
+        if e.upload_session.take().is_none() {
+            return Ok(());
+        }
+        g.save()
+    }
+
     /// The video is on YouTube: record it and drop the session, in one
     /// save, before the post-upload steps. Recording the same video twice
     /// keeps one record.
@@ -3318,6 +3336,24 @@ mod tests {
         let v = reopened.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(v.uploads.iter().filter_map(|u| u.video_id.as_deref()).collect::<Vec<_>>(), ["vid1"]);
         assert_eq!(server.with(|s| s.creates), 1);
+    }
+
+    #[test]
+    fn an_upload_session_can_be_forgotten_when_not_uploading() {
+        let (_t, lib, id, _dir) = processed_library();
+        let session = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1".into(), "h", 5, "m");
+        lib.set_upload_session(&id, Some(&session));
+        let job = lib.begin_upload(&id, None, None).unwrap();
+        assert!(lib.forget_upload_session(&id).is_err(), "not during an upload");
+        assert_eq!(lib.upload_session(&id), Some(session));
+        lib.finish_upload(&id, job, None, &public());
+        lib.forget_upload_session(&id).unwrap();
+        assert_eq!(lib.upload_session(&id), None);
+        // Saved: a reopen doesn't bring it back.
+        let reopened = Library::new(lib.root().unwrap().to_string_lossy().to_string());
+        reopened.open_blocking(true);
+        assert_eq!(reopened.upload_session(&id), None);
+        lib.forget_upload_session(&id).unwrap();
     }
 
     #[test]

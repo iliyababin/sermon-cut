@@ -177,6 +177,15 @@ pub fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_webview_knows_the_messages_it_acts_on() {
+        // src/lib/tauri.ts compares errors with these.
+        let ts = include_str!("../../../src/lib/tauri.ts");
+        for message in [CHECK_FAILED, CANCELLED_MAYBE_FINISHED] {
+            assert!(ts.contains(&format!("\"{}\"", message)), "{message}");
+        }
+    }
+
     fn api_error(status: u16, reason: &str) -> UploadError {
         let body = format!(r#"{{"error":{{"code":{},"message":"m","errors":[{{"reason":"{}"}}]}}}}"#, status, reason);
         UploadError::from_response(status, body, None, false)

@@ -51,6 +51,10 @@ this file in the same commit and say why.
    it. A finished session (200/201) is recorded, never re-uploaded. The one
    exception is a session URI that isn't YouTube's upload server
    (`UploadSession::is_trusted`): it is dropped without being contacted.
+   The other is the user's choice: when the check keeps failing (e.g. the
+   session is another account's), the review offers "Forget the earlier
+   upload attempt" after a warning that it may make a duplicate
+   (`Library::forget_upload_session`).
 9. Sessions are settled in one place: when the next upload begins
    (`client::Uploader::settle`). A re-trim, an edit or a cancel never drops
    a session. A finished session for other metadata or an earlier cut is

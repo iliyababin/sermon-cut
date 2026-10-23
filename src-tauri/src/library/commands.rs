@@ -260,6 +260,16 @@ pub async fn reveal_video(lib: State<'_, LibraryHandle>, video_id: String) -> Re
     reveal(&path)
 }
 
+/// Forget an earlier upload attempt that can't be checked with YouTube, so
+/// the next upload starts afresh (the webview confirms first: it may make a
+/// duplicate).
+#[tauri::command]
+pub async fn forget_upload_session(lib: State<'_, LibraryHandle>, app_handle: AppHandle, video_id: String) -> Result<(), String> {
+    let result = off_thread(&lib, move |lib| lib.forget_upload_session(&video_id)).await;
+    changed(&app_handle);
+    result
+}
+
 /// Show a video's unfinished commit backup in Finder (see `STUCK_COMMIT`).
 #[tauri::command]
 pub async fn reveal_commit_backup(lib: State<'_, LibraryHandle>, video_id: String) -> Result<(), String> {

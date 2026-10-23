@@ -19,6 +19,7 @@ vi.mock("./ThumbnailEditor", () => ({ ThumbnailEditor: () => null }));
 
 import { ReviewScreen } from "./ReviewScreen";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { UPLOAD_CHECK_FAILED } from "@/lib/tauri";
 
 const TITLE = "The Hope We Have";
 const PREACHER = "Pastor X";
@@ -172,6 +173,29 @@ describe("ReviewScreen", () => {
     expect(headers.headers["x-render-key"]).toBe(
       renderKey(options[0], { title: TITLE, preacher: PREACHER, singleLine: false, logo: "/me/logo.png" })
     );
+  });
+
+  it("offers to forget an earlier upload attempt that keeps failing its check", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "youtube_upload_video" ? Promise.reject(UPLOAD_CHECK_FAILED) : base(cmd, args)
+    );
+    vi.mocked(ask).mockClear();
+    render(<ReviewScreen video={video()} onBack={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^upload$/i }));
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    // Once could be the connection: no offer yet.
+    expect(screen.queryByRole("button", { name: "Forget the earlier upload attempt" })).toBeNull();
+    fireEvent.click(retry);
+    const forget = await screen.findByRole("button", { name: "Forget the earlier upload attempt" });
+    fireEvent.click(forget);
+    await waitFor(() => expect(calls("forget_upload_session")).toHaveLength(1));
+    expect(calls("forget_upload_session")[0][1]).toEqual({ videoId: "vid1" });
+    // Warned about a duplicate before anything was forgotten.
+    const warning = vi.mocked(ask).mock.calls.find(([text]) => String(text).includes("duplicate"));
+    expect(warning).toBeTruthy();
+    // Then a fresh upload (confirmed as usual).
+    await waitFor(() => expect(calls("youtube_upload_video")).toHaveLength(3));
   });
 
   it("sends one upload for a double-click", async () => {

@@ -220,6 +220,17 @@ export async function youtubeUploadVideo(
   });
 }
 
+/** An earlier upload attempt couldn't be checked with YouTube, so nothing
+ * was sent (UploadError::CheckFailed). */
+export const UPLOAD_CHECK_FAILED =
+  "Couldn't check the earlier upload with YouTube, so nothing was sent. Check the internet connection and try again.";
+
+/** Forget the video's earlier upload attempt, so the next upload starts a
+ * new one (it may duplicate the earlier upload if that had finished). */
+export async function forgetUploadSession(videoId: string): Promise<void> {
+  return invoke("forget_upload_session", { videoId });
+}
+
 /** What a cancelled upload rejects with (UploadError::Cancelled). */
 export const UPLOAD_CANCELLED = "Upload cancelled.";
 /** A cancel during the last chunk that couldn't tell whether it arrived

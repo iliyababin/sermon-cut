@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ImagePlus,
@@ -31,8 +31,6 @@ export function ThumbnailGenerator() {
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const canvasContainerRef = useRef<HTMLDivElement>(null);
-
   const {
     canvasRef,
     loadImage,
@@ -46,28 +44,6 @@ export function ThumbnailGenerator() {
     imageLoaded,
     handlers,
   } = useCanvasEditor({ aspectRatio: 16 / 9 });
-
-  // Set canvas size on mount and resize
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const container = canvasContainerRef.current;
-    if (!canvas || !container) return;
-
-    const updateSize = () => {
-      const rect = container.getBoundingClientRect();
-      const width = rect.width;
-      const height = width / (16 / 9);
-      canvas.width = width;
-      canvas.height = height;
-    };
-
-    updateSize();
-
-    const observer = new ResizeObserver(updateSize);
-    observer.observe(container);
-
-    return () => observer.disconnect();
-  }, [canvasRef]);
 
   // Load image into canvas when imagePath changes
   useEffect(() => {
@@ -166,8 +142,7 @@ export function ThumbnailGenerator() {
               <>
                 {/* Canvas crop editor */}
                 <div
-                  ref={canvasContainerRef}
-                  className="relative bg-black rounded-lg overflow-hidden"
+                        className="relative bg-black rounded-lg overflow-hidden"
                   style={{ aspectRatio: "16/9" }}
                 >
                   <canvas

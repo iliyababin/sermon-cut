@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useCanvasEditor } from "@/hooks/useCanvasEditor";
 import { readImageBase64, processCustomThumbnail } from "@/lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -42,8 +42,6 @@ export function ThumbnailEditor({
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const canvasContainerRef = useRef<HTMLDivElement>(null);
-
   const {
     canvasRef,
     loadImage,
@@ -57,28 +55,6 @@ export function ThumbnailEditor({
     imageLoaded,
     handlers,
   } = useCanvasEditor({ aspectRatio: 16 / 9 });
-
-  // Set canvas size on mount and resize
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const container = canvasContainerRef.current;
-    if (!canvas || !container) return;
-
-    const updateSize = () => {
-      const rect = container.getBoundingClientRect();
-      const width = rect.width;
-      const height = width / (16 / 9);
-      canvas.width = width;
-      canvas.height = height;
-    };
-
-    updateSize();
-
-    const observer = new ResizeObserver(updateSize);
-    observer.observe(container);
-
-    return () => observer.disconnect();
-  }, [canvasRef]);
 
   // Load the chosen source: a generated option's plain crop (no logo or
   // grading burned in) when there is one, else the option itself.
@@ -191,7 +167,6 @@ export function ThumbnailEditor({
         <div className="flex-1 overflow-auto p-6 space-y-6">
           {/* Canvas Preview */}
           <div
-            ref={canvasContainerRef}
             className="relative bg-black rounded-lg overflow-hidden"
             style={{ aspectRatio: "16/9" }}
           >

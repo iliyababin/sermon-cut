@@ -18,11 +18,20 @@ interface ImageDimensions {
  * always kept inside the image (`clampCropToImage`); the canvas draws the
  * image so that the crop fills a fixed frame. So what's in the frame is
  * exactly what gets cut, whatever the canvas size.
+ *
+ * `canvasRef` is a callback ref: the canvas may mount later (or be
+ * replaced), and it is sized from its CSS box times devicePixelRatio,
+ * redrawn whenever that box changes.
  */
 export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
   const { aspectRatio = 16 / 9, maxZoom = 5 } = options;
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [canvas, setCanvas] = useState<HTMLCanvasElement | null>(null);
+  // The canvas's CSS size; drawing works in CSS pixels.
+  const [size, setSize] = useState({ width: 0, height: 0, dpr: 1 });
+  const canvasRef = useCallback((node: HTMLCanvasElement | null) => {
+    setCanvas(node);
+  }, []);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const [imageDimensions, setImageDimensions] = useState<ImageDimensions | null>(null);
   const [crop, setCrop] = useState<Rect | null>(null);
@@ -74,25 +83,21 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
     [aspectRatio]
   );
 
-  /** Canvas pixels per image pixel. */
+  /** CSS pixels per image pixel. */
   const scaleOf = useCallback(
-    (c: Rect): number => {
-      const canvas = canvasRef.current;
-      if (!canvas) return 1;
-      return frameIn(canvas.width, canvas.height).width / c.width;
-    },
-    [frameIn]
+    (c: Rect): number => (size.width > 0 ? frameIn(size.width, size.height).width / c.width : 1),
+    [frameIn, size]
   );
 
   // Draw the canvas
   const draw = useCallback(() => {
-    const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     const img = imageRef.current;
-    if (!canvas || !ctx || !img || !crop) return;
+    if (!canvas || !ctx || !img || !crop || size.width === 0) return;
 
-    const w = canvas.width;
-    const h = canvas.height;
+    ctx.setTransform(size.dpr, 0, 0, size.dpr, 0, 0);
+    const w = size.width;
+    const h = size.height;
     const frame = frameIn(w, h);
     const scale = frame.width / crop.width;
 
@@ -124,7 +129,7 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
       ctx.lineTo(frame.x + frame.width, frame.y + (frame.height / 3) * i);
       ctx.stroke();
     }
-  }, [crop, frameIn]);
+  }, [canvas, crop, frameIn, size]);
 
   // The crop in source image pixels, for the backend.
   const getCropRect = useCallback((): CropRect | null => {
@@ -200,15 +205,37 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
   const handleMouseUp = useCallback(() => setIsDragging(false), []);
   const handleMouseLeave = useCallback(() => setIsDragging(false), []);
 
-  const handleWheel = useCallback(
-    (e: React.WheelEvent<HTMLCanvasElement>) => {
-      e.preventDefault();
-      setZoom(zoom * (e.deltaY > 0 ? 0.9 : 1.1));
-    },
-    [zoom, setZoom]
-  );
+  // Wheel zoom. React's onWheel is passive, so it can't stop the page
+  // scrolling; a native non-passive listener can.
+  const onWheel = useRef((_deltaY: number) => {});
+  onWheel.current = (deltaY: number) => setZoom(zoom * (deltaY > 0 ? 0.9 : 1.1));
 
-  // Redraw when the crop changes
+  // Size the backing store to the CSS box at the display's pixel ratio.
+  useEffect(() => {
+    if (!canvas) return;
+    const resize = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      setSize({ width, height, dpr });
+    };
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(canvas);
+    const wheel = (e: WheelEvent) => {
+      e.preventDefault();
+      onWheel.current(e.deltaY);
+    };
+    canvas.addEventListener("wheel", wheel, { passive: false });
+    return () => {
+      observer.disconnect();
+      canvas.removeEventListener("wheel", wheel);
+    };
+  }, [canvas]);
+
+  // Redraw when the crop or the canvas size changes
   useEffect(() => {
     if (imageLoaded) draw();
   }, [draw, imageLoaded]);
@@ -230,7 +257,6 @@ export function useCanvasEditor(options: UseCanvasEditorOptions = {}) {
       onMouseMove: handleMouseMove,
       onMouseUp: handleMouseUp,
       onMouseLeave: handleMouseLeave,
-      onWheel: handleWheel,
     },
   };
 }

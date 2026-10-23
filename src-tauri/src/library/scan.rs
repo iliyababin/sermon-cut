@@ -5,6 +5,7 @@
 //! `reconcile` applies the observations to the manifest (pure, fast).
 
 use super::fsutil::{self, Completeness};
+use super::manifest::Orphan;
 use super::{is_candidate_video, match_key, Entry, EntryStatus, Fingerprint};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -281,6 +282,19 @@ pub fn reconcile(
     busy: &HashSet<String>,
     previously_present: Option<&HashSet<String>>,
 ) -> Reconciled {
+    reconcile_adopting(entries, obs, busy, previously_present, &mut HashMap::new())
+}
+
+/// `reconcile`, where a new file whose hash is an orphaned video folder's
+/// (library.json was lost) gets that folder's id back, so its transcript,
+/// trim and thumbnails are kept. Adopted orphans are removed from the map.
+pub fn reconcile_adopting(
+    entries: &mut Vec<Entry>,
+    obs: &[FileObs],
+    busy: &HashSet<String>,
+    previously_present: Option<&HashSet<String>>,
+    orphans: &mut HashMap<String, Orphan>,
+) -> Reconciled {
     let mut r = Reconciled::default();
     let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
@@ -405,7 +419,7 @@ pub fn reconcile(
     }
     for o in new_files {
         let Some(hash) = o.hash.as_ref() else { continue };
-        let entry = Entry::new(
+        let mut entry = Entry::new(
             o.name.clone(),
             Fingerprint {
                 size: o.size,
@@ -414,6 +428,12 @@ pub fn reconcile(
             },
             o.duration,
         );
+        if let Some(orphan) = orphans.remove(hash) {
+            entry.id = orphan.id;
+            if orphan.has_results {
+                entry.status = EntryStatus::ReadyForReview;
+            }
+        }
         claimed.insert(entries.len());
         r.present.insert(entry.id.clone());
         entries.push(entry);
@@ -599,6 +619,26 @@ mod tests {
         assert!(r.replaced.is_empty());
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].status, EntryStatus::Done);
+    }
+
+    #[test]
+    fn new_files_adopt_orphaned_folders_by_hash() {
+        let orphan_id = crate::library::new_id();
+        let mut orphans: HashMap<String, Orphan> =
+            [("h1".to_string(), Orphan { id: orphan_id.clone(), has_results: true })].into();
+        let mut entries = vec![];
+        reconcile_adopting(
+            &mut entries,
+            &[ready("a.mp4", 10, 1, "h1"), ready("b.mp4", 10, 1, "h2")],
+            &HashSet::new(),
+            None,
+            &mut orphans,
+        );
+        assert!(orphans.is_empty());
+        let a = entries.iter().find(|e| e.file_name == "a.mp4").unwrap();
+        assert_eq!((a.id.as_str(), a.status), (orphan_id.as_str(), EntryStatus::ReadyForReview));
+        let b = entries.iter().find(|e| e.file_name == "b.mp4").unwrap();
+        assert_eq!(b.status, EntryStatus::New);
     }
 
     #[test]

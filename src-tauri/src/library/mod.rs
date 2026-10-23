@@ -234,6 +234,11 @@ impl LibraryPaths {
         self.data_dir().join("library.json")
     }
 
+    /// The last library.json that could be read, kept by every save.
+    pub fn manifest_backup(&self) -> PathBuf {
+        self.data_dir().join("library.json.bak")
+    }
+
     pub fn lock_file(&self) -> PathBuf {
         self.data_dir().join("lock.json")
     }

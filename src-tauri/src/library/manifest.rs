@@ -4,7 +4,7 @@ use super::fsutil::{self, ReadJsonError};
 use super::{is_valid_file_name, is_valid_id, Entry, EntryStatus, LibraryPaths, FORMAT_VERSION, MIN_APP_VERSION, SCHEMA_VERSION};
 use crate::state::TranscriptionResult;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const MAX_MANIFEST_BYTES: u64 = 10 * 1024 * 1024;
@@ -54,8 +54,15 @@ pub enum Loaded {
     /// Written by a newer app version: show it, but never write to it.
     /// Carries the app version it asks for, if it says.
     Newer(Manifest, Option<String>),
-    /// Unreadable; it was moved aside to the given name and a fresh one started.
-    Corrupt(Manifest, String),
+    /// Unreadable; it was moved aside to the given name. The list comes from
+    /// library.json.bak when `restored`, else it starts empty.
+    Corrupt(Manifest, String, bool),
+    /// library.json was missing but videos/ has content; restored from
+    /// library.json.bak.
+    Restored(Manifest),
+    /// library.json was missing and there was no usable backup; the list
+    /// starts empty (scans adopt the orphaned video folders).
+    Lost(Manifest),
     /// Unreadable, and it couldn't be set aside either: open read-only so
     /// it is never overwritten.
     Stuck(String),
@@ -118,33 +125,66 @@ pub fn load(paths: &LibraryPaths) -> Result<Loaded, String> {
     let path = paths.manifest();
     let bytes = match fsutil::read_limited(&path, MAX_MANIFEST_BYTES) {
         Ok(b) => b,
-        Err(ReadJsonError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Loaded::Ok(Manifest::default()))
-        }
+        Err(ReadJsonError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(recover_missing(paths)),
         Err(ReadJsonError::Io(e)) => return Err(format!("Can't read {}: {}", path.display(), e)),
-        Err(e) => return Ok(set_aside(&path, &e.to_string())),
+        Err(e) => return Ok(with_backup(paths, set_aside(&path, &e.to_string()))),
     };
+    match parse(&bytes) {
+        Ok(loaded) => Ok(loaded),
+        Err(e) => Ok(with_backup(paths, set_aside(&path, &e))),
+    }
+}
 
-    if let Ok(v) = serde_json::from_slice::<VersionOnly>(&bytes) {
+/// The backup, if it can be read and written back by this version.
+fn read_backup(paths: &LibraryPaths) -> Option<Manifest> {
+    let bytes = fsutil::read_limited(&paths.manifest_backup(), MAX_MANIFEST_BYTES).ok()?;
+    match parse(&bytes) {
+        Ok(Loaded::Ok(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// After an unreadable library.json was set aside: the backup's list.
+fn with_backup(paths: &LibraryPaths, loaded: Loaded) -> Loaded {
+    match loaded {
+        Loaded::Corrupt(_, aside, _) => match read_backup(paths) {
+            Some(m) => Loaded::Corrupt(m, aside, true),
+            None => Loaded::Corrupt(Manifest::default(), aside, false),
+        },
+        other => other,
+    }
+}
+
+/// No library.json. A new library has nothing in videos/; otherwise the
+/// file was lost (deleted, or not synced) and the list is recovered.
+fn recover_missing(paths: &LibraryPaths) -> Loaded {
+    let has_videos = std::fs::read_dir(paths.videos_dir()).is_ok_and(|mut d| d.next().is_some());
+    if !has_videos {
+        return Loaded::Ok(Manifest::default());
+    }
+    match read_backup(paths) {
+        Some(m) => Loaded::Restored(m),
+        None => Loaded::Lost(Manifest::default()),
+    }
+}
+
+fn parse(bytes: &[u8]) -> Result<Loaded, String> {
+    if let Ok(v) = serde_json::from_slice::<VersionOnly>(bytes) {
         if v.version > FORMAT_VERSION || v.schema_version.is_some_and(|s| s > SCHEMA_VERSION) {
             // Show what we can understand, but never rewrite it.
-            let mut manifest = serde_json::from_slice::<Manifest>(&bytes).unwrap_or_default();
+            let mut manifest = serde_json::from_slice::<Manifest>(bytes).unwrap_or_default();
             sanitize(&mut manifest);
             let wanted = v.min_app_version.filter(|m| m.len() <= 32 && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'));
             return Ok(Loaded::Newer(manifest, wanted));
         }
     }
 
-    match serde_json::from_slice::<Manifest>(&bytes) {
-        Ok(mut manifest) => {
-            sanitize(&mut manifest);
-            manifest.version = FORMAT_VERSION;
-            manifest.schema_version = SCHEMA_VERSION;
-            manifest.min_app_version = Some(MIN_APP_VERSION.to_string());
-            Ok(Loaded::Ok(manifest))
-        }
-        Err(e) => Ok(set_aside(&path, &e.to_string())),
-    }
+    let mut manifest = serde_json::from_slice::<Manifest>(bytes).map_err(|e| e.to_string())?;
+    sanitize(&mut manifest);
+    manifest.version = FORMAT_VERSION;
+    manifest.schema_version = SCHEMA_VERSION;
+    manifest.min_app_version = Some(MIN_APP_VERSION.to_string());
+    Ok(Loaded::Ok(manifest))
 }
 
 fn set_aside(path: &Path, reason: &str) -> Loaded {
@@ -166,6 +206,7 @@ fn set_aside_to(path: &Path, aside: &Path, reason: &str, rename: impl Fn(&Path, 
         Ok(()) => Loaded::Corrupt(
             Manifest::default(),
             aside.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            false,
         ),
         Err(e) => Loaded::Stuck(format!(
             "The library's tracking file (.sermon-cut/library.json) can't be read, and Sermon Cut couldn't keep a copy of it ({}). The library is read-only so nothing is lost; move that file somewhere safe, then reopen the library.",
@@ -174,8 +215,54 @@ fn set_aside_to(path: &Path, aside: &Path, reason: &str, rename: impl Fn(&Path, 
     }
 }
 
+/// Write library.json, first keeping the current one as library.json.bak,
+/// but only if it can be read: a damaged file never replaces a good backup.
 pub fn save(paths: &LibraryPaths, manifest: &Manifest) -> Result<(), String> {
+    if let Ok(current) = fsutil::read_limited(&paths.manifest(), MAX_MANIFEST_BYTES) {
+        if serde_json::from_slice::<Manifest>(&current).is_ok() {
+            if let Err(e) = fsutil::write_atomic(&paths.manifest_backup(), &current) {
+                eprintln!("[library] Failed to update library.json.bak: {}", e);
+            }
+        }
+    }
     fsutil::write_json_atomic(&paths.manifest(), manifest)
+}
+
+/// Whether a video folder holds finished processing results.
+pub fn has_results(dir: &Path) -> bool {
+    let data = load_video_data(dir);
+    !data.thumbnail_options.is_empty() && data.trimmed_file.is_some_and(|t| dir.join(t).is_file())
+}
+
+/// A video folder no entry refers to (its library.json entry was lost),
+/// waiting for its video to show up in a scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Orphan {
+    pub id: String,
+    pub has_results: bool,
+}
+
+/// Video folders without an entry, by the file hash in their
+/// transcript.json. Folders without a transcript can't be matched.
+pub fn find_orphans(paths: &LibraryPaths, manifest: &Manifest) -> HashMap<String, Orphan> {
+    let known: HashSet<&str> = manifest.entries.iter().map(|e| e.id.as_str()).collect();
+    let mut orphans = HashMap::new();
+    let videos = paths.videos_dir();
+    if !std::fs::symlink_metadata(&videos).is_ok_and(|m| m.is_dir()) {
+        return orphans;
+    }
+    let Ok(dirs) = std::fs::read_dir(&videos) else { return orphans };
+    for d in dirs.flatten() {
+        let id = d.file_name().to_string_lossy().to_string();
+        if !is_valid_id(&id) || known.contains(id.as_str()) || !d.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dir = d.path();
+        if let Some(t) = load_transcript(&dir) {
+            orphans.entry(t.file_hash).or_insert(Orphan { has_results: has_results(&dir), id });
+        }
+    }
+    orphans
 }
 
 /// When the app restarts, the job that was running is gone. A video that
@@ -439,7 +526,7 @@ mod tests {
     fn corrupt_manifest_is_set_aside_not_overwritten() {
         let (_t, paths) = lib();
         std::fs::write(paths.manifest(), b"{ not json").unwrap();
-        let Loaded::Corrupt(m, aside) = load(&paths).unwrap() else { panic!() };
+        let Loaded::Corrupt(m, aside, false) = load(&paths).unwrap() else { panic!() };
         assert!(m.entries.is_empty());
         assert!(aside.starts_with("library.json.corrupt-"));
         assert_eq!(std::fs::read(paths.data_dir().join(&aside)).unwrap(), b"{ not json");
@@ -453,7 +540,7 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         let aside = paths.data_dir().join("library.json.corrupt-x");
         let refuse = |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        let Loaded::Corrupt(_, name) = set_aside_to(&path, &aside, "bad", refuse) else { panic!() };
+        let Loaded::Corrupt(_, name, _) = set_aside_to(&path, &aside, "bad", refuse) else { panic!() };
         assert_eq!(name, "library.json.corrupt-x");
         assert_eq!(std::fs::read(&aside).unwrap(), b"{ not json");
     }
@@ -470,6 +557,84 @@ mod tests {
         let Loaded::Stuck(why) = set_aside_to(&path, &aside, "bad", |a, b| std::fs::rename(a, b)) else { panic!() };
         assert!(why.contains("read-only"), "{why}");
         assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "left in place");
+    }
+
+    fn ids(m: &Manifest) -> Vec<String> {
+        m.entries.iter().map(|e| e.id.clone()).collect()
+    }
+
+    #[test]
+    fn missing_manifest_is_restored_from_backup() {
+        let (_t, paths) = lib();
+        let mut m = Manifest::default();
+        m.entries.push(entry("a.mp4"));
+        save(&paths, &m).unwrap();
+        m.entries.push(entry("b.mp4"));
+        save(&paths, &m).unwrap();
+        // The backup is the save before.
+        assert_eq!(read_backup(&paths).map(|b| b.entries.len()), Some(1));
+
+        std::fs::remove_file(paths.manifest()).unwrap();
+        // A brand-new library (nothing in videos/) just starts empty.
+        let Loaded::Ok(empty) = load(&paths).unwrap() else { panic!() };
+        assert!(empty.entries.is_empty());
+
+        paths.ensure_video_dir(&m.entries[0].id).unwrap();
+        let Loaded::Restored(back) = load(&paths).unwrap() else { panic!() };
+        assert_eq!(ids(&back), ids(&m)[..1]);
+
+        // No usable backup either: rebuilt.
+        std::fs::write(paths.manifest_backup(), b"junk").unwrap();
+        assert!(matches!(load(&paths).unwrap(), Loaded::Lost(_)));
+    }
+
+    #[test]
+    fn corrupt_manifest_never_replaces_a_good_backup() {
+        let (_t, paths) = lib();
+        let mut m = Manifest::default();
+        m.entries.push(entry("a.mp4"));
+        save(&paths, &m).unwrap();
+        save(&paths, &m).unwrap();
+        std::fs::write(paths.manifest(), b"{ half writ").unwrap();
+        let mut newer = m.clone();
+        newer.entries.push(entry("b.mp4"));
+        save(&paths, &newer).unwrap();
+        assert_eq!(read_backup(&paths).map(|b| ids(&b)), Some(ids(&m)));
+
+        // And an unreadable file on open is set aside, with the backup's list.
+        std::fs::write(paths.manifest(), b"{ half writ").unwrap();
+        let Loaded::Corrupt(back, _, true) = load(&paths).unwrap() else { panic!() };
+        assert_eq!(ids(&back), ids(&m));
+    }
+
+    #[test]
+    fn orphaned_video_folders_are_found_by_transcript_hash() {
+        let (_t, paths) = lib();
+        let mut m = Manifest::default();
+        m.entries.push(entry("known.mp4"));
+        let known_dir = paths.ensure_video_dir(&m.entries[0].id).unwrap();
+        let orphan = new_id();
+        let dir = paths.ensure_video_dir(&orphan).unwrap();
+        // A folder without a transcript can't be matched to anything.
+        paths.ensure_video_dir(&new_id()).unwrap();
+        let transcript = |hash: &str| TranscriptFile {
+            file_hash: hash.into(),
+            transcription: serde_json::from_value(serde_json::json!({"segments": [], "full_text": ""})).unwrap(),
+        };
+        save_transcript(&known_dir, &transcript("k")).unwrap();
+        save_transcript(&dir, &transcript("h1")).unwrap();
+        std::fs::write(dir.join("trimmed.mp4"), b"t").unwrap();
+        std::fs::write(dir.join("thumbnail_option_1.jpg"), b"j").unwrap();
+        save_video_data(&dir, &VideoData {
+            trimmed_file: Some("trimmed.mp4".into()),
+            thumbnail_options: vec!["thumbnail_option_1.jpg".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let found = find_orphans(&paths, &m);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found["h1"], Orphan { id: orphan, has_results: true });
     }
 
     #[test]

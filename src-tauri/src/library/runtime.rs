@@ -5,7 +5,7 @@
 
 use super::fsutil::{self, TMP_MARKER};
 use super::lock::{self, Acquire};
-use super::manifest::{self, Loaded, Manifest, Render, Review, TranscriptFile, VideoData, RENDERED_PREFIX};
+use super::manifest::{self, Loaded, Manifest, Orphan, Render, Review, TranscriptFile, VideoData, RENDERED_PREFIX};
 use super::scan::{self, FileObs, ObsState, Reconciled, ScanCache};
 use super::{Entry, EntryStatus, Fingerprint, LibraryPaths, UploadRecord, MAX_TRANSCRIBE_SECS};
 use crate::state::{AppState, ProcessingStage, TranscriptionResult};
@@ -74,6 +74,9 @@ struct Inner {
     downloads: Vec<DownloadItem>,
     session: String,
     notice: Option<String>,
+    /// Video folders whose entries were lost, by file hash; a scan that
+    /// finds their video gives the new entry the folder back.
+    orphans: std::collections::HashMap<String, Orphan>,
 }
 
 pub struct Library {
@@ -257,7 +260,8 @@ impl Inner {
     fn apply_scan(&mut self, obs: &[FileObs]) {
         let busy = self.busy_set();
         let last_present = self.scanned.then(|| std::mem::take(&mut self.last.present));
-        let reconciled = scan::reconcile(&mut self.manifest.entries, obs, &busy, last_present.as_ref());
+        let reconciled =
+            scan::reconcile_adopting(&mut self.manifest.entries, obs, &busy, last_present.as_ref(), &mut self.orphans);
         if self.mode == Mode::Writable {
             if let Some(paths) = self.paths.clone() {
                 for id in &reconciled.replaced {
@@ -611,6 +615,7 @@ impl Library {
                 downloads: Vec::new(),
                 session: super::new_id(),
                 notice: None,
+                orphans: std::collections::HashMap::new(),
             }),
             scan_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
@@ -636,6 +641,7 @@ impl Library {
         };
 
         let mut notice = None;
+        let mut recovered = false;
         let (manifest, mut mode) = match paths.ensure_dir(&paths.data_dir()) {
             Err(e) => (
                 Manifest::default(),
@@ -643,11 +649,30 @@ impl Library {
             ),
             Ok(()) => match manifest::load(&paths) {
                 Ok(Loaded::Ok(m)) => (m, Mode::Writable),
-                Ok(Loaded::Corrupt(m, aside)) => {
-                    notice = Some(format!(
-                        "The library's tracking file couldn't be read, so it was set aside as .sermon-cut/{} and the list was rebuilt. Videos show as new.",
-                        aside
-                    ));
+                Ok(Loaded::Corrupt(m, aside, restored)) => {
+                    notice = Some(if restored {
+                        format!(
+                            "The library's tracking file couldn't be read, so it was set aside as .sermon-cut/{} and the list was restored from its backup.",
+                            aside
+                        )
+                    } else {
+                        format!(
+                            "The library's tracking file couldn't be read, so it was set aside as .sermon-cut/{} and the list was rebuilt. Processed videos keep their results; upload history isn't shown.",
+                            aside
+                        )
+                    });
+                    recovered = restored;
+                    (m, Mode::Writable)
+                }
+                Ok(Loaded::Restored(m)) => {
+                    notice = Some("The library's tracking file was missing, so the list was restored from its backup.".into());
+                    recovered = true;
+                    (m, Mode::Writable)
+                }
+                Ok(Loaded::Lost(m)) => {
+                    notice = Some(
+                        "The library's tracking file was missing, so the list was rebuilt. Processed videos keep their results; upload history isn't shown.".into(),
+                    );
                     (m, Mode::Writable)
                 }
                 Ok(Loaded::Stuck(why)) => (Manifest::default(), Mode::ReadOnly(why)),
@@ -676,22 +701,20 @@ impl Library {
         }
 
         let mut manifest = manifest;
+        let mut orphans = std::collections::HashMap::new();
         if mode == Mode::Writable {
             if idle {
                 sweep(&paths);
             }
-            let has_results = |e: &Entry| {
-                paths.video_dir(&e.id).is_ok_and(|dir| {
-                    let data = manifest::load_video_data(&dir);
-                    !data.thumbnail_options.is_empty()
-                        && data.trimmed_file.is_some_and(|t| dir.join(t).is_file())
-                })
-            };
-            if manifest::mark_interrupted(&mut manifest, running.as_deref(), has_results) {
+            let has_results = |e: &Entry| paths.video_dir(&e.id).is_ok_and(|dir| manifest::has_results(&dir));
+            if manifest::mark_interrupted(&mut manifest, running.as_deref(), has_results) || recovered {
                 if let Err(e) = manifest::save(&paths, &manifest) {
                     eprintln!("[library] Failed to save library.json: {}", e);
                 }
             }
+            // Normally none: a folder outlives its entry only when
+            // library.json was lost or restored from an older backup.
+            orphans = manifest::find_orphans(&paths, &manifest);
         }
 
         let mut g = self.inner();
@@ -701,6 +724,7 @@ impl Library {
         g.manifest = manifest;
         g.mode = mode;
         g.notice = notice;
+        g.orphans = orphans;
         g.cache = ScanCache::default();
         g.last = Reconciled::default();
         g.scanned = false;
@@ -2528,6 +2552,48 @@ mod tests {
         // Mounted: its own device.
         let mounted = [("/Volumes", 1, false), ("/Volumes/Church SSD", 7, false), ("/x", 0, false)];
         assert_eq!(unmounted_volume(Path::new("/Volumes/Church SSD/Sermons"), stat(mounted)), None);
+    }
+
+    #[test]
+    fn lost_manifest_adopts_video_folders_on_the_next_scan() {
+        let (_t, lib, id, dir) = processed_library();
+        let paths = lib.inner().paths.clone().unwrap();
+        let fp = lib.inner().manifest.get(&id).unwrap().fingerprint.clone();
+        let hash = fp.hash.clone();
+        manifest::save_transcript(
+            &dir,
+            &TranscriptFile {
+                file_hash: hash,
+                transcription: serde_json::from_value(serde_json::json!({"segments": [], "full_text": "hi"})).unwrap(),
+            },
+        )
+        .unwrap();
+        std::fs::write(dir.join("trimmed.mp4"), b"t").unwrap();
+        let mut data = manifest::load_video_data(&dir);
+        data.trimmed_file = Some("trimmed.mp4".into());
+        manifest::save_video_data(&dir, &data).unwrap();
+        lib.inner().save().unwrap();
+        std::fs::remove_file(paths.manifest()).unwrap();
+        let _ = std::fs::remove_file(paths.manifest_backup());
+
+        lib.open_blocking(true);
+        assert!(lib.view(vec![]).message.unwrap().contains("rebuilt"));
+        // What a scan sees once the file is read (observe is tested in scan.rs).
+        let obs = FileObs {
+            name: "a.mp4".into(),
+            size: fp.size,
+            mtime_ms: fp.mtime_ms,
+            state: ObsState::Ready,
+            hash: Some(fp.hash.clone()),
+            duration: Some(60.0),
+        };
+        lib.inner().apply_scan(&[obs]);
+        let v = lib.view(vec![]).videos;
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, id, "the folder's id comes back");
+        assert_eq!(v[0].status, ViewStatus::ReadyForReview);
+        assert_eq!(lib.detail(&id).unwrap().thumbnail_options.len(), 2);
+        assert!(paths.manifest().exists());
     }
 
     #[test]

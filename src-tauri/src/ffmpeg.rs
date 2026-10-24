@@ -7,8 +7,7 @@ pub async fn extract_audio(video_path: &Path, output_path: &Path) -> Result<(), 
     let video_path_str = video_path.to_str().ok_or("video path contains invalid UTF-8")?;
     let output_path_str = output_path.to_str().ok_or("output path contains invalid UTF-8")?;
 
-    let output = crate::tools::command("ffmpeg")
-        .args([
+    let args = [
             "-i", video_path_str,
             "-vn",                    // No video
             // Silence before a sound that starts late, so the transcript
@@ -21,17 +20,31 @@ pub async fn extract_audio(video_path: &Path, output_path: &Path) -> Result<(), 
             "-application", "voip",   // Tuned for speech
             "-y",                     // Overwrite
             output_path_str,
-        ])
+        ];
+    let output = crate::tools::command("ffmpeg")
+        .args(args)
         .output()
         .await
         .map_err(|e| crate::tools::spawn_error("ffmpeg", e))?;
 
     if !output.status.success() {
+        log_failure("ffmpeg", &args, &output);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg error: {}", stderr));
     }
 
     Ok(())
+}
+
+/// A tool that failed: what it was asked and the end of what it said.
+fn log_failure(tool: &str, args: &[&str], output: &std::process::Output) {
+    log::warn!(
+        "{} failed ({}): {}\n{}",
+        tool,
+        output.status,
+        args.join(" "),
+        crate::logging::output_tail(&output.stderr, 20)
+    );
 }
 
 fn check_times(start_time: f64, end_time: f64) -> Result<(), String> {
@@ -60,6 +73,7 @@ async fn run_ffmpeg(args: &[&str]) -> Result<(), String> {
         .await
         .map_err(|e| crate::tools::spawn_error("ffmpeg", e))?;
     if !output.status.success() {
+        log_failure("ffmpeg", args, &output);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg error: {}", stderr.trim()));
     }
@@ -75,6 +89,7 @@ async fn run_ffprobe(args: &[&str]) -> Result<String, String> {
         .await
         .map_err(|e| crate::tools::spawn_error("ffprobe", e))?;
     if !output.status.success() {
+        log_failure("ffprobe", args, &output);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffprobe error: {}", stderr.trim()));
     }
@@ -569,6 +584,7 @@ pub async fn trim_accurate(
         match cut {
             Ok(start) => {
                 on_step(1.0, "Done");
+                log::info!("Smart cut at {:.3}s (asked {:.3}s, keyframe {:.3}s)", start, start_time, keyframe);
                 return Ok(Cut { start, method: CutMethod::Smart });
             }
             Err(e) => {
@@ -594,6 +610,7 @@ pub async fn trim_accurate(
     }
     .max(0.0);
     on_step(1.0, "Done");
+    log::info!("Keyframe cut at {:.3}s (asked {:.3}s)", start, start_time);
     Ok(Cut { start, method: CutMethod::Keyframe })
 }
 
@@ -637,18 +654,20 @@ pub fn probe_duration_blocking(video_path: &Path) -> Option<f64> {
 
 /// Get video duration in seconds
 pub async fn get_duration(video_path: &str) -> Result<f64, String> {
-    let output = crate::tools::command("ffprobe")
-        .args([
+    let args = [
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             video_path,
-        ])
+        ];
+    let output = crate::tools::command("ffprobe")
+        .args(args)
         .output()
         .await
         .map_err(|e| crate::tools::spawn_error("ffprobe", e))?;
 
     if !output.status.success() {
+        log_failure("ffprobe", &args, &output);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffprobe error: {}", stderr));
     }
@@ -666,19 +685,22 @@ pub async fn extract_frame(
     time: f64,
     output_path: &str,
 ) -> Result<(), String> {
-    let output = crate::tools::command("ffmpeg")
-        .args([
-            "-ss", &format_time(time),
+    let at = format_time(time);
+    let args = [
+            "-ss", &at,
             "-i", video_path,
             "-vframes", "1",
             "-y",
             output_path,
-        ])
+        ];
+    let output = crate::tools::command("ffmpeg")
+        .args(args)
         .output()
         .await
         .map_err(|e| crate::tools::spawn_error("ffmpeg", e))?;
 
     if !output.status.success() {
+        log_failure("ffmpeg", &args, &output);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg error: {}", stderr));
     }

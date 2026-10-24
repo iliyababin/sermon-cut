@@ -67,6 +67,7 @@ fn count_restarts(manifest: &mut Manifest, running: Option<&str>) -> bool {
         if e.status == EntryStatus::Processing && running != Some(e.id.as_str()) && queued.contains(&e.id) {
             e.process_attempts += 1;
             any = true;
+            log::warn!("Processing {} ({}) stopped when the app did (attempt {})", e.file_name, e.id, e.process_attempts);
         }
     }
     any
@@ -78,6 +79,7 @@ fn give_up_restarting(manifest: &mut Manifest) {
     let queued: HashSet<String> = manifest.queue.iter().cloned().collect();
     for e in &mut manifest.entries {
         if e.process_attempts >= super::MAX_RESTARTS && queued.contains(&e.id) {
+            log::warn!("Not restarting {} ({}): it stopped {} times", e.file_name, e.id, e.process_attempts);
             e.error = Some(if e.status == EntryStatus::Error {
                 "Processing stopped unexpectedly twice — click Retry.".into()
             } else {

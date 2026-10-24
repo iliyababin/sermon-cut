@@ -48,6 +48,16 @@ struct JobOutputs {
     duration: f64,
 }
 
+/// How long since `since`, for the log: "4.2s", "3m 12s".
+fn took(since: std::time::Instant) -> String {
+    let secs = since.elapsed().as_secs_f64();
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else {
+        format!("{}m {:02}s", (secs / 60.0) as u64, secs as u64 % 60)
+    }
+}
+
 fn fingerprint_matches(now: &Fingerprint, expected: &Fingerprint) -> bool {
     now.size == expected.size && now.hash == expected.hash
 }
@@ -131,17 +141,24 @@ impl Library {
     pub fn cancel(&self, id: &str) -> Result<(), String> {
         let mut g = self.inner();
         g.queue.retain(|q| q != id);
-        if let Some(r) = g.running.as_mut().filter(|r| r.id == id) {
+        let what = if let Some(r) = g.running.as_mut().filter(|r| r.id == id) {
             // Leaves the saved queue when the job has stopped (finish_job).
             if r.committing {
                 r.late_cancel = true;
+                "while its results were being saved; they'll be kept"
             } else {
                 r.cancel.cancel();
+                "while it ran"
             }
         } else if g.manifest.queue.iter().any(|q| q == id) {
             g.manifest.queue.retain(|q| q != id);
             g.save_logged();
-        }
+            "while it was queued"
+        } else {
+            return Ok(());
+        };
+        drop(g);
+        log::info!("Processing {} cancelled {}", id, what);
         Ok(())
     }
 
@@ -243,6 +260,8 @@ impl Library {
                 continue;
             };
             emit_changed(&app);
+            let started = std::time::Instant::now();
+            log::info!("Processing {} ({})", self.title_of(&id), id);
 
             let result = tokio::select! {
                 r = self.run_job(&app, &app_state, &id) => Some(r),
@@ -251,7 +270,13 @@ impl Library {
             // A job that saw the cancel itself (just before its commit).
             let result = if token.is_cancelled() && !matches!(result, Some(Ok(()))) { None } else { result };
             if let Some(notice) = self.finish_job(&id, &result) {
+                log::info!("The cancel for {} came too late; processing finished", id);
                 app_state.lock().await.notices.push(notice.to_string());
+            }
+            match &result {
+                Some(Ok(())) => log::info!("Processed {} in {}", id, took(started)),
+                None => log::info!("Processing {} stopped (cancelled) after {}", id, took(started)),
+                Some(Err(_)) => {}
             }
 
             if let Some(Ok(())) = &result {
@@ -259,7 +284,7 @@ impl Library {
                 crate::notify::notify(&app, crate::notify::Event::Processed { title: &title });
             }
             if let Some(Err(err)) = &result {
-                log::error!("Processing {} failed: {}", id, err);
+                log::error!("Processing {} failed after {}: {}", id, took(started), err);
                 let _ = app.emit(
                     "processing-progress",
                     ProcessingProgressEvent {
@@ -322,7 +347,10 @@ impl Library {
             None => {
                 progress(ProcessingStage::ExtractingAudio, 5.0, "Extracting audio from video...");
                 let audio = staging.join("audio.ogg");
+                let stage = std::time::Instant::now();
                 tools.extract_audio(&video_path, &audio).await?;
+                let size = std::fs::metadata(&audio).map(|m| m.len()).unwrap_or(0);
+                log::info!("Extracted the audio in {} ({:.1} MB)", took(stage), size as f64 / 1e6);
 
                 // The server answers only when it's done, so show how long
                 // it has been going.
@@ -342,6 +370,10 @@ impl Library {
                     }
                 };
                 let _ = std::fs::remove_file(&audio);
+                match &result {
+                    Ok(_) => log::info!("Transcribed in {}", took(started)),
+                    Err(e) => log::warn!("Transcription failed after {}: {}", took(started), e),
+                }
                 let transcription = result?;
                 // The one output saved straight away rather than staged: it
                 // costs a paid transcription, and it's keyed to the file's
@@ -368,17 +400,24 @@ impl Library {
             start = 0.0;
             end = duration;
         }
+        if transcription.sermon_start.is_none() || transcription.sermon_end.is_none() {
+            log::info!("No sermon start or end found; using the video's own start or end instead");
+        }
         let trimmed_name = trimmed_name(&file_name);
         // The cut may start at a keyframe a moment early; chapters and
         // captions are timed from where it really starts.
         let on_step = |f: f32, _: &str| {
             progress(ProcessingStage::Trimming, 50.0 + 25.0 * f, "Trimming video to sermon boundaries...");
         };
+        let stage = std::time::Instant::now();
         let start = tools.trim(&video_path, start, end, &staging.join(&trimmed_name), &on_step).await?;
+        log::info!("Trimmed to {:.1}–{:.1}s of {:.1}s in {}", start, end, duration, took(stage));
 
         progress(ProcessingStage::GeneratingThumbnails, 75.0, "Generating thumbnail options...");
         let title = transcription.suggested_title.clone().unwrap_or(display_title);
+        let stage = std::time::Instant::now();
         let thumbs = tools.thumbnails(&video_path, start, end, &title, &staging).await?;
+        log::info!("Made {} thumbnail options in {}", thumbs.len(), took(stage));
         let thumb_names: Vec<String> = thumbs
             .iter()
             .filter_map(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
@@ -391,7 +430,9 @@ impl Library {
         }
 
         let outputs = JobOutputs { trimmed_name, start, end, thumb_names, duration };
+        let stage = std::time::Instant::now();
         self.commit_job(id, &video_dir, &staging, &expected.hash, outputs, || {}).await?;
+        log::info!("Saved the results in {}", took(stage));
         drop(staging_dir);
         progress(ProcessingStage::Complete, 100.0, "Processing complete!");
         Ok(())

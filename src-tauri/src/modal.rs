@@ -410,7 +410,7 @@ fn parse_response(bytes: &[u8]) -> Result<TranscriptionResult, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn the_app_outwaits_the_server_and_the_server_has_room_for_the_longest_video() {
         let app_py = include_str!("../../backend/app.py");
@@ -534,14 +534,14 @@ mod tests {
         }
     }
 
-    const RESULT: &str = r#"{"segments":[{"start":0,"end":1,"text":"Hi"}],"text":"Hi","sermon_analysis":null,"analysis_error":"x"}"#;
+    pub(crate) const RESULT: &str = r#"{"segments":[{"start":0,"end":1,"text":"Hi"}],"text":"Hi","sermon_analysis":null,"analysis_error":"x"}"#;
 
-    fn reply(status: &str, headers: &str, body: &str) -> String {
+    pub(crate) fn reply(status: &str, headers: &str, body: &str) -> String {
         format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
     }
 
     /// What the mock server does with one request.
-    enum Act {
+    pub(crate) enum Act {
         Reply(String),
         /// Close the connection without answering.
         Drop,
@@ -550,11 +550,11 @@ mod tests {
     }
 
     /// Requests the mock server saw: (method, path, had the key).
-    type Seen = Arc<std::sync::Mutex<Vec<(String, String, bool)>>>;
+    pub(crate) type Seen = Arc<std::sync::Mutex<Vec<(String, String, bool)>>>;
 
     /// A local HTTP server answering each request with `handler(method,
     /// path, how many requests came before)`.
-    async fn mock(handler: impl Fn(&str, &str, usize) -> Act + Send + Sync + 'static) -> (String, Seen) {
+    pub(crate) async fn mock(handler: impl Fn(&str, &str, usize) -> Act + Send + Sync + 'static) -> (String, Seen) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/transcribe", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();

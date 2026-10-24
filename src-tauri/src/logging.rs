@@ -299,10 +299,6 @@ impl FailureTracker {
         FailureTracker { target, what, failing: None }
     }
 
-    pub fn is_failing(&self) -> bool {
-        self.failing.is_some()
-    }
-
     /// Note a failure; the line to log, if it's time for one.
     pub fn failure_at(&mut self, now: Instant, error: &str) -> Option<String> {
         match &mut self.failing {
@@ -423,6 +419,46 @@ pub fn tail(dir: &Path, n: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+/// A logger for tests that keeps every line, as the app would write it
+/// and as it was logged, with the app's levels.
+#[cfg(test)]
+pub mod capture {
+    use super::*;
+
+    /// (the line as written, the message as logged)
+    static LINES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, meta: &log::Metadata) -> bool {
+            let noisy = NOISY.iter().any(|n| meta.target() == *n || meta.target().starts_with(&format!("{}::", n)));
+            meta.level() <= if noisy { log::Level::Warn } else { log::Level::Debug }
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                let raw = record.args().to_string();
+                let line = format_line(&chrono::Local::now(), record.level(), record.target(), &raw);
+                LINES.lock().unwrap_or_else(|p| p.into_inner()).push((line, raw));
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    /// Install it (once per test run; other tests' lines are kept too).
+    pub fn install() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log::set_boxed_logger(Box::new(Capture)).expect("no other logger in tests");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    pub fn lines() -> Vec<(String, String)> {
+        LINES.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 #[cfg(test)]

@@ -706,3 +706,91 @@ async fn a_quit_mid_chunk_only_pauses_the_upload() {
     assert_eq!(h.server.with(|s| (s.creates, s.queries, s.chunk_puts)), (1, 1, 5));
     assert!(store.load().is_none());
 }
+
+/// Upload (with a retry, a refused token and a refused thumbnail), token
+/// refreshes (one fine, one refused with a body full of secrets) and a
+/// transcription (with a failed poll), all on local mocks: no token, key,
+/// auth code, client secret or session URI reaches a log line, neither as
+/// the app writes it nor as the call site logged it.
+#[tokio::test]
+async fn nothing_secret_reaches_the_log() {
+    use crate::state::{AppState, YouTubeAuth};
+    crate::logging::capture::install();
+    const ACCESS: &str = "ya29.e2e-access-first-0001";
+    const ACCESS_NEXT: &str = "ya29.e2e-access-second-0002";
+    const REFRESHED: &str = "ya29.e2e-access-refreshed-0003";
+    const REFRESH: &str = "1//e2e-refresh-token-0004";
+    const SECRET: &str = "GOCSPX-e2e-client-secret-0005";
+    const CODE: &str = "4/0e2e-auth-code-0006";
+    const MODAL_KEY: &str = "modal-e2e-key-0007";
+
+    // The upload.
+    let mut h = Harness::new().await;
+    h.tokens = FakeTokens { current: Mutex::new(ACCESS.into()), next: ACCESS_NEXT.into(), refreshes: AtomicU32::new(0) };
+    h.server.with(|s| {
+        s.token = ACCESS.into();
+        s.thumbnail_status = 403;
+    });
+    h.faults(vec![
+        Fault::Status { code: 503, retry_after: None },
+        Fault::PartialStore(CHUNK as usize),
+        Fault::ExpireToken(ACCESS_NEXT.into()),
+    ]);
+    let cancel = CancellationToken::new();
+    let progress = |_: u64, _: u64| {};
+    let after = AfterUpload { thumbnail: Some(Thumbnail { data: vec![1, 2, 3], mime: "image/jpeg" }), captions: None, playlist_id: None };
+    let outcome = run(&h.http, &h.cfg, &h.tokens, &h.store, &cancel, &h.video(), &after, &progress).await.unwrap();
+    assert_eq!(outcome.warnings.len(), 1, "the thumbnail was refused");
+    let session_uri = format!("{}/session/s1", h.server.base);
+
+    // Token refreshes: one that works, one Google refuses.
+    let mut state = AppState::for_test();
+    state.settings.youtube_auth = Some(YouTubeAuth {
+        access_token: Some(ACCESS.into()),
+        refresh_token: Some(REFRESH.into()),
+        expires_at: Some(0),
+        channel_name: Some("Youth".into()),
+        channel_id: Some("UC1".into()),
+    });
+    let state = Arc::new(tokio::sync::Mutex::new(state));
+    let credentials = || Ok(crate::youtube::YouTubeCredentials { client_id: "client".into(), client_secret: SECRET.into() });
+    let url = format!("{}/token", h.server.base);
+    let lock = tokio::sync::Mutex::new(());
+    h.server.with(|s| s.token_reply = (200, format!(r#"{{"access_token":"{}","expires_in":3600}}"#, REFRESHED)));
+    assert_eq!(crate::commands::access_token_with(&state, true, credentials, &url, &lock).await.unwrap(), REFRESHED);
+    h.server.with(|s| {
+        s.token_reply = (400, format!(r#"{{"error":"invalid_grant","error_description":"{} {} {}"}}"#, REFRESH, CODE, SECRET))
+    });
+    assert!(crate::commands::access_token_with(&state, true, credentials, &url, &lock).await.is_err());
+
+    // A transcription whose first poll fails with a body full of secrets.
+    use crate::modal::tests::{mock, reply, Act, RESULT};
+    let leak = format!("{} {} {}", MODAL_KEY, ACCESS, CODE);
+    let (modal_url, _) = mock(move |method, _, n| match (method, n) {
+        ("POST", _) => Act::Reply(reply("303 See Other", "Location: /result/1\r\n", "")),
+        (_, 1) => Act::Reply(reply("502 Bad Gateway", "", &leak)),
+        _ => Act::Reply(reply("200 OK", "", RESULT)),
+    })
+    .await;
+    let audio = h._dir.path().join("audio.ogg");
+    std::fs::write(&audio, b"not really audio").unwrap();
+    let mut settings = crate::state::Settings::default();
+    settings.modal_api_key = Some(MODAL_KEY.into());
+    crate::logging::register_settings(&settings);
+    let transcript = crate::modal::transcribe_audio(&audio.to_string_lossy(), &modal_url, Some(MODAL_KEY)).await.unwrap();
+    assert_eq!(transcript.full_text, "Hi");
+
+    let lines = crate::logging::capture::lines();
+    let ours = |text: &str| lines.iter().any(|(line, _)| line.contains(text));
+    assert!(ours("Video uploaded: vid1"), "the flows were logged");
+    assert!(ours("Thumbnail failed: HTTP 403"));
+    assert!(ours("Renewing the YouTube sign-in failed: auth: invalid_grant"));
+    assert!(ours("Transcription done in"));
+    for (line, raw) in &lines {
+        for secret in [ACCESS, ACCESS_NEXT, REFRESHED, REFRESH, SECRET, CODE, MODAL_KEY, session_uri.as_str(), "/session/s1"] {
+            assert!(!line.contains(secret), "{} in the log: {}", secret, line);
+            assert!(!raw.contains(secret), "{} logged at the call site: {}", secret, raw);
+        }
+        assert!(!line.contains("upload_id="), "{}", line);
+    }
+}

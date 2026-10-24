@@ -79,7 +79,7 @@ pub fn migrate(paths: &LibraryPaths, manifest: &mut Manifest, legacy: &serde_jso
         let video: VideoInfo = match serde_json::from_value(value.clone()) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[migrate] Skipping unreadable old video {}: {}", key, e);
+                log::warn!("Skipping unreadable old video {}: {}", key, e);
                 outcome.done.push(key.clone());
                 continue;
             }
@@ -92,7 +92,7 @@ pub fn migrate(paths: &LibraryPaths, manifest: &mut Manifest, legacy: &serde_jso
                 }
             }
             Err(error) => {
-                eprintln!("[migrate] {} failed: {}", key, error);
+                log::warn!("Migrating {} failed: {}", key, error);
                 outcome.failed.push(Failed { key: key.clone(), title: video.title.clone(), error });
             }
         }

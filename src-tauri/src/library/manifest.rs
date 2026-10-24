@@ -101,7 +101,7 @@ fn sanitize(manifest: &mut Manifest) {
     manifest.entries.retain(|e| {
         let ok = is_valid_id(&e.id) && is_valid_file_name(&e.file_name) && seen_ids.insert(e.id.clone());
         if !ok {
-            eprintln!("[library] Ignoring invalid entry {:?} ({:?})", e.id, e.file_name);
+            log::warn!("Ignoring invalid entry {:?} ({:?})", e.id, e.file_name);
         }
         ok
     });
@@ -204,9 +204,9 @@ fn set_aside(path: &Path, reason: &str) -> Loaded {
 /// copy it there if it can't be moved. If neither works, it must not be
 /// overwritten, so the library opens read-only.
 fn set_aside_to(path: &Path, aside: &Path, reason: &str, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Loaded {
-    eprintln!("[library] library.json is unreadable ({}); moving it to {}", reason, aside.display());
+    log::error!("library.json is unreadable ({}); moving it to {}", reason, aside.display());
     let kept = rename(path, aside).or_else(|e| {
-        eprintln!("[library] Couldn't move it ({}); copying instead", e);
+        log::warn!("Couldn't move it ({}); copying instead", e);
         std::fs::copy(path, aside).map(|_| ())
     });
     match kept {
@@ -228,7 +228,7 @@ pub fn save(paths: &LibraryPaths, manifest: &Manifest) -> Result<(), String> {
     if let Ok(current) = fsutil::read_limited(&paths.manifest(), MAX_MANIFEST_BYTES) {
         if serde_json::from_slice::<Manifest>(&current).is_ok() {
             if let Err(e) = fsutil::write_atomic(&paths.manifest_backup(), &current) {
-                eprintln!("[library] Failed to update library.json.bak: {}", e);
+                log::warn!("Failed to update library.json.bak: {}", e);
             }
         }
     }
@@ -484,7 +484,7 @@ pub fn load_video_data(dir: &Path) -> VideoData {
         Ok(Some(d)) => d,
         Ok(None) => return VideoData::default(),
         Err(e) => {
-            eprintln!("[library] Ignoring unreadable {}/video.json: {}", dir.display(), e);
+            log::warn!("Ignoring unreadable {}/video.json: {}", dir.display(), e);
             return VideoData::default();
         }
     };
@@ -555,7 +555,7 @@ pub fn load_transcript(dir: &Path) -> Option<TranscriptFile> {
     match fsutil::read_json(&dir.join("transcript.json"), MAX_TRANSCRIPT_BYTES) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[library] Ignoring unreadable {}/transcript.json: {}", dir.display(), e);
+            log::warn!("Ignoring unreadable {}/transcript.json: {}", dir.display(), e);
             None
         }
     }

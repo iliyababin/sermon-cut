@@ -254,7 +254,7 @@ impl Library {
             if manifest::mark_interrupted(&mut manifest, running.as_deref(), has_results) || restarts || recovered {
                 give_up_restarting(&mut manifest);
                 if let Err(e) = manifest::save(&paths, &manifest) {
-                    eprintln!("[library] Failed to save library.json: {}", e);
+                    log::error!("Failed to save library.json: {}", e);
                 }
             }
             // Normally none: a folder outlives its entry only when

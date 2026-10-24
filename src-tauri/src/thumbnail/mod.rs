@@ -124,7 +124,7 @@ fn pick_and_save(
         let detections = match yolo::detect(model_path, &img) {
             Ok(d) => d,
             Err(e) => {
-                println!("[thumbnail] YOLO error on frame at {:.0}s: {}", timestamp, e);
+                log::warn!("YOLO error on frame at {:.0}s: {}", timestamp, e);
                 continue;
             }
         };
@@ -136,8 +136,8 @@ fn pick_and_save(
     }
 
     let count_of = |status| all_scored.iter().filter(|(_, s)| s.status == status).count();
-    println!(
-        "[thumbnail] Detection summary: {} valid, {} not facing, {} sitting",
+    log::info!(
+        "Detection summary: {} valid, {} not facing, {} sitting",
         count_of(DetectionStatus::Valid),
         count_of(DetectionStatus::NotFacing),
         count_of(DetectionStatus::Sitting)
@@ -165,7 +165,7 @@ fn pick_and_save(
 
     // Fallback: no valid detections
     if selected.is_empty() {
-        println!("[thumbnail] No person detected, using center crop of middle frame");
+        log::info!("No person detected, using center crop of middle frame");
         let mid = &frame_data[frame_data.len() / 2];
         let img = load_image(&mid.1)?;
         let fallback_crop = crop::calculate_fallback_crop(img.width(), img.height());
@@ -216,8 +216,8 @@ fn pick_and_save(
             .map_err(|e| format!("Failed to canonicalize: {}", e))?;
         output_paths.push(abs.to_string_lossy().to_string());
 
-        println!(
-            "[thumbnail] Generated thumbnail {}/{}: score={:.3} {}",
+        log::info!(
+            "Generated thumbnail {}/{}: score={:.3} {}",
             idx + 1,
             selected.len(),
             scored.score,
@@ -270,8 +270,8 @@ pub async fn generate_thumbnail_options(
     }
     let video_path = video_path.to_str().ok_or("video path contains invalid UTF-8")?;
 
-    println!(
-        "[thumbnail] Generating {} thumbnail options for: {}",
+    log::info!(
+        "Generating {} thumbnail options for: {}",
         count, title
     );
 
@@ -311,7 +311,7 @@ fn custom_thumbnail(source: &Path, output_dir: &Path, crop_rect: &CropRect, grad
         .as_millis();
     let output_path = output_dir.join(format!("custom_thumbnail_{}.jpg", timestamp));
 
-    println!("[thumbnail] Processing custom thumbnail from: {}", source.display());
+    log::debug!("Processing a custom thumbnail from {}", source.display());
 
     // Upright, as the editor showed it: the crop is in that space.
     let decoded = decode::decode_file(source)?;
@@ -322,8 +322,8 @@ fn custom_thumbnail(source: &Path, output_dir: &Path, crop_rect: &CropRect, grad
     let x = crop_rect.x.clamp(0, (w - 1).max(0));
     let y = crop_rect.y.clamp(0, (h - 1).max(0));
     let clamped = CropRect { x, y, width: crop_rect.width.clamp(1, (w - x).max(1)), height: crop_rect.height.clamp(1, (h - y).max(1)) };
-    println!(
-        "[thumbnail] Cropping: x={}, y={}, w={}, h={}",
+    log::debug!(
+        "Cropping: x={}, y={}, w={}, h={}",
         clamped.x, clamped.y, clamped.width, clamped.height
     );
 
@@ -339,7 +339,7 @@ fn custom_thumbnail(source: &Path, output_dir: &Path, crop_rect: &CropRect, grad
 
     let jpeg = fit::encode_for_youtube(&result)?;
     std::fs::write(&output_path, &jpeg).map_err(|e| format!("Failed to write {}: {}", output_path.display(), e))?;
-    println!("[thumbnail] Saved custom thumbnail to: {}", output_path.display());
+    log::info!("Saved a custom thumbnail to {}", output_path.display());
 
     let absolute_path = output_path
         .canonicalize()

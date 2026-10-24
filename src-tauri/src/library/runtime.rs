@@ -290,7 +290,7 @@ impl Inner {
     fn save_logged(&self) {
         if matches!(self.mode, Mode::Writable) {
             if let Err(e) = self.save() {
-                eprintln!("[library] Failed to save library.json: {}", e);
+                log::error!("Failed to save library.json: {}", e);
             }
         }
     }
@@ -578,7 +578,7 @@ impl Library {
                 }
                 Ok(None) => HeartbeatOutcome::Unchanged,
                 Err(e) => {
-                    eprintln!("[library] Lock heartbeat failed: {}", e);
+                    log::warn!("Lock heartbeat failed: {}", e);
                     HeartbeatOutcome::Unchanged
                 }
             },
@@ -659,26 +659,26 @@ impl Library {
         }
         let (outcome, saved) = match moved {
             Ok((_, outcome, saved)) => (outcome, saved),
-            Err(e) => return eprintln!("[migrate] {}", e),
+            Err(e) => return log::error!("Migration failed: {}", e),
         };
         if let Err(e) = saved {
             // state.json keeps every old video; the next launch tries again.
-            return eprintln!("[migrate] Failed to save library.json: {}", e);
+            return log::error!("Migration: failed to save library.json: {}", e);
         }
 
         let mut state = app_state.lock().await;
         if let Err(e) = state.backup_pre_library_state() {
-            eprintln!("[migrate] {}", e);
+            log::error!("Migration: {}", e);
             return;
         }
         let notices = super::migrate::settle(&mut state.legacy_videos, &outcome);
         state.notices.extend(notices);
         match state.save() {
             Ok(()) => super::migrate::cleanup(&paths, &outcome),
-            Err(e) => eprintln!("[migrate] Failed to save state: {}", e),
+            Err(e) => log::error!("Migration: failed to save state: {}", e),
         }
-        println!(
-            "[migrate] Moved {} old videos into the library; {} failed",
+        log::info!(
+            "Moved {} old videos into the library; {} failed",
             outcome.done.len(),
             outcome.failed.len()
         );
@@ -760,7 +760,7 @@ impl Library {
                     g.save_logged();
                     queued.push(id);
                 }
-                Err(e) => eprintln!("[library] Auto-process couldn't queue {}: {}", id, e),
+                Err(e) => log::warn!("Auto-process couldn't queue {}: {}", id, e),
             }
         }
         queued
@@ -781,7 +781,7 @@ impl Library {
             let _ = blocking(move || {
                 for id in &ids {
                     if let Err(e) = lib.remove_video_files(&paths, id) {
-                        eprintln!("[library] {}", e);
+                        log::warn!("Removing a replaced video's files: {}", e);
                     }
                 }
             })
@@ -905,7 +905,7 @@ impl Library {
             paths.verify_original(&check)?;
             mover(&check)?;
             if let Err(e) = lib.remove_video_files(&paths, &video) {
-                eprintln!("[library] {}", e);
+                log::warn!("Removing a trashed video's files: {}", e);
             }
             Ok(())
         })

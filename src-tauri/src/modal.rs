@@ -68,7 +68,7 @@ async fn send_with_retry(
     loop {
         match make().send().await {
             Err(e) if attempt < delays.len() && never_reached_server(&e) => {
-                eprintln!("[modal] Couldn't reach the server ({}); trying again", e);
+                log::warn!("Couldn't reach the server ({}); trying again", e);
                 tokio::time::sleep(delays[attempt]).await;
                 attempt += 1;
             }
@@ -265,7 +265,7 @@ async fn transcribe_with(
                 }
                 Err(e) => e.to_string(),
             };
-            eprintln!("[modal] Waiting for the result failed ({}); asking again", failure);
+            log::warn!("Waiting for the result failed ({}); asking again", failure);
             tokio::time::sleep(wait.min(remaining())).await;
             wait = (wait * 2).min(limits.max_backoff);
         }

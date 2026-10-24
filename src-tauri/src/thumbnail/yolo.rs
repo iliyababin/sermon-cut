@@ -40,7 +40,7 @@ fn get_session(model_path: &Path) -> Result<&'static Mutex<Session>, String> {
     if let Some(s) = SESSION.get() {
         return Ok(s);
     }
-    println!("[yolo] Loading ONNX model from {}", model_path.display());
+    log::info!("Loading the ONNX model from {}", model_path.display());
     let session = Session::builder(get_env()?)
         .map_err(|e| format!("Failed to create session builder: {}", e))?
         .with_intra_threads(4)

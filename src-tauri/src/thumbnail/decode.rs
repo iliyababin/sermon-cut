@@ -87,7 +87,7 @@ pub fn is_srgb_profile(icc: &[u8]) -> bool {
 fn convert_to_srgb(pixels: &mut [u8], layout: moxcms::Layout, icc: &[u8]) {
     use moxcms::{ColorProfile, DataColorSpace, TransformOptions};
     let Ok(source) = ColorProfile::new_from_slice(icc) else {
-        eprintln!("[thumbnail] Unreadable colour profile; using the colours as they are");
+        log::warn!("Unreadable colour profile; using the colours as they are");
         return;
     };
     if source.color_space != DataColorSpace::Rgb {
@@ -97,13 +97,13 @@ fn convert_to_srgb(pixels: &mut [u8], layout: moxcms::Layout, icc: &[u8]) {
     let transform = match source.create_transform_8bit(layout, &srgb, layout, TransformOptions::default()) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[thumbnail] Can't convert the colour profile ({:?}); using the colours as they are", e);
+            log::warn!("Can't convert the colour profile ({:?}); using the colours as they are", e);
             return;
         }
     };
     let src = pixels.to_vec();
     if let Err(e) = transform.transform(&src, pixels) {
-        eprintln!("[thumbnail] Colour conversion failed ({:?}); using the colours as they are", e);
+        log::warn!("Colour conversion failed ({:?}); using the colours as they are", e);
         pixels.copy_from_slice(&src);
     }
 }

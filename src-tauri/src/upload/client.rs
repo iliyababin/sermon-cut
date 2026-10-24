@@ -180,7 +180,7 @@ impl Uploader<'_> {
             match self.settle(store, &mut token, stored, &current).await? {
                 Settled::Fresh => {}
                 Settled::Resume(s, n) => {
-                    println!("[upload] Continuing the upload session from {} at byte {}", s.created, n);
+                    log::info!("Continuing the upload session from {} at byte {}", s.created, n);
                     session = Some(s);
                     offset = Some(n);
                     confirmed = n;
@@ -256,7 +256,7 @@ impl Uploader<'_> {
                     on_progress(n, size);
                 }
                 Err(UploadError::SessionGone) => {
-                    println!("[upload] The upload session is gone; starting a new one");
+                    log::warn!("The upload session is gone; starting a new one");
                     store.save(None);
                     session = None;
                     offset = None;
@@ -289,7 +289,7 @@ impl Uploader<'_> {
     /// Wait before retry number `failures`, unless cancelled.
     async fn pause(&self, e: &UploadError, failures: u32) -> Result<(), UploadError> {
         let delay = self.cfg.backoff.delay(failures, e.retry_after());
-        println!("[upload] {} (try {}); retrying in {:?}", e, failures, delay);
+        log::warn!("{} (try {}); retrying in {:?}", e.log_text(), failures, delay);
         tokio::select! {
             _ = (self.cfg.sleep)(delay) => Ok(()),
             _ = self.cancel.cancelled() => Err(UploadError::Cancelled),
@@ -318,7 +318,7 @@ impl Uploader<'_> {
         if !stored.is_trusted() {
             // Not YouTube's upload server (an edited library.json): never
             // contacted, so there is nothing to settle.
-            println!("[upload] Ignoring a stored session that isn't YouTube's");
+            log::warn!("Ignoring a stored session that isn't YouTube's");
             store.save(None);
             return Ok(Settled::Fresh);
         }
@@ -337,25 +337,25 @@ impl Uploader<'_> {
                     let metadata_changed = !new_cut && stored.metadata_hash != current.metadata_hash;
                     let earlier = (new_cut || metadata_changed).then_some(EarlierUpload { new_cut, metadata_changed });
                     if earlier.is_some() {
-                        println!("[upload] An earlier upload had finished: {}", id);
+                        log::info!("An earlier upload had finished: {}", id);
                     }
                     return Ok(Settled::Finished(Uploaded { video_id: id, earlier, before_cancel: false }));
                 }
                 Ok(Step::Resume(n)) if n >= stored.size && !asked_again => asked_again = true,
                 Ok(Step::Resume(n)) if n >= stored.size => {
-                    println!("[upload] Dropping a stored session that has every byte but never finished");
+                    log::warn!("Dropping a stored session that has every byte but never finished");
                     store.save(None);
                     return if matches { Err(UploadError::NeverFinished) } else { Ok(Settled::Fresh) };
                 }
                 Ok(Step::Resume(n)) if matches => return Ok(Settled::Resume(stored, n)),
                 Ok(Step::Resume(_)) => {
-                    println!("[upload] Dropping an unfinished session for another file or metadata");
+                    log::info!("Dropping an unfinished session for another file or metadata");
                     store.save(None);
                     return Ok(Settled::Fresh);
                 }
                 Ok(Step::Created(_)) => unreachable!("a query never creates"),
                 Err(UploadError::SessionGone) => {
-                    println!("[upload] The stored upload session is gone");
+                    log::info!("The stored upload session is gone");
                     store.save(None);
                     return Ok(Settled::Fresh);
                 }
@@ -369,8 +369,8 @@ impl Uploader<'_> {
                     self.pause(&e, failures).await?;
                 }
                 Err(e) => {
-                    println!("[upload] Couldn't check the stored session: {}", e);
-                    return Err(UploadError::CheckFailed(e.to_string()));
+                    log::warn!("Couldn't check the stored session: {}", e.log_text());
+                    return Err(UploadError::CheckFailed(e.log_text()));
                 }
             }
         }
@@ -399,7 +399,7 @@ impl Uploader<'_> {
         };
         match tokio::time::timeout(self.cfg.cancel_check, ask).await {
             Ok(Ok(Step::Done(id))) => {
-                println!("[upload] The upload finished before it could be cancelled: {}", id);
+                log::info!("The upload finished before it could be cancelled: {}", id);
                 store.complete(&id, &session.file_hash);
                 Ok(Uploaded { video_id: id, earlier: None, before_cancel: true })
             }

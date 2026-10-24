@@ -209,8 +209,8 @@ pub async fn download_video(
     let status = child.wait().await.map_err(|e| e.to_string())?;
 
     if !status.success() {
-        let stderr_tail = stderr_task.await.unwrap_or_default();
-        return Err(format!("Download failed: {}", stderr_tail.trim()));
+        let output_tail = stderr_task.await.unwrap_or_default();
+        return Err(format!("Download failed: {}", output_tail.trim()));
     }
 
     find_downloaded_file(output_dir)

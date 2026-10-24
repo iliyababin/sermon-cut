@@ -55,12 +55,12 @@ fn flush_first(app: &AppHandle, then: impl FnOnce(&AppHandle) + Send + 'static) 
         let _ = done.send(());
     });
     if let Err(e) = tauri::Emitter::emit(app, "flush-before-exit", ()) {
-        eprintln!("[app] Couldn't ask the window to save: {}", e);
+        log::warn!("Couldn't ask the window to save: {}", e);
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if tokio::time::timeout(FLUSH_TIMEOUT, answered).await.is_err() {
-            eprintln!("[app] The window didn't confirm saving in time; going ahead");
+            log::warn!("The window didn't confirm saving in time; going ahead");
         }
         tauri::Listener::unlisten(&app, listener);
         FLUSHED.store(true, Ordering::SeqCst);
@@ -166,7 +166,7 @@ fn main() {
                     let handle = handle.clone();
                     async move {
                         if let Err(e) = library.rescan(&app_state).await {
-                            eprintln!("[library] First scan failed: {}", e);
+                            log::error!("First scan failed: {}", e);
                         }
                         commands::allow_user_paths(&handle, library.root().as_deref(), &settings);
                         let _ = tauri::Emitter::emit(&handle, "library-changed", ());
@@ -188,7 +188,7 @@ fn main() {
                                 continue;
                             }
                             if let Err(e) = library.rescan(&app_state).await {
-                                eprintln!("[library] Scan failed: {}", e);
+                                log::warn!("Scan failed: {}", e);
                             }
                             let _ = tauri::Emitter::emit(&handle, "library-changed", ());
                             notify::refresh_badge(&handle);
@@ -204,11 +204,11 @@ fn main() {
                             match library.heartbeat().await {
                                 HeartbeatOutcome::Unchanged => continue,
                                 HeartbeatOutcome::LostTo(host) => {
-                                    eprintln!("[library] {} took over the library; read-only now", host);
+                                    log::warn!("{} took over the library; read-only now", host);
                                 }
                                 HeartbeatOutcome::Regained => {
                                     if let Err(e) = library.reopen().await {
-                                        eprintln!("[library] Reopen failed: {}", e);
+                                        log::error!("Reopen failed: {}", e);
                                     }
                                 }
                             }

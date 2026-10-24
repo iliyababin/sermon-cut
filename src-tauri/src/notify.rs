@@ -48,7 +48,7 @@ pub fn notify(app: &AppHandle, event: Event) {
     use tauri_plugin_notification::NotificationExt;
     let Some(note) = note_for(&event, window_focused(app)) else { return };
     if let Err(e) = app.notification().builder().title(note.title).body(note.body).show() {
-        eprintln!("[notify] {}", e);
+        log::warn!("Couldn't show a notification: {}", e);
     }
 }
 

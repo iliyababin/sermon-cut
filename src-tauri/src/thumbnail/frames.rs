@@ -46,8 +46,8 @@ pub async fn extract_candidate_frames(
 ) -> Result<Vec<(f64, PathBuf)>, String> {
     let times = sample_times(start_time, end_time, count)?;
     let count = times.len();
-    println!(
-        "[thumbnail] Sampling {} frames from {:.1}min to {:.1}min into the sermon",
+    log::debug!(
+        "Sampling {} frames from {:.1}min to {:.1}min into the sermon",
         count,
         (times[0] - start_time) / 60.0,
         (times[count - 1] - start_time) / 60.0
@@ -95,8 +95,8 @@ pub async fn extract_candidate_frames(
         return Err("No frames could be extracted from the video".to_string());
     }
 
-    println!(
-        "[thumbnail] Extracted {} of {} candidate frames",
+    log::info!(
+        "Extracted {} of {} candidate frames",
         frames.len(),
         count
     );

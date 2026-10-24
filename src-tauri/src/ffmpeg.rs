@@ -572,7 +572,7 @@ pub async fn trim_accurate(
                 return Ok(Cut { start, method: CutMethod::Smart });
             }
             Err(e) => {
-                eprintln!("[trim] Exact cut failed, cutting at the keyframe instead: {}", e);
+                log::warn!("Exact cut failed, cutting at the keyframe instead: {}", e);
                 let _ = std::fs::remove_file(output_path);
             }
         }

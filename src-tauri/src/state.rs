@@ -527,7 +527,7 @@ impl AppState {
                     // overwriting it with defaults on the next save.
                     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
                     let aside = path.with_file_name(format!("state.json.corrupt-{}", stamp));
-                    eprintln!("Failed to parse state file ({}); moved to {}", e, aside.display());
+                    crate::logging::early(log::Level::Error, format!("Failed to parse state file ({}); moved to {}", e, aside.display()));
                     if std::fs::rename(path, &aside).is_ok() {
                         // It may hold the sign-in, and may have been written
                         // before state.json was made private.
@@ -557,7 +557,7 @@ impl AppState {
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("Failed to read state file: {}", e),
+            Err(e) => crate::logging::early(log::Level::Error, format!("Failed to read state file: {}", e)),
         }
 
         AppState::default()
@@ -611,7 +611,7 @@ impl AppState {
         if let Ok(current) = std::fs::read(path) {
             if serde_json::from_slice::<PersistedState>(&current).is_ok() {
                 if let Err(e) = crate::library::fsutil::write_atomic_private(&backup_path(path), &current) {
-                    eprintln!("[warn] Failed to back up state.json: {}", e);
+                    log::warn!("Failed to back up state.json: {}", e);
                 }
             }
         }
@@ -650,7 +650,7 @@ fn make_private(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            eprintln!("[warn] Failed to make {} private: {}", path.display(), e);
+            crate::logging::early(log::Level::Warn, format!("Failed to make {} private: {}", path.display(), e));
         }
     }
     #[cfg(not(unix))]

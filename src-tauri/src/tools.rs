@@ -106,14 +106,15 @@ pub async fn update_ytdlp_if_stale() {
 
     match Command::new(&ytdlp).arg("-U").output().await {
         Ok(output) if output.status.success() => {
-            println!("[tools] {}", String::from_utf8_lossy(&output.stdout).trim());
+            log::info!("yt-dlp update: {}", crate::logging::output_tail(&output.stdout, 5));
             let _ = std::fs::write(&stamp, "");
         }
-        Ok(output) => eprintln!(
-            "[tools] yt-dlp update failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        Ok(output) => log::warn!(
+            "yt-dlp update failed ({}):\n{}",
+            output.status,
+            crate::logging::output_tail(&output.stderr, 20)
         ),
-        Err(e) => eprintln!("[tools] yt-dlp update failed: {}", e),
+        Err(e) => log::warn!("yt-dlp update failed: {}", e),
     }
 }
 

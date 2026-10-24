@@ -83,7 +83,7 @@ impl YouTubeCredentials {
             let dev_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
                 .join("youtube_client_secrets.json");
-            println!("[youtube] Trying dev path: {:?}", dev_path);
+            log::debug!("Trying the dev path for the client secrets: {:?}", dev_path);
             std::fs::read_to_string(&dev_path).ok()
         });
 
@@ -286,7 +286,7 @@ pub async fn run_oauth_flow(credentials: &YouTubeCredentials, flow: &OAuthFlow) 
         pkce_challenge(&verifier)
     );
 
-    println!("[youtube] Opening browser for sign-in; waiting on port {}", port);
+    log::info!("Opening the browser for sign-in; waiting on port {}", port);
     (flow.open_browser)(&auth_url)?;
 
     // Connections are read side by side, so an idle preconnect can't hold
@@ -307,7 +307,7 @@ pub async fn run_oauth_flow(credentials: &YouTubeCredentials, flow: &OAuthFlow) 
                 Some((mut stream, line)) = rx.recv() => match parse_callback(&line, &oauth_state) {
                     Callback::Other => respond(&mut stream, "404 Not Found", "").await,
                     Callback::Denied(error) => {
-                        println!("[youtube] Sign-in ended in the browser: {}", error);
+                        log::warn!("Sign-in ended in the browser: {}", error);
                         respond(&mut stream, "200 OK", &page("Sign-in cancelled", "You can close this window.")).await;
                         return Err(SIGN_IN_CANCELLED.to_string());
                     }

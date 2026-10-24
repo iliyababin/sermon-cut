@@ -132,7 +132,7 @@ pub async fn save_review(
     let mut s = state.lock().await;
     if s.note_preacher(&video_id, &named) {
         if let Err(e) = s.save() {
-            eprintln!("[warn] Failed to save state: {}", e);
+            log::error!("Failed to save state: {}", e);
         }
     }
     Ok(())
@@ -407,7 +407,7 @@ pub async fn youtube_upload_video(
             if s.settings.upload_privacy != options.privacy {
                 s.settings.upload_privacy = options.privacy.clone();
                 if let Err(e) = s.save() {
-                    eprintln!("[warn] Failed to save state: {}", e);
+                    log::error!("Failed to save state: {}", e);
                 }
             }
         }
@@ -464,7 +464,7 @@ pub async fn youtube_upload_video(
             emit_upload(&app_handle, &video_id, 0, "cancelled", None, Some(e.user_message().as_str()))
         }
         Err(e) => {
-            eprintln!("[upload] Failed: {}", e);
+            log::warn!("Upload failed: {}", e.log_text());
             emit_upload(&app_handle, &video_id, 0, "error", None, Some(e.user_message().as_str()))
         }
     }

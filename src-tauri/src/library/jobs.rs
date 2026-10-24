@@ -259,7 +259,7 @@ impl Library {
                 crate::notify::notify(&app, crate::notify::Event::Processed { title: &title });
             }
             if let Some(Err(err)) = &result {
-                eprintln!("[process] {} failed: {}", id, err);
+                log::error!("Processing {} failed: {}", id, err);
                 let _ = app.emit(
                     "processing-progress",
                     ProcessingProgressEvent {
@@ -316,7 +316,7 @@ impl Library {
         let cached = manifest::load_transcript(&video_dir).filter(|t| t.file_hash == expected.hash);
         let transcription = match cached {
             Some(t) => {
-                println!("[process] Using saved transcript for {}", file_name);
+                log::info!("Using the saved transcript for {}", file_name);
                 t.transcription
             }
             None => {

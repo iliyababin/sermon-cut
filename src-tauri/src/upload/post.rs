@@ -51,7 +51,7 @@ impl Thumbnail {
             Ok(jpeg) => Thumbnail { data: jpeg, mime: "image/jpeg" },
             Err(e) => {
                 // Let YouTube judge it; a refusal becomes an upload warning.
-                println!("[upload] Sending the thumbnail as it is ({})", e);
+                log::warn!("Sending the thumbnail as it is ({})", e);
                 let mime = match content_type(path) {
                     "image/png" => "image/png",
                     _ => "image/jpeg",
@@ -103,14 +103,14 @@ pub async fn after_upload(
 
     if let Some(thumb) = &steps.thumbnail {
         if let Err(e) = authed(tokens, |t| async move { set_thumbnail(http, endpoints, &t, video_id, thumb).await }).await {
-            println!("[upload] Thumbnail failed: {}", e);
+            log::warn!("Thumbnail failed: {}", e.log_text());
             warnings.push(UploadWarning::thumbnail(&e));
         }
     }
 
     if let Some(srt) = steps.captions.as_deref().filter(|s| !s.trim().is_empty()) {
         if let Err(e) = authed(tokens, |t| async move { upload_captions(http, endpoints, &t, video_id, srt).await }).await {
-            println!("[upload] Captions failed: {}", e);
+            log::warn!("Captions failed: {}", e.log_text());
             warnings.push(UploadWarning {
                 kind: WarningKind::Captions,
                 message: format!("Captions weren't added. {}", e.user_message()),
@@ -120,7 +120,7 @@ pub async fn after_upload(
 
     if let Some(playlist) = steps.playlist_id.as_deref() {
         if let Err(e) = authed(tokens, |t| async move { add_to_playlist(http, endpoints, &t, playlist, video_id).await }).await {
-            println!("[upload] Playlist failed: {}", e);
+            log::warn!("Playlist failed: {}", e.log_text());
             warnings.push(UploadWarning {
                 kind: WarningKind::Playlist,
                 message: format!("The video wasn't added to the playlist. {}", e.user_message()),
@@ -149,7 +149,7 @@ pub async fn set_thumbnail(
     thumbnail: &Thumbnail,
 ) -> Result<(), UploadError> {
     let (data, mime) = (thumbnail.data.clone(), thumbnail.mime);
-    println!("[upload] Setting thumbnail for {} ({} bytes)", video_id, data.len());
+    log::info!("Setting the thumbnail for {} ({} bytes)", video_id, data.len());
     let resp = http
         .post(format!("{}?videoId={}&uploadType=media", endpoints.thumbnails, urlencoding::encode(video_id)))
         .bearer_auth(token)

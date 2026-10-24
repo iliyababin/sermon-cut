@@ -250,7 +250,7 @@ pub fn redact_with<'a>(known: &[String], line: &'a str) -> Cow<'a, str> {
 /// URLs in `text` cut to their scheme and host: yt-dlp prints the video's
 /// URL, signed media URLs and the like.
 pub fn hosts_only(text: &str) -> Cow<'_, str> {
-    static URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(https?://[^/\s?#'\x22]+)[^\s'\x22]*").expect("valid pattern"));
+    static URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(https?://[^/\s?#'\x22()<>]+)[^\s'\x22()<>]*").expect("valid pattern"));
     URL.replace_all(text, "$1/…")
 }
 
@@ -264,7 +264,7 @@ pub fn url_host(url: &str) -> String {
 
 /// The last `n` lines of a tool's stderr, URLs cut to their host, ready to
 /// log (the redactor still runs over it).
-pub fn stderr_tail(stderr: &[u8], n: usize) -> String {
+pub fn output_tail(stderr: &[u8], n: usize) -> String {
     let text = String::from_utf8_lossy(stderr);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = lines[lines.len().saturating_sub(n)..].join("\n");
@@ -503,12 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn stderr_tails_keep_the_end_and_only_hosts() {
+    fn output_tails_keep_the_end_and_only_hosts() {
         let stderr = (1..=30)
             .map(|i| format!("line {} https://rr3.googlevideo.com/videoplayback?expire=1&sig=abc", i))
             .collect::<Vec<_>>()
             .join("\n");
-        let tail = stderr_tail(stderr.as_bytes(), 20);
+        let tail = output_tail(stderr.as_bytes(), 20);
         let lines: Vec<&str> = tail.lines().collect();
         assert_eq!(lines.len(), 20);
         assert!(lines[0].starts_with("line 11 "));

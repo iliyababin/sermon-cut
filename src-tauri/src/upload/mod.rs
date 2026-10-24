@@ -184,7 +184,7 @@ pub async fn run(
 ) -> Result<UploadOutcome, UploadError> {
     let uploader = client::Uploader { http, cfg, tokens, cancel };
     let up = uploader.upload(store, video, on_progress).await?;
-    println!("[upload] Video uploaded: {}", up.video_id);
+    log::info!("Video uploaded: {}", up.video_id);
     // An earlier cut isn't given this cut's thumbnail, captions or playlist.
     let warnings = match &up.earlier {
         Some(e) if e.new_cut => Vec::new(),

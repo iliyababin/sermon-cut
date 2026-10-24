@@ -219,7 +219,7 @@ where
             let mut s = state.lock().await;
             s.settings.library_folder = old_folder;
             if let Err(save_err) = s.save() {
-                eprintln!("[settings] Failed to restore the library folder: {}", save_err);
+                log::error!("Failed to restore the library folder: {}", save_err);
             }
             return Err(e);
         }
@@ -410,7 +410,7 @@ pub async fn youtube_sign_in(
     {
         let mut state = state.lock().await;
         state.settings.youtube_auth = Some(auth);
-        if let Err(e) = state.save() { eprintln!("[warn] Failed to save state: {}", e); }
+        if let Err(e) = state.save() { log::error!("Failed to save the sign-in: {}", e); }
     }
 
     Ok(YouTubeAuthStatus {
@@ -509,13 +509,13 @@ pub(crate) async fn access_token_with(
         return Err(UploadError::Auth("signed out".into()));
     };
     if auth.channel_id != current.channel_id || auth.refresh_token.as_ref() != Some(&refresh) {
-        println!("[youtube] The account changed during a token refresh; not saving it");
+        log::warn!("The account changed during a token refresh; not saving it");
         return Err(UploadError::Other(ACCOUNT_CHANGED.into()));
     }
     auth.access_token = Some(new_tokens.access_token.clone());
     auth.expires_at = new_tokens.expires_at;
     if let Err(e) = g.save() {
-        eprintln!("[warn] Failed to save state: {}", e);
+        log::error!("Failed to save the renewed sign-in: {}", e);
     }
     Ok(new_tokens.access_token)
 }

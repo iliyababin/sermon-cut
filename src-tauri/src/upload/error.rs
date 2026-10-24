@@ -143,6 +143,29 @@ impl UploadError {
         }
     }
 
+    /// For the log: like Display, but never a response body (only its
+    /// size and Google's reason code), with URLs cut to their host.
+    pub fn log_text(&self) -> String {
+        let summary = |body: &str| match reason(body) {
+            Some(r) => format!("{}, {} bytes", r, body.len()),
+            None => format!("{} bytes", body.len()),
+        };
+        let text = match self {
+            UploadError::Http { status, body, retry_after } => format!(
+                "HTTP {} ({}){}",
+                status,
+                summary(body),
+                retry_after.map(|d| format!(", retry after {:?}", d)).unwrap_or_default()
+            ),
+            // Our own few words ("no refresh token"), or a response body.
+            UploadError::Auth(e) if reason(e).is_some() || e.len() > 60 || e.contains(['{', '<']) => {
+                format!("auth: {}", summary(e))
+            }
+            other => other.to_string(),
+        };
+        crate::logging::hosts_only(&text).into_owned()
+    }
+
     /// What the volunteer sees.
     pub fn user_message(&self) -> String {
         match self {
@@ -225,6 +248,20 @@ mod tests {
 
         assert_eq!(UploadError::Cancelled.user_message(), CANCELLED_MESSAGE);
         assert!(api_error(400, "invalidTitle").user_message().contains("(400): m"));
+    }
+
+    #[test]
+    fn the_log_never_gets_a_response_body() {
+        let body = r#"{"error":{"code":403,"message":"secret detail","errors":[{"reason":"forbidden"}]}}"#;
+        let http = UploadError::from_response(403, body.into(), Some(Duration::from_secs(3)), false);
+        assert_eq!(http.log_text(), format!("HTTP 403 (forbidden, {} bytes), retry after 3s", body.len()));
+        let grant = UploadError::from_response(400, r#"{"error":"invalid_grant","error_description":"secret detail"}"#.into(), None, false);
+        assert!(grant.log_text().starts_with("auth: invalid_grant, "), "{}", grant.log_text());
+        let html = UploadError::from_response(401, "<html>secret detail</html>".into(), None, true);
+        assert!(!html.log_text().contains("secret detail"));
+        assert_eq!(UploadError::Auth("no refresh token".into()).log_text(), "auth: no refresh token");
+        let net = UploadError::Network("error sending request for url (https://www.googleapis.com/upload/youtube/v3/videos?upload_id=XYZ)".into());
+        assert_eq!(net.log_text(), "network error: error sending request for url (https://www.googleapis.com/…)");
     }
 
     #[test]

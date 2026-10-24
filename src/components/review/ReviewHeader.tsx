@@ -1,5 +1,6 @@
 import type { RefObject } from "react";
-import { ArrowLeft, Loader2, RotateCcw, Youtube } from "lucide-react";
+import { ArrowLeft, Loader2, RotateCcw } from "lucide-react";
+import { YoutubeIcon } from "@/components/YoutubeIcon";
 import type { PlaylistInfo, UploadPrivacy, VideoDetail, YouTubeAuthStatus } from "@/lib/types";
 import { canStartUpload, type ReviewPhase, type ReviewState } from "./reviewMachine";
 
@@ -134,7 +135,7 @@ export function ReviewHeader({
               </>
             ) : (
               <>
-                <Youtube className="w-4 h-4" />
+                <YoutubeIcon className="w-4 h-4" />
                 Upload
               </>
             )}

@@ -1,4 +1,5 @@
-import { Loader2, LogOut, Youtube } from "lucide-react";
+import { Loader2, LogOut } from "lucide-react";
+import { YoutubeIcon } from "@/components/YoutubeIcon";
 import type { PlaylistInfo, Settings as SettingsType, YouTubeAuthStatus } from "@/lib/types";
 import { ErrorBanner } from "../ErrorBanner";
 import { FieldError, type EditSetting, type Field } from "./fields";
@@ -43,7 +44,7 @@ export function SettingsYouTube({
         <div className="flex items-center justify-between p-4 bg-muted rounded-lg">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-red-600 rounded-full flex items-center justify-center">
-              <Youtube className="w-5 h-5 text-white" />
+              <YoutubeIcon className="w-5 h-5 text-white" />
             </div>
             <div>
               <p className="font-medium">{youtubeAuth.channel_name}</p>
@@ -76,7 +77,7 @@ export function SettingsYouTube({
             </>
           ) : (
             <>
-              <Youtube className="w-5 h-5" />
+              <YoutubeIcon className="w-5 h-5" />
               Sign in with YouTube
             </>
           )}

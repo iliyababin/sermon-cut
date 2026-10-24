@@ -197,9 +197,33 @@ pub fn spawn(app: AppHandle, library: Arc<Library>, state: Arc<Mutex<AppState>>)
             "regain" => regain(&app, &library).await,
             "logo" => logo(&app, &library, &state).await,
             "close_flush" => close_flush(&app, &library).await,
+            "logs" => logs(&app).await,
             other => log(&format!("unknown scenario {}", other)),
         }
     });
+}
+
+/// The webview's console.error reaches the log (masked), Show Logs opens
+/// the folder and the diagnostics come back.
+async fn logs(app: &AppHandle) {
+    let out = ipc(
+        app,
+        "console.error('smoke: a webview error', 'ya29.smoke-token-0123456789'); \
+         console.warn('smoke: a webview warning'); \
+         await new Promise((r) => setTimeout(r, 500)); \
+         return { show: await call('open_log_folder'), diagnostics: await call('diagnostics') };",
+    )
+    .await;
+    log(&format!("open_log_folder: {}", out["show"]));
+    let text = out["diagnostics"]["ok"].as_str().unwrap_or_default();
+    log(&format!("diagnostics: {} lines; err={}", text.lines().count(), out["diagnostics"]["err"]));
+    for line in text.lines().take(14) {
+        log(&format!("  | {}", line));
+    }
+    log(&format!("diagnostics has the webview error: {}", text.contains("smoke: a webview error")));
+    if let Some(w) = main_window(app) {
+        let _ = w.close();
+    }
 }
 
 fn video_dir(library: &Library, id: &str) -> std::path::PathBuf {

@@ -37,8 +37,11 @@ static READY: OnceLock<()> = OnceLock::new();
 /// plugin that might log.
 pub fn plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
     use tauri_plugin_log::{Target, TargetKind};
+    // Other crates at info even in dev builds: their debug lines are long
+    // (the updater prints its whole manifest).
     let mut builder = builder(Target::new(TargetKind::LogDir { file_name: Some(FILE_NAME.into()) }), MAX_FILE_SIZE, KEEP_FILES)
-        .level(if cfg!(debug_assertions) { log::LevelFilter::Debug } else { log::LevelFilter::Info });
+        .level(log::LevelFilter::Info)
+        .level_for("sermon_cut", if cfg!(debug_assertions) { log::LevelFilter::Debug } else { log::LevelFilter::Info });
     for name in NOISY {
         builder = builder.level_for(name, log::LevelFilter::Warn);
     }
@@ -73,7 +76,7 @@ pub fn ready_plugin<R: Runtime>(library_folder: String) -> tauri::plugin::TauriP
     tauri::plugin::Builder::new("app-log")
         .setup(move |app, _api| {
             let _ = READY.set(());
-            log::info!("{}", start_line(app.package_info().version.to_string(), &library_folder));
+            log::info!(target: "sermon_cut", "{}", start_line(app.package_info().version.to_string(), &library_folder));
             for (level, message) in std::mem::take(&mut *EARLY.lock().unwrap_or_else(|p| p.into_inner())) {
                 log::log!(level, "{}", message);
             }
@@ -142,6 +145,8 @@ pub fn install_panic_hook() {
 pub fn format_line(now: &chrono::DateTime<chrono::Local>, level: log::Level, target: &str, message: &str) -> String {
     let target = match target {
         "sermon_cut" => "app",
+        // The plugin adds where in the bundled JS the call was: no help.
+        t if t.starts_with("webview::") => "webview",
         t => t.strip_prefix("sermon_cut::").unwrap_or(t),
     };
     let message = redact(message);
@@ -591,6 +596,8 @@ mod tests {
         let stamp = now.format("%:z").to_string();
         assert!(line.starts_with(&now.format("%Y-%m-%d").to_string()) && line[..30].contains(&stamp), "{}", line);
         assert!(format_line(&now, log::Level::Info, "sermon_cut", "x").contains(" app: x"));
+        let webview = format_line(&now, log::Level::Error, "webview::tn@tauri://localhost/assets/index-BIl0b8lb.js:11:669", "x");
+        assert!(webview.ends_with(" ERROR webview: x"), "{}", webview);
         assert!(!format_line(&now, log::Level::Info, "sermon_cut", ACCESS).contains(ACCESS));
     }
 

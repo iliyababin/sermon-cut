@@ -45,9 +45,9 @@ pub const MIN_APP_VERSION: &str = "0.5.0";
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "mts"];
 
 /// Longest video the app will send for transcription. The server
-/// (backend/app.py) has a 30-minute limit per request; a 2-hour service
-/// takes well under 10 minutes on its GPU.
-pub const MAX_TRANSCRIBE_SECS: f64 = 2.0 * 60.0 * 60.0;
+/// (backend/app.py) has a 45-minute limit per request, and the app waits up
+/// to 55 (`modal::Limits`); a 3-hour service takes well under 15 minutes on its GPU.
+pub const MAX_TRANSCRIBE_SECS: f64 = 3.0 * 60.0 * 60.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {

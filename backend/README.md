@@ -64,8 +64,8 @@ To retarget the analysis at a different kind of service, edit
 
 Any format ffmpeg can read works. The desktop app sends 16 kHz mono Opus at
 24 kb/s (`ffmpeg -vn -ar 16000 -ac 1 -c:a libopus -b:a 24k -application voip`),
-about 11 MB for a 2-hour service; in testing it transcribed the same as WAV.
-The app caps uploads at 200 MB and videos at 2 hours.
+about 11 MB for a 2-hour service (16 MB for 3 hours); in testing it
+transcribed the same as WAV. The app caps uploads at 200 MB and videos at 3 hours.
 
 ```json
 {
@@ -98,7 +98,7 @@ python3 -m unittest discover backend
 
 ## Cost notes
 
-Runs on a T4 with a 30-minute timeout. The default Whisper model is baked into
+Runs on a T4 with a 45-minute timeout (the app waits up to 55). The default Whisper model is baked into
 the image at build time (a `WHISPER_MODEL` override downloads on first use) and
 loaded once per container; back-to-back requests reuse a warm container. A ~90-minute service is
 a few minutes of GPU time plus one Sonnet call over the transcript.

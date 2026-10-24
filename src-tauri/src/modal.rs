@@ -152,7 +152,8 @@ struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            overall: Duration::from_secs(40 * 60),
+            // Longer than the server's own limit (TIMEOUT in backend/app.py).
+            overall: Duration::from_secs(55 * 60),
             poll: Duration::from_secs(5 * 60),
             backoff: Duration::from_secs(2),
             max_backoff: Duration::from_secs(30),
@@ -161,7 +162,7 @@ impl Default for Limits {
     }
 }
 
-const TIMED_OUT: &str = "Transcription took too long (over 40 minutes). Try again later.";
+const TIMED_OUT: &str = "Transcription took too long (over 55 minutes). Try again later.";
 
 /// Send the audio once (again only if it never reached the server), then
 /// wait for the answer. Modal answers a request that runs past 150 s with
@@ -340,6 +341,22 @@ fn parse_response(bytes: &[u8]) -> Result<TranscriptionResult, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_app_outwaits_the_server_and_the_server_has_room_for_the_longest_video() {
+        let app_py = include_str!("../../backend/app.py");
+        let server_secs: u64 = app_py
+            .lines()
+            .find_map(|l| l.strip_prefix("TIMEOUT = "))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .expect("TIMEOUT in backend/app.py");
+        // The app keeps waiting until the server has certainly given up.
+        assert!(super::Limits::default().overall.as_secs() > server_secs + 5 * 60);
+        // Transcription runs at ~12x real time on the T4: leave at least 3x that.
+        let longest = crate::library::MAX_TRANSCRIBE_SECS as u64;
+        assert!(server_secs >= longest / 12 * 3, "{server_secs} s for a {longest} s video");
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

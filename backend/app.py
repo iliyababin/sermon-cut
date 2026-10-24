@@ -38,7 +38,10 @@ from analysis import (
 app = modal.App("youtube-clipper")
 
 GPU = "T4"
-TIMEOUT = 1800  # 30 min — long services take a while
+# 45 min: a 3-hour service (the app's limit) takes well under 15. The app waits up
+# to 55 minutes (modal::Limits in src-tauri/src/modal.rs), so it never gives
+# up on a request the server is still working on.
+TIMEOUT = 2700
 
 # Baked into the image at build time. Secrets aren't available during the
 # build, so a WHISPER_MODEL override downloads at runtime instead.

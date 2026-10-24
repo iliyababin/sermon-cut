@@ -422,6 +422,25 @@ mod tests {
         assert_eq!(lib.detail(&copy).unwrap().duplicate_upload.as_deref(), Some(crate::upload::watch_url("abc").as_str()));
     }
 
+    #[tokio::test]
+    async fn services_up_to_three_hours_can_be_processed() {
+        let (_t, lib, id, _dir) = processed_library();
+        let status = |secs: f64| {
+            let mut g = lib.inner();
+            let e = g.entry_mut(&id).unwrap();
+            e.status = EntryStatus::New;
+            e.duration = Some(secs);
+            drop(g);
+            lib.view(vec![]).videos.into_iter().find(|v| v.id == id).unwrap().status
+        };
+        assert_eq!(status(2.0 * 3600.0 + 50.0 * 60.0), ViewStatus::New);
+        assert_eq!(status(3.0 * 3600.0), ViewStatus::New);
+        assert_eq!(status(3.0 * 3600.0 + 60.0), ViewStatus::TooLong);
+        assert_eq!(lib.view(vec![]).max_transcribe_secs, 3.0 * 3600.0);
+        let refused = lib.enqueue(&id).await.unwrap_err();
+        assert!(refused.contains("Videos over 180 min"), "{refused}");
+    }
+
     #[test]
     fn storage_counts_the_recording_and_the_video_folder() {
         let (t, lib, id, dir) = processed_library();

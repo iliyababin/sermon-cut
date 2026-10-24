@@ -1,5 +1,6 @@
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { AlertCircle } from "lucide-react";
+import { logShown } from "@/lib/log";
 
 /** The one way an error is shown: an alert with the message (already made
  * friendly by errorMessage) and optional actions. */
@@ -22,6 +23,8 @@ export function ErrorBanner({
   children?: ReactNode;
   className?: string;
 }) {
+  // Into the app log too, once however often it renders.
+  useEffect(() => logShown(message), [message]);
   return (
     <div role="alert" className={`p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center gap-2 ${className}`}>
       <AlertCircle className="w-4 h-4 shrink-0" />

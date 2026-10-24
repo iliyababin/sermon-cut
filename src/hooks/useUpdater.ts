@@ -2,6 +2,11 @@ import { createContext, useCallback, useContext, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { beginUpdate, endUpdate, errorMessage } from "@/lib/tauri";
+import { log } from "@/lib/log";
+
+/** The last update check failed: the next failure isn't logged again
+ * (the app checks on every launch and from Settings), only the recovery. */
+let checkFailing = false;
 
 interface UpdaterState {
   checked: boolean;
@@ -41,6 +46,9 @@ export function useUpdaterState() {
     setState((s) => ({ ...s, checking: true, error: null }));
     try {
       const result = await check();
+      if (checkFailing) log("info", "Update check works again");
+      checkFailing = false;
+      log("info", result ? `Update check: version ${result.version} is available` : "Update check: up to date");
       if (result) {
         setUpdate(result);
         setState((s) => ({
@@ -61,6 +69,8 @@ export function useUpdaterState() {
       }
       return result;
     } catch (err) {
+      if (!checkFailing) log("warn", "Update check failed:", err);
+      checkFailing = true;
       setState((s) => ({
         ...s,
         checking: false,
@@ -81,6 +91,7 @@ export function useUpdaterState() {
       setState((s) => ({ ...s, downloading: false, error: errorMessage(err) }));
       return;
     }
+    log("info", `Downloading and installing version ${update.version}`);
     try {
       let totalBytes = 0;
       let downloadedBytes = 0;
@@ -97,8 +108,10 @@ export function useUpdaterState() {
           }
         }
       });
+      log("info", "Update installed; restarting");
       await relaunch();
     } catch (err) {
+      log("error", "Update failed:", err);
       await endUpdate().catch(() => {});
       setState((s) => ({
         ...s,

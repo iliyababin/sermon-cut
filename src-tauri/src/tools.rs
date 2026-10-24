@@ -59,6 +59,27 @@ pub fn missing_tool_message() -> Option<String> {
         .map(|name| format!("{} isn't installed. {}", name, INSTALL_HINT))
 }
 
+/// Where each outside tool comes from, for the diagnostics.
+pub fn report() -> Vec<String> {
+    let on_path = |name: &str| {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX)))
+                .find(|p| p.is_file())
+        })
+    };
+    let mut lines: Vec<String> = ["ffmpeg", "ffprobe", "yt-dlp"]
+        .into_iter()
+        .map(|name| match (installed(name), on_path(name)) {
+            (Some(p), _) => format!("{}: {} (the app's copy)", name, p.display()),
+            (None, Some(p)) => format!("{}: {}", name, p.display()),
+            (None, None) => format!("{}: not found", name),
+        })
+        .collect();
+    lines.extend(missing_tool_message().map(|m| format!("Couldn't start: {}", m.lines().next().unwrap_or_default())));
+    lines
+}
+
 /// Turn a failure to start a tool into a message a non-technical user can act on.
 pub fn spawn_error(name: &str, e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {

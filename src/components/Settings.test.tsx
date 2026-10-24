@@ -275,3 +275,21 @@ describe("Settings autosave", () => {
     expect(screen.getByText("/data/com.youthscc.sermon-cut/bin")).toBeTruthy();
   });
 });
+
+describe("Settings logs", () => {
+  it("shows the log folder and copies the diagnostics", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === "diagnostics" ? Promise.resolve("Sermon Cut 0.5.0\nlog lines") : base(cmd, args),
+    );
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    await renderSettings();
+    fireEvent.click(screen.getByText("Show Logs"));
+    expect(invoke).toHaveBeenCalledWith("open_log_folder", undefined);
+    fireEvent.click(screen.getByText("Copy Diagnostics"));
+    await tick();
+    expect(writeText).toHaveBeenCalledWith("Sermon Cut 0.5.0\nlog lines");
+    expect(screen.getByText("Copied")).toBeTruthy();
+  });
+});

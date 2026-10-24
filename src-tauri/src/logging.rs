@@ -423,6 +423,62 @@ pub fn tail(dir: &Path, n: usize) -> Vec<String> {
 
 /// A logger for tests that keeps every line, as the app would write it
 /// and as it was logged, with the app's levels.
+/// How many log lines the diagnostics include.
+const DIAGNOSTIC_LINES: usize = 200;
+
+/// The newest `n` crash reports of the app in `dir`
+/// (~/Library/Logs/DiagnosticReports): names and dates only.
+fn crash_reports(dir: &Path, n: usize) -> Vec<String> {
+    let mut found: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+            name.to_lowercase().starts_with(FILE_NAME).then_some((modified, name))
+        })
+        .collect();
+    found.sort();
+    found
+        .into_iter()
+        .rev()
+        .take(n)
+        .map(|(when, name)| format!("{} ({})", name, chrono::DateTime::<chrono::Local>::from(when).format("%Y-%m-%d %H:%M")))
+        .collect()
+}
+
+/// Settings → Copy diagnostics: the app and system, the library and
+/// tools, recent crash reports and the end of the log.
+pub fn diagnostics(version: &str, library: &[String], tools: &[String], log_dir: &Path, crash_dir: Option<&Path>) -> String {
+    log::logger().flush();
+    let os = os_info::get();
+    let mut out = vec![
+        format!("Sermon Cut {} ({} build)", version, if cfg!(debug_assertions) { "debug" } else { "release" }),
+        format!("System: {} {} ({})", os.os_type(), os.version(), os.architecture().unwrap_or("unknown")),
+        format!("Written: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%:z")),
+        String::new(),
+    ];
+    out.extend(library.iter().cloned());
+    out.push(String::new());
+    out.push("Tools:".into());
+    out.extend(tools.iter().map(|t| format!("  {}", t)));
+    if let Some(dir) = crash_dir {
+        let crashes = crash_reports(dir, 3);
+        out.push(String::new());
+        out.push(if crashes.is_empty() { "Crash reports: none".into() } else { "Crash reports:".into() });
+        out.extend(crashes.into_iter().map(|c| format!("  {}", c)));
+    }
+    out.push(String::new());
+    out.push(format!("Log ({}):", log_dir.join(format!("{}.log", FILE_NAME)).display()));
+    let lines = tail(log_dir, DIAGNOSTIC_LINES);
+    if lines.is_empty() {
+        out.push("  (empty)".into());
+    }
+    out.extend(lines);
+    redact(&out.join("\n")).into_owned()
+}
+
 #[cfg(test)]
 pub mod capture {
     use super::*;
@@ -571,6 +627,29 @@ mod tests {
         assert!(back.starts_with("The heartbeat works again, after 6 failures since "), "{}", back);
         assert_eq!(t.recovered(), None);
         assert!(t.failure_at(start + Duration::from_secs(603), "again").unwrap().ends_with("failed: again"));
+    }
+
+    #[test]
+    fn diagnostics_list_crash_reports_by_name_and_the_log_tail() {
+        let logs = tempfile::tempdir().unwrap();
+        let crashes = tempfile::tempdir().unwrap();
+        std::fs::write(logs.path().join("sermon-cut.log"), format!("first\nlast line {}\n", ACCESS)).unwrap();
+        for (i, name) in ["sermon-cut-2026-10-01.ips", "Sermon-Cut-2026-10-02.ips", "sermon-cut-2026-10-03.ips", "sermon-cut-2026-10-04.ips", "Safari-2026-10-05.ips"].iter().enumerate() {
+            let path = crashes.path().join(name);
+            std::fs::write(&path, "crash contents").unwrap();
+            let when = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+        }
+        let text = diagnostics("1.2.3", &["Library: /x".into()], &["ffmpeg: /bin/ffmpeg".into()], logs.path(), Some(crashes.path()));
+        assert!(text.starts_with("Sermon Cut 1.2.3 ("), "{}", text);
+        assert!(text.contains("Library: /x") && text.contains("  ffmpeg: /bin/ffmpeg"));
+        assert!(text.contains("  sermon-cut-2026-10-04.ips (") && text.contains("  sermon-cut-2026-10-03.ips ("));
+        assert!(text.contains("Sermon-Cut-2026-10-02.ips") && !text.contains("2026-10-01.ips") && !text.contains("Safari"));
+        assert!(!text.contains("crash contents"));
+        assert!(text.ends_with("last line <redacted>"), "{}", text);
+        let empty = tempfile::tempdir().unwrap();
+        let text = diagnostics("1.2.3", &[], &[], empty.path(), Some(empty.path()));
+        assert!(text.contains("Crash reports: none") && text.ends_with("  (empty)"), "{}", text);
     }
 
     #[test]

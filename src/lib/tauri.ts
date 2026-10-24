@@ -178,6 +178,28 @@ export async function getAppFolders(): Promise<{ settings: string; tools: string
   return invoke("get_app_folders");
 }
 
+/** Show the app's log folder in Finder. */
+export async function openLogFolder(): Promise<void> {
+  return invoke("open_log_folder");
+}
+
+/** The app, library, tools and the end of the log, as text to send. */
+export async function getDiagnostics(): Promise<string> {
+  return invoke("diagnostics");
+}
+
+/** Put `text` (which may still be coming) on the clipboard. The text is
+ * handed over as a promise where the webview allows it, so the copy still
+ * counts as part of the click even though the text arrives later. */
+export async function copyText(text: Promise<string>): Promise<void> {
+  if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+    const blob = text.then((t) => new Blob([t], { type: "text/plain" }));
+    await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
+    return;
+  }
+  await navigator.clipboard.writeText(await text);
+}
+
 export async function openFile(path: string): Promise<void> {
   return invoke("open_file", { path });
 }

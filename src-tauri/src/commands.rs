@@ -267,6 +267,33 @@ pub async fn get_app_folders() -> Result<AppFolders, String> {
     })
 }
 
+/// Settings → Show Logs.
+#[tauri::command]
+pub async fn open_log_folder(app_handle: AppHandle) -> Result<(), String> {
+    let dir = crate::logging::log_dir(&app_handle)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+    crate::tools::os_open(crate::tools::OsOpen::Folder(&dir))
+}
+
+/// Settings → Copy diagnostics: what someone helping needs, as text. No
+/// secrets: the log is masked as it's written, and again here.
+#[tauri::command]
+pub async fn diagnostics(app_handle: AppHandle, lib: State<'_, LibraryHandle>) -> Result<String, String> {
+    let version = app_handle.package_info().version.to_string();
+    let dir = crate::logging::log_dir(&app_handle)?;
+    let library = lib.diagnostics();
+    let crash_dir = cfg!(target_os = "macos")
+        .then(dirs::home_dir)
+        .flatten()
+        .map(|h| h.join("Library/Logs/DiagnosticReports"));
+    tokio::task::spawn_blocking(move || {
+        let tools = crate::tools::report();
+        crate::logging::diagnostics(&version, &library, &tools, &dir, crash_dir.as_deref())
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {}", e))
+}
+
 #[tauri::command]
 pub async fn read_image_base64(
     app_handle: AppHandle,

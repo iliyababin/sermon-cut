@@ -1015,6 +1015,28 @@ impl Library {
         self.inner().work_in_progress()
     }
 
+    /// The library in a few lines, for the diagnostics.
+    pub fn diagnostics(&self) -> Vec<String> {
+        let g = self.inner();
+        let mode = match &g.mode {
+            Mode::Writable => "writable".to_string(),
+            Mode::Locked(host) => format!("read-only, open on {}", host),
+            Mode::ReadOnly(why) => format!("read-only: {}", why),
+            Mode::Unavailable(why) => format!("unavailable: {}", why),
+        };
+        let mut counts = std::collections::BTreeMap::new();
+        for e in &g.manifest.entries {
+            *counts.entry(format!("{:?}", e.status)).or_insert(0) += 1;
+        }
+        let counts: Vec<String> = counts.iter().map(|(status, n)| format!("{} {}", n, status)).collect();
+        vec![
+            format!("Library: {}", g.paths.as_ref().map(|p| path_string(&p.root)).unwrap_or_else(|| g.configured.clone())),
+            format!("Library mode: {}", mode),
+            format!("Videos: {} ({})", g.manifest.entries.len(), if counts.is_empty() { "none".into() } else { counts.join(", ") }),
+            format!("Queued: {}; uploading: {}; downloading: {}", g.queue.len() + g.running.is_some() as usize, g.uploads.len(), g.downloads.len()),
+        ]
+    }
+
     /// Before installing an app update: refused while anything is running,
     /// otherwise no new processing, upload or download starts until
     /// `end_update` (or the relaunch).

@@ -268,6 +268,8 @@ fn main() {
             commands::save_settings,
             commands::reset_state,
             commands::get_app_folders,
+            commands::open_log_folder,
+            commands::diagnostics,
             commands::read_image_base64,
             commands::open_file,
             commands::open_folder,

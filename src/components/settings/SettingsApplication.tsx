@@ -1,5 +1,6 @@
-import { AlertTriangle, Download, FolderOpen, Loader2, RefreshCw } from "lucide-react";
-import { clearLibraryData, errorMessage, openFolder, resetState } from "@/lib/tauri";
+import { useState } from "react";
+import { AlertTriangle, Check, ClipboardCopy, Download, FolderOpen, Loader2, RefreshCw } from "lucide-react";
+import { clearLibraryData, copyText, errorMessage, getDiagnostics, openFolder, openLogFolder, resetState } from "@/lib/tauri";
 import type { Updater } from "@/hooks/useUpdater";
 
 interface SettingsApplicationProps {
@@ -35,6 +36,17 @@ export function SettingsApplication({
   clearing,
   setClearing,
 }: SettingsApplicationProps) {
+  const [copied, setCopied] = useState(false);
+  const copyDiagnostics = async () => {
+    setActionError(null);
+    try {
+      await copyText(getDiagnostics());
+      setCopied(true);
+      setTimeout(() => setCopied(false), 3000);
+    } catch (err) {
+      setActionError(errorMessage(err, "Couldn't copy the diagnostics"));
+    }
+  };
   return (
     <div className="bg-card border border-border rounded-lg p-6">
       <h3 className="text-lg font-semibold mb-4">Application</h3>
@@ -123,6 +135,29 @@ export function SettingsApplication({
             You're on the latest version.
           </p>
         )}
+      </div>
+
+      <div className="mt-6 pt-6 border-t border-border">
+        <h4 className="text-sm font-semibold mb-2">Logs</h4>
+        <p className="text-sm text-muted-foreground mb-3">
+          If something goes wrong, send these to whoever helps you with Sermon Cut. Sign-in details and keys are kept out of them, but file paths in them include your Mac's user name.
+        </p>
+        <div className="flex gap-2">
+          <button
+            onClick={() => openLogFolder().catch((err) => setActionError(errorMessage(err, "Couldn't open the logs folder")))}
+            className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 flex items-center gap-2 text-sm transition-colors"
+          >
+            <FolderOpen className="w-4 h-4" />
+            Show Logs
+          </button>
+          <button
+            onClick={copyDiagnostics}
+            className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 flex items-center gap-2 text-sm transition-colors"
+          >
+            {copied ? <Check className="w-4 h-4" /> : <ClipboardCopy className="w-4 h-4" />}
+            {copied ? "Copied" : "Copy Diagnostics"}
+          </button>
+        </div>
       </div>
 
       <div className="mt-6 pt-6 border-t border-border">

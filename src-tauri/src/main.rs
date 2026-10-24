@@ -265,6 +265,7 @@ fn main() {
             commands::youtube_list_playlists,
             library::commands::get_library,
             library::commands::rescan_library,
+            library::commands::get_storage,
             library::commands::get_video,
             library::commands::process_video,
             library::commands::reprocess_video,

@@ -1,7 +1,7 @@
 //! Tauri commands for the library screen, review screen and downloads.
 
 use super::manifest::Review;
-use super::runtime::{AppStateHandle, EntrySession, Library, LibraryView, UploadOptions, VideoDetail};
+use super::runtime::{AppStateHandle, EntrySession, Library, LibraryView, StorageView, UploadOptions, VideoDetail};
 use crate::upload::client::{video_metadata, VideoUpload};
 use crate::upload::{self, AfterUpload, Thumbnail, TokenSource, UploadConfig, UploadError, UploadOutcome, UploadWarning};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -50,6 +50,12 @@ pub async fn rescan_library(
     crate::commands::allow_library_paths(&app_handle, lib.root().as_deref());
     crate::notify::refresh_badge(&app_handle);
     Ok(view(&lib, &state).await)
+}
+
+/// Space taken per video, and left on the library's drive.
+#[tauri::command]
+pub async fn get_storage(lib: State<'_, LibraryHandle>) -> Result<StorageView, String> {
+    off_thread(&lib, |lib| lib.storage()).await
 }
 
 #[tauri::command]

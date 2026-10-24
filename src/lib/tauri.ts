@@ -10,6 +10,7 @@ import type {
   UploadOutcome,
   UploadWarning,
   LibraryView,
+  StorageView,
   VideoDetail,
 } from "./types";
 
@@ -26,6 +27,11 @@ export async function getLibrary(): Promise<LibraryView> {
 /** List the library folder again and return the result. */
 export async function rescanLibrary(): Promise<LibraryView> {
   return invoke("rescan_library");
+}
+
+/** How much space each video takes, and how much the library's drive has left. */
+export async function getStorage(): Promise<StorageView> {
+  return invoke("get_storage");
 }
 
 export async function getVideo(videoId: string): Promise<VideoDetail> {

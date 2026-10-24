@@ -3,6 +3,7 @@ import { ErrorBanner } from "./ErrorBanner";
 import type { DownloadProgress } from "@/lib/types";
 import {
   getLibrary,
+  getStorage,
   rescanLibrary,
   processVideo,
   cancelProcessing,
@@ -20,9 +21,10 @@ import {
 } from "@/lib/tauri";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import type { LibraryVideo, LibraryView } from "@/lib/types";
+import type { LibraryVideo, LibraryView, StorageView } from "@/lib/types";
 import { duplicateFileNames } from "@/lib/utils";
 import { DownloadCard } from "./library/DownloadCard";
+import { StorageSummary } from "./library/StorageSummary";
 import { LibraryToolbar } from "./library/LibraryToolbar";
 import { VideoCard, type ProcessingProgress } from "./library/VideoCard";
 import {
@@ -42,6 +44,9 @@ interface UploadProgress {
 }
 
 const RESCAN_MS = 5000;
+/** Disk space is measured again this often while shown, and whenever a
+ * video comes, goes or changes status. */
+const STORAGE_MS = 60_000;
 
 interface VideoLibraryProps {
   onVideoSelect: (video: LibraryVideo) => void;
@@ -131,6 +136,26 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
       unlistenUpload.then((fn) => fn());
     };
   }, [refresh]);
+
+  // Space per video and on the drive. Not essential: if it can't be read,
+  // the page just goes without it.
+  const [storage, setStorage] = useState<StorageView | null>(null);
+  const storageKey = library ? library.folder + "|" + library.videos.map((v) => `${v.id}:${v.status}`).join(",") : "";
+  useEffect(() => {
+    if (!visible || !storageKey) return;
+    let current = true;
+    const measure = () =>
+      getStorage()
+        .then((s) => current && setStorage(s))
+        .catch(() => current && setStorage(null));
+    measure();
+    const timer = setInterval(measure, STORAGE_MS);
+    return () => {
+      current = false;
+      clearInterval(timer);
+    };
+  }, [visible, storageKey]);
+  const storageById = new Map(storage?.videos.map((v) => [v.id, v]));
 
   // Close the actions menu on any outside click, or Esc.
   useEffect(() => {
@@ -262,6 +287,8 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
         )}
       </div>
 
+      {storage && library.available && <StorageSummary storage={storage} folder={library.folder} />}
+
       {library.downloads.length > 0 && (
         <div className="grid gap-4 mb-4">
           {library.downloads.map((d) => (
@@ -287,6 +314,7 @@ export function VideoLibrary({ onVideoSelect, visible = true }: VideoLibraryProp
               video={video}
               sharedName={sharedNames.has(video.file_name.normalize("NFC"))}
               live={progress[video.id]}
+              storage={storageById.get(video.id)}
               uploadPercent={uploads[video.id] ?? video.upload_progress ?? 0}
               writable={library.writable}
               maxMinutes={maxMinutes}

@@ -129,6 +129,24 @@ export interface LibraryView {
   max_transcribe_secs: number;
 }
 
+/** Disk space per video and on the library's drive (get_storage). */
+export interface StorageView {
+  videos: VideoStorage[];
+  /** Sermon Cut's files that belong to no video. */
+  other: number;
+  /** The library's drive; null if it couldn't be read. */
+  disk_free: number | null;
+  disk_total: number | null;
+}
+
+export interface VideoStorage {
+  id: string;
+  /** The recording in the library folder. */
+  original: number;
+  /** Sermon Cut's files for it: the cut, audio, thumbnails. */
+  files: number;
+}
+
 export interface Review {
   title: string | null;
   description: string | null;

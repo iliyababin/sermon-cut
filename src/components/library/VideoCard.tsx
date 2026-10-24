@@ -6,6 +6,7 @@ import {
   Eye,
   EyeOff,
   Film,
+  HardDrive,
   Loader2,
   MoreHorizontal,
   Play,
@@ -17,7 +18,7 @@ import {
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { formatTimeDisplay } from "@/lib/clips";
 import { isStuckCommit } from "@/lib/tauri";
-import type { LibraryStatus, LibraryVideo, ProcessingStage } from "@/lib/types";
+import type { LibraryStatus, LibraryVideo, ProcessingStage, VideoStorage } from "@/lib/types";
 import { formatFileSize } from "@/lib/utils";
 import { LocalImage } from "../LocalImage";
 import { UploadWarnings } from "../UploadWarnings";
@@ -34,6 +35,8 @@ interface VideoCardProps {
   /** Another item has the same file name: show what tells them apart. */
   sharedName: boolean;
   live?: ProcessingProgress;
+  /** Space it takes, once measured. */
+  storage?: VideoStorage;
   uploadPercent: number;
   writable: boolean;
   maxMinutes: number;
@@ -104,6 +107,15 @@ export function VideoCard(props: VideoCardProps) {
             <span className="flex items-center gap-1">
               <Clock className="w-4 h-4" />
               {formatTimeDisplay(video.duration)}
+            </span>
+          ) : null}
+          {props.storage && props.storage.original + props.storage.files > 0 ? (
+            <span
+              className="flex items-center gap-1"
+              title={`Recording ${formatFileSize(props.storage.original)} · Sermon Cut's files ${formatFileSize(props.storage.files)}`}
+            >
+              <HardDrive className="w-4 h-4" />
+              {formatFileSize(props.storage.original + props.storage.files)}
             </span>
           ) : null}
           <StatusBadge

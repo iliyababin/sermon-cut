@@ -249,9 +249,81 @@ impl Inner {
     }
 }
 
+/// Disk space for the library page: per video, and the drive it's on.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StorageView {
+    pub videos: Vec<VideoStorage>,
+    /// Sermon Cut's own files that belong to no video (the library list,
+    /// leftovers in its temp folder).
+    pub other: u64,
+    /// The drive the library is on; None if it couldn't be read.
+    pub disk_free: Option<u64>,
+    pub disk_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct VideoStorage {
+    pub id: String,
+    /// The recording in the library folder (0 if it's gone).
+    pub original: u64,
+    /// Sermon Cut's files for it: the cut, audio, thumbnails.
+    pub files: u64,
+}
+
+/// Bytes in a folder and everything under it, not following links.
+/// Missing or unreadable parts count as nothing.
+fn folder_size(dir: &Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else { return 0 };
+    read.flatten()
+        .map(|item| match item.file_type() {
+            Ok(t) if t.is_dir() => folder_size(&item.path()),
+            Ok(t) if t.is_file() => item.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 impl Library {
     pub fn view(&self, notices: Vec<String>) -> LibraryView {
         self.inner().view(notices)
+    }
+
+    /// How much space each video takes and how much the drive has left.
+    /// Blocking (walks the video folders); nothing is read under `inner`.
+    pub fn storage(&self) -> Result<StorageView, String> {
+        let (paths, entries) = {
+            let g = self.inner();
+            let paths = g.paths.clone().ok_or("The library isn't open")?;
+            let entries: Vec<(String, String)> =
+                g.manifest.entries.iter().map(|e| (e.id.clone(), e.file_name.clone())).collect();
+            (paths, entries)
+        };
+        let videos: Vec<VideoStorage> = entries
+            .into_iter()
+            .map(|(id, file_name)| {
+                let original = paths
+                    .original(&file_name)
+                    .ok()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let files = paths.video_dir(&id).map(|d| folder_size(&d)).unwrap_or(0);
+                VideoStorage { id, original, files }
+            })
+            .collect();
+        let in_videos: u64 = videos.iter().map(|v| v.files).sum();
+        // Folders of videos no longer listed count as "other" too.
+        let other = folder_size(&paths.data_dir()).saturating_sub(in_videos);
+        // statvfs's "available": on macOS it leaves out purgeable space, so
+        // Finder can show a little more free.
+        let disk = fs4::statvfs(&paths.root).ok();
+        Ok(StorageView {
+            videos,
+            other,
+            disk_free: disk.as_ref().map(|d| d.available_space()),
+            disk_total: disk.as_ref().map(|d| d.total_space()),
+        })
     }
 
     /// Videos waiting for review, for the Dock badge.
@@ -348,6 +420,37 @@ mod tests {
             copy
         };
         assert_eq!(lib.detail(&copy).unwrap().duplicate_upload.as_deref(), Some(crate::upload::watch_url("abc").as_str()));
+    }
+
+    #[test]
+    fn storage_counts_the_recording_and_the_video_folder() {
+        let (t, lib, id, dir) = processed_library();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/audio.opus"), vec![0u8; 1000]).unwrap();
+        let before = lib.storage().unwrap();
+        let v = before.videos.iter().find(|v| v.id == id).unwrap();
+        // a.mp4 holds "video"; the folder has three 3-byte jpgs, video.json
+        // and the 1000-byte audio.
+        assert_eq!(v.original, 5);
+        let json = std::fs::metadata(dir.join("video.json")).unwrap().len();
+        assert_eq!(v.files, 9 + json + 1000);
+        assert!(before.disk_total.unwrap() >= before.disk_free.unwrap());
+        assert!(before.disk_free.unwrap() > 0);
+
+        // A missing recording counts as nothing rather than failing.
+        std::fs::remove_file(t.path().join("lib/a.mp4")).unwrap();
+        assert_eq!(lib.storage().unwrap().videos.iter().find(|v| v.id == id).unwrap().original, 0);
+    }
+
+    #[test]
+    fn storage_counts_unlisted_leftovers_as_other() {
+        let (_t, lib, _id, _dir) = processed_library();
+        let base = lib.storage().unwrap().other;
+        let paths = lib.inner().paths.clone().unwrap();
+        let stray = paths.videos_dir().join("gone-video");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("trimmed.mp4"), vec![0u8; 500]).unwrap();
+        assert_eq!(lib.storage().unwrap().other, base + 500);
     }
 
     #[test]

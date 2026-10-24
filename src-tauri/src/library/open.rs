@@ -5,7 +5,9 @@ use super::*;
 /// renders (`.render-tmp-*`); and, under each video's lock, renders its
 /// video.json doesn't record.
 fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
+    let had_tmp = std::fs::symlink_metadata(paths.tmp_dir()).is_ok();
     let _ = std::fs::remove_dir_all(paths.tmp_dir()); // removes a symlink itself, never its target
+    let mut removed = 0;
     let mut dirs = vec![paths.data_dir()];
     let videos_dir = paths.videos_dir();
     if std::fs::symlink_metadata(&videos_dir).is_ok_and(|m| m.is_dir()) {
@@ -26,8 +28,8 @@ fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
             // A temp file of this run is a write in flight (a review or
             // library.json being saved meanwhile), not a crash's leftover.
             let leftover = name.contains(TMP_MARKER) && !fsutil::is_own_tmp(&name);
-            if leftover || name.starts_with(manifest::RENDER_TMP_PREFIX) {
-                let _ = std::fs::remove_file(e.path());
+            if (leftover || name.starts_with(manifest::RENDER_TMP_PREFIX)) && std::fs::remove_file(e.path()).is_ok() {
+                removed += 1;
             }
         }
         let id = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -36,6 +38,9 @@ fn sweep(paths: &LibraryPaths, video_lock: &dyn Fn(&str) -> Arc<Mutex<()>>) {
             let _v = hold(&lock);
             manifest::prune_renders(&dir, &manifest::load_video_data(&dir));
         }
+    }
+    if had_tmp || removed > 0 {
+        log::info!("Swept leftovers of an earlier run: {} temp files{}", removed, if had_tmp { " and the temp folder" } else { "" });
     }
 }
 
@@ -168,8 +173,9 @@ impl Library {
         let paths = match open_paths(&configured) {
             Ok(p) => p,
             Err(mode) => {
-                let mut g = self.inner();
-                g.mode = mode;
+                let reason = mode.reason().unwrap_or_default();
+                self.inner().mode = mode;
+                self.availability().log_failure(reason);
                 return;
             }
         };
@@ -235,9 +241,10 @@ impl Library {
             (g.session.clone(), running, idle, g.running.is_none() && g.queue.is_empty())
         };
         let sweeping = idle.then(|| SweepGuard { lib: self });
+        let mut took_lock = false;
         if mode == Mode::Writable {
             match lock::acquire(&paths, &session, force_lock) {
-                Ok(Acquire::Acquired) => {}
+                Ok(Acquire::Acquired) => took_lock = true,
                 Ok(Acquire::HeldBy(host)) => mode = Mode::Locked(host),
                 Err(e) => mode = Mode::ReadOnly(format!("Sermon Cut can't write to this folder: {}", e)),
             }
@@ -307,11 +314,34 @@ impl Library {
             g.save_logged();
         }
         let wake = !g.queue.is_empty();
+        let (root, mode, notice, queued) = (path_string(&paths_root(&g)), g.mode.clone(), g.notice.clone(), g.queue.len());
         drop(g);
         if wake {
             self.wake.notify_one();
         }
+        self.log_opened(&root, &mode, took_lock && force_lock, notice.as_deref(), queued);
     }
+
+    /// One line for each open, or (through `availability`) for a library
+    /// that stays unavailable.
+    fn log_opened(&self, root: &str, mode: &Mode, took_over: bool, notice: Option<&str>, queued: usize) {
+        let how = match mode {
+            Mode::Unavailable(why) => return self.availability().log_failure(why),
+            Mode::Writable if took_over => "writable; took the lock over".to_string(),
+            Mode::Writable => "writable".to_string(),
+            Mode::Locked(host) => format!("read-only, open on {}", host),
+            Mode::ReadOnly(why) => format!("read-only: {}", why),
+        };
+        self.availability().log_recovered();
+        log::info!("Opened the library {} ({}); {} queued", root, how, queued);
+        if let Some(notice) = notice {
+            log::warn!("{}", notice);
+        }
+    }
+}
+
+fn paths_root(g: &Inner) -> PathBuf {
+    g.paths.as_ref().map(|p| p.root.clone()).unwrap_or_default()
 }
 
 #[cfg(test)]

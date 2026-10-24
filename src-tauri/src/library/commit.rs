@@ -196,9 +196,11 @@ pub(super) fn recover_commit(dir: &Path) {
     let journal: Option<CommitJournal> = fsutil::read_json(&backup.join(COMMIT_JOURNAL), 1 << 20).ok().flatten();
     // `DONE`: how an earlier build marked a finished commit.
     if journal.as_ref().is_some_and(|j| j.phase == CommitPhase::Done) || backup.join("DONE").exists() {
+        log::info!("Cleaning up a finished commit in {}", dir.display());
         let _ = std::fs::remove_dir_all(&backup);
         return;
     }
+    log::warn!("Recovering an interrupted commit in {}", dir.display());
     let mut restored = true;
     for name in names_in(&backup).unwrap_or_default() {
         if name == COMMIT_JOURNAL || name.contains(TMP_MARKER) {
@@ -217,6 +219,9 @@ pub(super) fn recover_commit(dir: &Path) {
     }
     if restored {
         let _ = std::fs::remove_dir_all(&backup);
+        log::info!("Put the earlier outputs back in {}", dir.display());
+    } else {
+        log::error!("Couldn't put all the earlier outputs back in {}; the backup is kept", dir.display());
     }
 }
 

@@ -90,6 +90,7 @@ fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
         // Already asking; that answer decides.
         return true;
     }
+    log::info!("Quit requested while working on {}; asking first", work);
     let app = app.clone();
     app.dialog()
         .message(format!(
@@ -103,6 +104,7 @@ fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
             let app = app.clone();
             move |quit| {
                 ASKING.store(false, Ordering::SeqCst);
+                log::info!("{}", if quit { "Quitting anyway" } else { "Kept working instead of quitting" });
                 if !quit {
                     // Kept working: the next close or quit saves again.
                     FLUSHED.store(false, Ordering::SeqCst);
@@ -182,13 +184,15 @@ fn main() {
                     let handle = handle.clone();
                     async move {
                         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                        let mut failures = logging::FailureTracker::new(module_path!(), "The auto-process scan");
                         loop {
                             tick.tick().await;
                             if !app_state.lock().await.settings.auto_process {
                                 continue;
                             }
-                            if let Err(e) = library.rescan(&app_state).await {
-                                log::warn!("Scan failed: {}", e);
+                            match library.rescan(&app_state).await {
+                                Ok(()) => failures.log_recovered(),
+                                Err(e) => failures.log_failure(e),
                             }
                             let _ = tauri::Emitter::emit(&handle, "library-changed", ());
                             notify::refresh_badge(&handle);
@@ -207,6 +211,7 @@ fn main() {
                                     log::warn!("{} took over the library; read-only now", host);
                                 }
                                 HeartbeatOutcome::Regained => {
+                                    log::info!("The other computer let go of the library; reopening it");
                                     if let Err(e) = library.reopen().await {
                                         log::error!("Reopen failed: {}", e);
                                     }
@@ -324,7 +329,10 @@ fn main() {
                 api.prevent_exit();
             }
         }
-        tauri::RunEvent::Exit => library.release_lock(),
+        tauri::RunEvent::Exit => {
+            log::info!("Quitting");
+            library.release_lock();
+        }
         _ => {}
     });
 }

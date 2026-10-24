@@ -178,6 +178,10 @@ pub struct Library {
     wake: tokio::sync::Notify,
     /// The pre-0.4 migration ran this launch.
     migration_tried: std::sync::atomic::AtomicBool,
+    /// Logs an unavailable folder (unplugged drive) once, not every scan.
+    /// Like `heartbeat_log`, a leaf: no other lock is taken while held.
+    availability: Mutex<crate::logging::FailureTracker>,
+    heartbeat_log: Mutex<crate::logging::FailureTracker>,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +458,8 @@ impl Library {
             video_locks: Mutex::new(std::collections::HashMap::new()),
             wake: tokio::sync::Notify::new(),
             migration_tried: std::sync::atomic::AtomicBool::new(false),
+            availability: Mutex::new(crate::logging::FailureTracker::new(module_path!(), "Opening the library")),
+            heartbeat_log: Mutex::new(crate::logging::FailureTracker::new(module_path!(), "The lock heartbeat")),
         });
         lib.inner().configured = configured;
         lib
@@ -461,6 +467,10 @@ impl Library {
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn availability(&self) -> MutexGuard<'_, crate::logging::FailureTracker> {
+        self.availability.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The lock for one video's folder. Lock it with `hold`, before `inner`.
@@ -489,7 +499,7 @@ impl Library {
         // changes, nothing can be written (the old paths are gone).
         let _scan = self.scan_lock.lock().await;
         let _lock_file = self.lock_file_mutex.lock().await;
-        let (paths, session) = {
+        let (paths, session, from) = {
             let mut g = self.inner();
             if g.configured == configured {
                 return Ok(());
@@ -497,12 +507,13 @@ impl Library {
             if !g.is_idle() {
                 return Err(SWITCH_BUSY.into());
             }
-            g.configured = configured;
+            let from = std::mem::replace(&mut g.configured, configured);
             g.mode = Mode::Unavailable("Switching folders…".into());
             // The new folder's videos are a backlog, not new arrivals.
             g.baseline_scan = true;
-            (g.paths.take(), g.session.clone())
+            (g.paths.take(), g.session.clone(), from)
         };
+        log::info!("Switching the library from {}", from);
         let lib = self.clone();
         blocking(move || {
             if let Some(old) = paths {
@@ -543,6 +554,7 @@ impl Library {
     }
 
     pub async fn take_over(self: &Arc<Self>) -> Result<(), String> {
+        log::info!("Taking the library over from the other computer");
         let _scan = self.scan_lock.lock().await;
         let _lock_file = self.lock_file_mutex.lock().await;
         // What arrived while another computer had it is a backlog.
@@ -576,9 +588,12 @@ impl Library {
                     }
                     HeartbeatOutcome::Unchanged
                 }
-                Ok(None) => HeartbeatOutcome::Unchanged,
+                Ok(None) => {
+                    lib.heartbeat_log.lock().unwrap_or_else(|p| p.into_inner()).log_recovered();
+                    HeartbeatOutcome::Unchanged
+                }
                 Err(e) => {
-                    log::warn!("Lock heartbeat failed: {}", e);
+                    lib.heartbeat_log.lock().unwrap_or_else(|p| p.into_inner()).log_failure(e);
                     HeartbeatOutcome::Unchanged
                 }
             },
@@ -597,6 +612,7 @@ impl Library {
     /// Reopen after the lock was regained. What arrived while another
     /// computer had the library is a backlog, not new arrivals.
     pub async fn reopen(self: &Arc<Self>) -> Result<(), String> {
+        log::info!("Reopening the library");
         let _scan = self.scan_lock.lock().await;
         let _lock_file = self.lock_file_mutex.lock().await;
         self.inner().baseline_scan = true;
@@ -635,6 +651,7 @@ impl Library {
             (paths, g.manifest.clone())
         };
         self.migration_tried.store(true, std::sync::atomic::Ordering::Relaxed);
+        log::info!("Moving {} videos from before the library into it", legacy.len());
 
         let moved = blocking({
             let paths = paths.clone();
@@ -719,10 +736,13 @@ impl Library {
                 Ok(obs) => obs,
                 Err(e) => {
                     let folder = g.paths.as_ref().map(|p| path_string(&p.root)).unwrap_or_default();
-                    g.mode = Mode::Unavailable(format!(
+                    let why = format!(
                         "Can't read the library folder {} ({}). If it's on an external drive, plug it back in.",
                         folder, e
-                    ));
+                    );
+                    g.mode = Mode::Unavailable(why.clone());
+                    drop(g);
+                    self.availability().log_failure(why);
                     return Ok(());
                 }
             }
@@ -769,10 +789,24 @@ impl Library {
     /// Apply a scan, then delete replaced videos' old outputs outside the
     /// lock. Those videos stay busy (nothing can be queued) until done.
     async fn finish_scan(self: &Arc<Self>, obs: &[FileObs]) {
-        let (stale, paths) = {
+        let (stale, paths, summary) = {
             let mut g = self.inner();
-            (g.apply_scan(obs), g.paths.clone())
+            let stale = g.apply_scan(obs);
+            let summary = g.last.changed.then(|| {
+                format!(
+                    "Library scan: {} videos, {} in the folder, {} still copying, {} unreadable, {} replaced",
+                    g.manifest.entries.len(),
+                    g.last.present.len(),
+                    g.last.copying.len() + g.last.copying_ids.len(),
+                    g.last.unreadable.len() + g.last.unreadable_ids.len(),
+                    g.last.replaced.len()
+                )
+            });
+            (stale, g.paths.clone(), summary)
         };
+        if let Some(summary) = summary {
+            log::info!("{}", summary);
+        }
         if stale.is_empty() {
             return;
         }
@@ -993,12 +1027,15 @@ impl Library {
             ));
         }
         g.updating = true;
+        drop(g);
+        log::info!("Installing an app update; no new work starts");
         Ok(())
     }
 
     /// The update failed: work may start again.
     pub fn end_update(&self) {
         self.inner().updating = false;
+        log::info!("The app update ended without a restart; work may start again");
     }
 
     pub fn reveal_path(&self, id: &str) -> Result<PathBuf, String> {
@@ -1033,6 +1070,7 @@ impl Library {
             paths
         };
         let _lock_file = self.lock_file_mutex.lock().await;
+        log::warn!("Clearing the library's data in {}", paths.root.display());
         let lib = self.clone();
         blocking(move || {
             let data = paths.data_dir();

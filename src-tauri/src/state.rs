@@ -164,6 +164,10 @@ impl std::fmt::Debug for Settings {
     }
 }
 
+/// Settings whose values may go in the log (as saved in state.json).
+const LOGGED_SETTINGS: [&str; 6] =
+    ["download_quality", "auto_process", "upload_privacy", "output_folder", "logo_path", "youtube_playlist_id"];
+
 /// How many speakers `recent_preachers` keeps.
 pub const MAX_RECENT_PREACHERS: usize = 10;
 
@@ -398,6 +402,27 @@ impl Settings {
             }
             self.auto_process = on;
         }
+    }
+
+    /// What changed from `old`, for the log. Only the fields in
+    /// LOGGED_SETTINGS show their value; any other field (the Modal key,
+    /// the sign-in, ...) is only named.
+    pub fn changes_from(&self, old: &Settings) -> Vec<String> {
+        let (Ok(serde_json::Value::Object(new)), Ok(serde_json::Value::Object(old))) =
+            (serde_json::to_value(self), serde_json::to_value(old))
+        else {
+            return Vec::new();
+        };
+        new.iter()
+            .filter(|(k, v)| old.get(*k) != Some(*v))
+            .map(|(k, v)| {
+                if LOGGED_SETTINGS.contains(&k.as_str()) {
+                    format!("{} = {}", k, v)
+                } else {
+                    format!("{} changed", k)
+                }
+            })
+            .collect()
     }
 
     /// The library folder, or the default one when none is set.
@@ -660,6 +685,22 @@ fn make_private(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_harmless_settings_are_logged_with_their_values() {
+        let old = Settings::default();
+        let mut new = old.clone();
+        new.download_quality = "720p".into();
+        new.modal_api_key = Some("modal-hidden-key".into());
+        new.youtube_auth = Some(YouTubeAuth { refresh_token: Some("1//hidden-refresh".into()), ..Default::default() });
+        new.library_folder = "/Volumes/Media/Sermons".into();
+        let changes = new.changes_from(&old).join(", ");
+        assert!(changes.contains("download_quality = \"720p\""), "{}", changes);
+        assert!(changes.contains("output_folder = \"/Volumes/Media/Sermons\""), "{}", changes);
+        assert!(changes.contains("modal_api_key changed") && changes.contains("youtube_auth changed"), "{}", changes);
+        assert!(!changes.contains("hidden"), "{}", changes);
+        assert!(old.changes_from(&old).is_empty());
+    }
 
     #[test]
     fn debug_output_hides_the_sign_in_and_the_key() {

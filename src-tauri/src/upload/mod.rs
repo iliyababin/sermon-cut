@@ -184,7 +184,15 @@ pub async fn run(
 ) -> Result<UploadOutcome, UploadError> {
     let uploader = client::Uploader { http, cfg, tokens, cancel };
     let up = uploader.upload(store, video, on_progress).await?;
-    log::info!("Video uploaded: {}", up.video_id);
+    match &up.earlier {
+        Some(e) => log::info!(
+            "An earlier upload is on YouTube as {} ({})",
+            up.video_id,
+            if e.new_cut { "another cut" } else { "other metadata" }
+        ),
+        None if up.before_cancel => log::info!("Video uploaded before the cancel: {}", up.video_id),
+        None => log::info!("Video uploaded: {}", up.video_id),
+    }
     // An earlier cut isn't given this cut's thumbnail, captions or playlist.
     let warnings = match &up.earlier {
         Some(e) if e.new_cut => Vec::new(),

@@ -100,6 +100,12 @@ pub async fn after_upload(
     steps: &AfterUpload,
 ) -> Vec<UploadWarning> {
     let mut warnings = Vec::new();
+    log::info!(
+        "After the upload: {}{}{}",
+        if steps.thumbnail.is_some() { "thumbnail " } else { "" },
+        if steps.captions.as_deref().is_some_and(|s| !s.trim().is_empty()) { "captions " } else { "" },
+        if steps.playlist_id.is_some() { "playlist" } else { "" }
+    );
 
     if let Some(thumb) = &steps.thumbnail {
         if let Err(e) = authed(tokens, |t| async move { set_thumbnail(http, endpoints, &t, video_id, thumb).await }).await {
@@ -234,7 +240,12 @@ pub async fn update_metadata_authed(
     title: &str,
     description: &str,
 ) -> Result<(), UploadError> {
-    authed(tokens, |t| async move { update_metadata(http, endpoints, &t, video_id, title, description).await }).await
+    let result = authed(tokens, |t| async move { update_metadata(http, endpoints, &t, video_id, title, description).await }).await;
+    match &result {
+        Ok(()) => log::info!("Updated the title and description of {}", video_id),
+        Err(e) => log::warn!("Updating the title and description of {} failed: {}", video_id, e.log_text()),
+    }
+    result
 }
 
 pub async fn add_to_playlist(

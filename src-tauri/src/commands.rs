@@ -211,6 +211,10 @@ where
             s.settings = previous;
             return Err(e);
         }
+        let changes = s.settings.changes_from(&previous);
+        if !changes.is_empty() {
+            log::info!("Settings changed: {}", changes.join(", "));
+        }
         (previous.library_folder, new_folder.map(|_| s.settings.library_folder_or_default()))
     };
 
@@ -390,13 +394,25 @@ pub async fn youtube_sign_in(
 
     // Wait for the browser (up to five minutes). Starting another sign-in
     // cancels this one.
+    log::info!("Signing in to YouTube");
     let (slot, cancel) = sign_in.begin();
     let tokens = youtube::start_oauth_flow(&credentials, cancel).await;
     sign_in.end(slot);
-    let tokens = tokens?;
+    // Not the error itself: it can hold Google's answer.
+    let tokens = tokens.inspect_err(|e| {
+        let known = [youtube::SIGN_IN_CANCELLED, youtube::SIGN_IN_TIMED_OUT, youtube::SIGN_IN_REPLACED];
+        log::warn!("Sign-in didn't finish{}", if known.contains(&e.as_str()) { format!(": {}", e) } else { String::new() })
+    })?;
+    crate::logging::register_secret(&tokens.access_token);
+    if let Some(refresh) = &tokens.refresh_token {
+        crate::logging::register_secret(refresh);
+    }
 
     // Get channel info
-    let channel_info = youtube::get_channel_info(&tokens.access_token).await?;
+    let channel_info = youtube::get_channel_info(&tokens.access_token)
+        .await
+        .inspect_err(|_| log::warn!("Signed in, but the channel couldn't be read"))?;
+    log::info!("Signed in to YouTube as {}", channel_info.title);
 
     // Save tokens to state
     let auth = YouTubeAuth {
@@ -426,6 +442,7 @@ pub async fn youtube_sign_out(
 ) -> Result<(), String> {
     let mut state = state.lock().await;
     state.settings.youtube_auth = None;
+    log::info!("Signed out of YouTube");
     state.save()
 }
 
@@ -503,7 +520,11 @@ pub(crate) async fn access_token_with(
     };
 
     let credentials = credentials().map_err(UploadError::Other)?;
-    let new_tokens = crate::youtube::refresh_access_token_at(&credentials, &refresh, token_url).await?;
+    let new_tokens = crate::youtube::refresh_access_token_at(&credentials, &refresh, token_url)
+        .await
+        .inspect_err(|e| log::warn!("Renewing the YouTube sign-in failed: {}", e.log_text()))?;
+    crate::logging::register_secret(&new_tokens.access_token);
+    log::info!("Renewed the YouTube sign-in");
     let mut g = state.lock().await;
     let Some(auth) = g.settings.youtube_auth.as_mut() else {
         return Err(UploadError::Auth("signed out".into()));

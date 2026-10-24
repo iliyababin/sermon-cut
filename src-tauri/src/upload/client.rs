@@ -13,6 +13,7 @@
 //!   not after a fixed total time, so slow uplinks still work.
 //! - A 401 refreshes the token once and carries on.
 
+use crate::logging::FailureTracker;
 use super::error::{parse_retry_after, UploadError};
 use super::session::{file_key, metadata_hash, SessionStore, UploadSession};
 use super::{content_type, TokenSource, UploadConfig};
@@ -169,6 +170,17 @@ impl Uploader<'_> {
         let current = Current { file_hash: video.file_hash, size, metadata_hash: &mhash, file_key: &fkey };
 
         let mut file = tokio::fs::File::open(video.path).await.map_err(|e| UploadError::File(e.to_string()))?;
+        log::info!("Uploading {} ({:.1} MB)", file_name, size as f64 / 1e6);
+        // The log hears every tenth.
+        let tenths = std::sync::atomic::AtomicU64::new(0);
+        let progress = |sent: u64, size: u64| {
+            let tenth = (sent * 10).checked_div(size).unwrap_or(0);
+            if tenth > tenths.fetch_max(tenth, std::sync::atomic::Ordering::Relaxed) && tenth < 10 {
+                log::info!("Upload {}% ({} of {} bytes)", tenth * 10, sent, size);
+            }
+            on_progress(sent, size)
+        };
+        let on_progress: Progress<'_> = &progress;
         let mut token = self.tokens.token().await?;
         on_progress(0, size);
 
@@ -177,6 +189,8 @@ impl Uploader<'_> {
         let mut offset = None;
         let mut confirmed: u64 = 0;
         if let Some(stored) = store.load() {
+            crate::logging::register_secret(&stored.uri);
+            log::info!("Checking the stored upload session from {} with YouTube", stored.created);
             match self.settle(store, &mut token, stored, &current).await? {
                 Settled::Fresh => {}
                 Settled::Resume(s, n) => {
@@ -196,6 +210,7 @@ impl Uploader<'_> {
         let mut failures = 0u32;
         let mut refreshed = false;
         let mut asked_again = false;
+        let mut retries = FailureTracker::new(module_path!(), "Uploading");
         loop {
             if self.cancel.is_cancelled() {
                 return Err(UploadError::Cancelled);
@@ -218,6 +233,8 @@ impl Uploader<'_> {
             };
             match step {
                 Ok(Step::Created(s)) => {
+                    crate::logging::register_secret(&s.uri);
+                    log::info!("Started a new upload session");
                     store.save(Some(&s));
                     session = Some(s);
                     offset = Some(0);
@@ -231,6 +248,7 @@ impl Uploader<'_> {
                 Ok(Step::Resume(n)) if n >= size => {
                     // Every byte is there but no video: ask once more.
                     if asked_again {
+                        log::warn!("YouTube has every byte but didn't finish the upload");
                         return Err(UploadError::Unfinished);
                     }
                     asked_again = true;
@@ -241,15 +259,17 @@ impl Uploader<'_> {
                     // or a server that never moves would loop forever.
                     failures += 1;
                     if failures >= self.cfg.max_attempts {
+                        log::warn!("Giving up: no progress after {} tries", failures);
                         return Err(UploadError::Stalled);
                     }
-                    self.pause(&UploadError::Stalled, failures).await?;
+                    self.pause(&UploadError::Stalled, failures, &mut retries).await?;
                     offset = Some(n);
                 }
                 Ok(Step::Resume(n)) => {
                     if n > confirmed {
                         failures = 0;
                         refreshed = false;
+                        retries.log_recovered();
                     }
                     confirmed = n;
                     offset = Some(n);
@@ -270,15 +290,17 @@ impl Uploader<'_> {
                         return Err(UploadError::Auth(e));
                     }
                     refreshed = true;
+                    log::info!("YouTube refused the sign-in; renewing it");
                     token = self.tokens.refresh().await?;
                     offset = None;
                 }
                 Err(e) if e.is_retryable() => {
                     failures += 1;
                     if failures >= self.cfg.max_attempts {
+                        log::warn!("Giving up after {} tries: {}", failures, e.log_text());
                         return Err(e);
                     }
-                    self.pause(&e, failures).await?;
+                    self.pause(&e, failures, &mut retries).await?;
                     offset = None;
                 }
                 Err(e) => return Err(e),
@@ -286,10 +308,11 @@ impl Uploader<'_> {
         }
     }
 
-    /// Wait before retry number `failures`, unless cancelled.
-    async fn pause(&self, e: &UploadError, failures: u32) -> Result<(), UploadError> {
+    /// Wait before retry number `failures`, unless cancelled. `retries`
+    /// logs when they start, every five minutes, and when they stop.
+    async fn pause(&self, e: &UploadError, failures: u32, retries: &mut FailureTracker) -> Result<(), UploadError> {
         let delay = self.cfg.backoff.delay(failures, e.retry_after());
-        log::warn!("{} (try {}); retrying in {:?}", e.log_text(), failures, delay);
+        retries.log_failure(format!("{} (try {}); retrying in {:.1}s", e.log_text(), failures, delay.as_secs_f64()));
         tokio::select! {
             _ = (self.cfg.sleep)(delay) => Ok(()),
             _ = self.cancel.cancelled() => Err(UploadError::Cancelled),
@@ -326,6 +349,7 @@ impl Uploader<'_> {
         let mut failures = 0u32;
         let mut refreshed = false;
         let mut asked_again = false;
+        let mut retries = FailureTracker::new(module_path!(), "Checking the stored session");
         loop {
             if self.cancel.is_cancelled() {
                 return Err(UploadError::Cancelled);
@@ -347,7 +371,10 @@ impl Uploader<'_> {
                     store.save(None);
                     return if matches { Err(UploadError::NeverFinished) } else { Ok(Settled::Fresh) };
                 }
-                Ok(Step::Resume(n)) if matches => return Ok(Settled::Resume(stored, n)),
+                Ok(Step::Resume(n)) if matches => {
+                    retries.log_recovered();
+                    return Ok(Settled::Resume(stored, n));
+                }
                 Ok(Step::Resume(_)) => {
                     log::info!("Dropping an unfinished session for another file or metadata");
                     store.save(None);
@@ -366,7 +393,7 @@ impl Uploader<'_> {
                 }
                 Err(e) if e.is_retryable() && failures + 1 < self.cfg.max_attempts => {
                     failures += 1;
-                    self.pause(&e, failures).await?;
+                    self.pause(&e, failures, &mut retries).await?;
                 }
                 Err(e) => {
                     log::warn!("Couldn't check the stored session: {}", e.log_text());

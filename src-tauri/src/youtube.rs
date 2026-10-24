@@ -98,7 +98,7 @@ impl YouTubeCredentials {
             .get("installed")
             .ok_or("Invalid credentials format: missing 'installed' key")?;
 
-        Ok(YouTubeCredentials {
+        let credentials = YouTubeCredentials {
             client_id: installed["client_id"]
                 .as_str()
                 .ok_or("Missing client_id")?
@@ -107,7 +107,9 @@ impl YouTubeCredentials {
                 .as_str()
                 .ok_or("Missing client_secret")?
                 .to_string(),
-        })
+        };
+        crate::logging::register_secret(&credentials.client_secret);
+        Ok(credentials)
     }
 }
 
@@ -370,10 +372,12 @@ async fn exchange_code_for_tokens(
         .map_err(|e| format!("Couldn't reach Google to finish signing in: {}", e))?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let error_text = response
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
+        log::warn!("Google answered {} ({} bytes) when finishing the sign-in", status, error_text.len());
         return Err(format!("Signing in failed: {}", error_text));
     }
 
@@ -448,10 +452,12 @@ pub async fn get_channel_info(access_token: &str) -> Result<ChannelInfo, String>
         .map_err(|e| format!("Failed to get channel info: {}", e))?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let error_text = response
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
+        log::warn!("YouTube answered {} ({} bytes) when asked for the channel", status, error_text.len());
         return Err(format!("Failed to get channel info: {}", error_text));
     }
 

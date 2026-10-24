@@ -54,6 +54,7 @@ fn info_args(url: &str) -> Result<Vec<String>, String> {
 }
 
 pub async fn get_video_info(url: &str) -> Result<VideoInfo, String> {
+    log::info!("Asking yt-dlp about a video on {}", crate::logging::url_host(url));
     let output = crate::tools::command("yt-dlp")
         .args(info_args(url)?)
         .output()
@@ -61,6 +62,11 @@ pub async fn get_video_info(url: &str) -> Result<VideoInfo, String> {
         .map_err(|e| crate::tools::spawn_error("yt-dlp", e))?;
 
     if !output.status.success() {
+        log::warn!(
+            "yt-dlp failed ({}) reading the video's details:\n{}",
+            output.status,
+            crate::logging::output_tail(&output.stderr, 20)
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("yt-dlp error: {}", stderr));
     }
@@ -131,6 +137,8 @@ pub async fn download_video(
         _ => "bestvideo+bestaudio/best",
     };
 
+    log::info!("Downloading a video from {} ({})", crate::logging::url_host(url), quality);
+    let started = std::time::Instant::now();
     let mut child = crate::tools::command("yt-dlp")
         .args(download_args(format, output_template_str, url)?)
         .stdout(Stdio::piped())
@@ -166,6 +174,7 @@ pub async fn download_video(
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
                     child.kill().await.ok();
+                    log::info!("Download cancelled");
                     return Err("Download cancelled".to_string());
                 }
             }
@@ -210,8 +219,10 @@ pub async fn download_video(
 
     if !status.success() {
         let output_tail = stderr_task.await.unwrap_or_default();
+        log::warn!("yt-dlp failed ({}):\n{}", status, crate::logging::output_tail(output_tail.as_bytes(), 20));
         return Err(format!("Download failed: {}", output_tail.trim()));
     }
+    log::info!("yt-dlp finished ({}) in {}s", status, started.elapsed().as_secs());
 
     find_downloaded_file(output_dir)
 }

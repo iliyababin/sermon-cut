@@ -157,7 +157,7 @@ pub fn content_hash(path: &Path, size: u64) -> io::Result<String> {
         file.read_exact(&mut buf)?;
         ctx.consume(&buf);
     }
-    Ok(format!("{:x}", ctx.compute()))
+    Ok(format!("{:x}", ctx.finalize()))
 }
 
 /// Fingerprint a file as it is right now. Refuses symlinks.

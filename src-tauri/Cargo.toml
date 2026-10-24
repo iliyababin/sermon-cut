@@ -19,19 +19,19 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.13", features = ["json", "stream", "form", "query"] }
-base64 = "0.22"
+base64 = "0.23"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+dirs = "7"
 futures = "0.3"
-md5 = "0.7"
-sha2 = "0.10"
+md5 = "0.8"
+sha2 = "0.11"
 urlencoding = "2.1"
 ort = "2.0.0-rc.15"
 ndarray = "0.17"
 image = { version = "0.25", features = ["jpeg", "png"] }
 # Colour profiles (e.g. Display P3) to sRGB; image already depends on it.
-moxcms = "0.7"
+moxcms = "0.8"
 # Also the thumbnail pipeline's scratch folder for candidate frames.
 tempfile = "3.14"
 tauri-plugin-updater = "2.0"

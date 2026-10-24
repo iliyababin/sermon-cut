@@ -463,7 +463,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                   type="text"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
-                  className="w-full px-3 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="w-full px-3 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring"
                 />
               </div>
 
@@ -483,7 +483,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                     setPreacher(e.target.value);
                   }}
                   placeholder="Enter speaker name"
-                  className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-ring ${
+                  className={`w-full px-3 py-2 border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring ${
                     !preacher.trim() ? "border-red-300" : "border-input"
                   }`}
                 />
@@ -521,7 +521,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   rows={4}
-                  className="w-full px-3 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring resize-none"
+                  className="w-full px-3 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring resize-none"
                 />
               </div>
 
@@ -547,7 +547,7 @@ export function ReviewScreen({ video, onBack, active = true }: ReviewScreenProps
 
               <details className="text-sm">
                 <summary className="cursor-pointer font-medium">Preview YouTube description</summary>
-                <pre className="mt-2 p-2 bg-muted rounded-lg whitespace-pre-wrap break-words font-sans text-xs text-muted-foreground max-h-64 overflow-y-auto">
+                <pre className="mt-2 p-2 bg-muted rounded-lg whitespace-pre-wrap wrap-break-word font-sans text-xs text-muted-foreground max-h-64 overflow-y-auto">
                   {youtubeDescription}
                 </pre>
               </details>

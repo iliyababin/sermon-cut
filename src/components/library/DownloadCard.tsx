@@ -6,7 +6,7 @@ export function DownloadCard({ item, progress, onCancel }: { item: DownloadItem;
   const pct = progress?.progress ?? 0;
   return (
     <div className="flex gap-4 p-4 bg-card border border-border rounded-lg">
-      <div className="w-48 h-28 bg-muted rounded-lg flex items-center justify-center flex-shrink-0">
+      <div className="w-48 h-28 bg-muted rounded-lg flex items-center justify-center shrink-0">
         <Download className="w-8 h-8 text-muted-foreground" />
       </div>
       <div className="flex-1 min-w-0">

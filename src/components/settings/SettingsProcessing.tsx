@@ -28,7 +28,7 @@ export function SettingsProcessing({
           value={settings.modal_api_url}
           onChange={(e) => edit("modal_api_url", e.target.value)}
           onBlur={() => flushField("modal_api_url")}
-          className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring font-mono text-sm"
+          className="w-full px-4 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring font-mono text-sm"
         />
         <FieldError message={fieldErrors.modal_api_url} />
       </div>
@@ -44,7 +44,7 @@ export function SettingsProcessing({
           onChange={(e) => edit("modal_api_key", e.target.value || null)}
           onBlur={() => flushField("modal_api_key")}
           placeholder="Leave empty if not required"
-          className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring"
+          className="w-full px-4 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring"
         />
         <FieldError message={fieldErrors.modal_api_key} />
       </div>

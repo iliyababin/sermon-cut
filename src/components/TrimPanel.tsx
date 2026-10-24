@@ -253,7 +253,7 @@ function TrimPoint({
           </>
         )}
       </div>
-      <p className="text-xs text-muted-foreground italic min-h-[1rem]">{line ? `“${line.trim()}”` : ""}</p>
+      <p className="text-xs text-muted-foreground italic min-h-4">{line ? `“${line.trim()}”` : ""}</p>
     </div>
   );
 }

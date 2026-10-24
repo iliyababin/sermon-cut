@@ -74,10 +74,10 @@ export function VideoCard(props: VideoCardProps) {
           type="button"
           onClick={props.onOpen}
           aria-label={`Review ${video.title}`}
-          className="absolute inset-0 rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="absolute inset-0 rounded-lg focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
         />
       )}
-      <div className="relative pointer-events-none w-48 h-28 bg-muted rounded-lg overflow-hidden flex-shrink-0">
+      <div className="relative pointer-events-none w-48 h-28 bg-muted rounded-lg overflow-hidden shrink-0">
         {video.thumbnail ? (
           <LocalImage path={video.thumbnail} alt={video.title} className="w-full h-full object-cover" />
         ) : (

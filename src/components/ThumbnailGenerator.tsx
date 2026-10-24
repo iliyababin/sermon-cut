@@ -257,7 +257,7 @@ export function ThumbnailGenerator() {
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               placeholder="Enter sermon title..."
-              className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
             />
             <div className="flex items-center justify-between mt-1">
               <label className="flex items-center gap-2 text-sm">
@@ -286,7 +286,7 @@ export function ThumbnailGenerator() {
               value={speakerName}
               onChange={(e) => setSpeakerName(e.target.value)}
               placeholder="Enter speaker name..."
-              className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
             />
           </div>
 

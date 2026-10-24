@@ -41,7 +41,7 @@ export function UploadWarnings({ videoId, warnings, onChange, compact }: UploadW
       <ul className="space-y-1">
         {warnings.map((w) => (
           <li key={w.kind} className="flex items-start gap-2">
-            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
             <span className="flex-1">{w.message}</span>
             {w.kind === "thumbnail" && (
               <button

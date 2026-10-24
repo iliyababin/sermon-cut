@@ -115,7 +115,7 @@ export function DownloadForm({ onGoToLibrary, isActive }: DownloadFormProps) {
               placeholder="https://youtube.com/watch?v=..."
               aria-label="YouTube URL"
               disabled={downloading}
-              className="flex-1 px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring"
+              className="flex-1 px-4 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring"
               onPaste={(e) => {
                 // Pasting into an empty field looks the video up straight away.
                 if (url.trim() || loading) return;
@@ -154,7 +154,7 @@ export function DownloadForm({ onGoToLibrary, isActive }: DownloadFormProps) {
             id="download-quality"
             value={quality}
             onChange={(e) => setQuality(e.target.value)}
-            className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring bg-background"
+            className="w-full px-4 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring bg-background"
           >
             <option value="best">Best Available</option>
             <option value="2160p">4K (2160p)</option>

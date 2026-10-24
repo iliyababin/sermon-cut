@@ -30,7 +30,7 @@ export function SettingsLibrary({
           id="settings-quality"
           value={settings.download_quality}
           onChange={(e) => edit("download_quality", e.target.value, 0)}
-          className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring bg-background"
+          className="w-full px-4 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring bg-background"
         >
           <option value="best">Best Available</option>
           <option value="2160p">4K (2160p)</option>
@@ -62,7 +62,7 @@ export function SettingsLibrary({
               if (e.key === "Enter") flushField("output_folder");
             }}
             placeholder="Leave empty for default"
-            className="flex-1 px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring"
+            className="flex-1 px-4 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring"
           />
           <button
             onClick={async () => {

@@ -106,7 +106,7 @@ export function SettingsYouTube({
               id="settings-playlist"
               value={settings.youtube_playlist_id ?? ""}
               onChange={(e) => edit("youtube_playlist_id", e.target.value || null, 0)}
-              className="w-full px-4 py-2 border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring bg-background"
+              className="w-full px-4 py-2 border border-input rounded-lg focus:outline-hidden focus:ring-2 focus:ring-ring bg-background"
             >
               <option value="">None</option>
               {playlists.map((pl) => (

@@ -328,9 +328,9 @@ function Banner({
   }[tone];
   return (
     <div className={`flex items-start gap-3 p-3 rounded-lg text-sm ${colors}`}>
-      <span className="flex-shrink-0 mt-0.5">{icon}</span>
-      <div className="flex-1 min-w-0 break-words">{children}</div>
-      {action && <div className="flex-shrink-0">{action}</div>}
+      <span className="shrink-0 mt-0.5">{icon}</span>
+      <div className="flex-1 min-w-0 wrap-break-word">{children}</div>
+      {action && <div className="shrink-0">{action}</div>}
     </div>
   );
 }

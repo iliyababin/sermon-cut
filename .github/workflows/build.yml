@@ -68,13 +68,11 @@ jobs:
             libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev
 
-      # No install scripts run from the registry. esbuild is the only dependency
-      # whose install script matters (it checks its platform binary); fsevents
-      # ships prebuilt. Rebuild only the allow-listed ones.
+      # No install scripts run from the registry. None are needed: Vite's
+      # bundler ships its platform binary as an optional package, and the
+      # only other one (fsevents) ships prebuilt.
       - name: Install frontend dependencies
-        run: |
-          npm ci --ignore-scripts
-          npm rebuild esbuild
+        run: npm ci --ignore-scripts
 
       # Built on its own, with no secrets in the environment; tauri-action is
       # told not to rebuild it (beforeBuildCommand is emptied below).

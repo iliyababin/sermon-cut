@@ -31,6 +31,14 @@ The app keeps its own files in a hidden `.sermon-cut` folder inside the library 
 
 Videos up to 3 hours long can be processed; trim longer recordings first.
 
+## Troubleshooting
+
+Sermon Cut keeps a log of what it does: processing, transcriptions, uploads, sign-in, and anything that went wrong. On a Mac it's in `~/Library/Logs/com.youthscc.sermon-cut/` (`sermon-cut.log`, plus up to four older files of 5 MB each). On Windows it's in `%LOCALAPPDATA%\com.youthscc.sermon-cut\logs`, on Linux in `~/.local/share/com.youthscc.sermon-cut/logs`.
+
+To send it to whoever helps you, open **Settings → Application → Logs**: **Copy Diagnostics** copies the app version, your system, the state of the library and tools, and the end of the log, ready to paste into an email or message; **Show Logs** opens the folder if they want the whole files.
+
+The log never holds YouTube sign-in details, the Modal API key or anything the server sent back, but it does have file paths, and on a Mac those include your user name (`/Users/<name>/…`) and the names of your videos.
+
 ## Install on Windows and Linux
 
 Grab the latest release for your platform from [Releases](https://github.com/iliyababin/sermon-cut/releases):

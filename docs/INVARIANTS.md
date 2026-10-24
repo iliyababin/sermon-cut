@@ -79,3 +79,14 @@ this file in the same commit and say why.
 12. External tools get `--` before user-supplied arguments, and yt-dlp also
     gets `--ignore-config`.
 13. Tests never contact YouTube or Modal; they use localhost mocks.
+
+## Logs
+
+14. Never log secrets (tokens, keys, auth codes, upload session URIs) or
+    HTTP response bodies, transcripts or audio: log a status, a size, a
+    reason code (`UploadError::log_text`). Types that hold secrets
+    implement `Debug` by hand and hide them (`logging::Hidden`). The
+    redactor in `logging.rs` masks what slips through; it's a backstop,
+    not permission. A log line is a quick file write: where it's easy,
+    log after dropping `inner`. The `FailureTracker` mutexes are leaves,
+    never held while taking another lock.

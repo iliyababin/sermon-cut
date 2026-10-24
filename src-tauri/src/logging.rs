@@ -157,6 +157,21 @@ pub fn format_line(now: &chrono::DateTime<chrono::Local>, level: log::Level, tar
 // ---------------------------------------------------------------------------
 // Redaction
 
+/// Stands in for a secret in a hand-written `Debug`: types that hold
+/// secrets never derive it (docs/INVARIANTS.md).
+pub struct Hidden;
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+/// `Some(<redacted>)` or `None`, for an optional secret.
+pub fn hidden<T>(secret: &Option<T>) -> Option<Hidden> {
+    secret.as_ref().map(|_| Hidden)
+}
+
 /// Secrets the app holds right now, replaced wherever they appear. Newest
 /// last; the oldest go past MAX_KNOWN.
 static KNOWN: Mutex<Vec<String>> = Mutex::new(Vec::new());

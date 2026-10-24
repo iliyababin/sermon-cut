@@ -89,7 +89,9 @@ pub struct Chapter {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+// The settings hold the sign-in and the Modal key, so these Debugs are
+// written by hand and hide them (docs/INVARIANTS.md).
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct YouTubeAuth {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
@@ -98,7 +100,20 @@ pub struct YouTubeAuth {
     pub channel_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for YouTubeAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::logging::hidden;
+        f.debug_struct("YouTubeAuth")
+            .field("access_token", &hidden(&self.access_token))
+            .field("refresh_token", &hidden(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("channel_name", &self.channel_name)
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub download_quality: String,
     /// The library folder. Saved as "output_folder" (its name before the
@@ -129,6 +144,24 @@ pub struct Settings {
     /// auto_process on, cleared by turning it off.
     #[serde(default)]
     pub auto_process_since: Option<i64>,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("download_quality", &self.download_quality)
+            .field("library_folder", &self.library_folder)
+            .field("modal_api_url", &self.modal_api_url)
+            .field("modal_api_key", &crate::logging::hidden(&self.modal_api_key))
+            .field("logo_path", &self.logo_path)
+            .field("youtube_auth", &self.youtube_auth)
+            .field("youtube_playlist_id", &self.youtube_playlist_id)
+            .field("upload_privacy", &self.upload_privacy)
+            .field("recent_preachers", &self.recent_preachers)
+            .field("auto_process", &self.auto_process)
+            .field("auto_process_since", &self.auto_process_since)
+            .finish()
+    }
 }
 
 /// How many speakers `recent_preachers` keeps.
@@ -164,7 +197,7 @@ pub const UPLOAD_PRIVACIES: [&str; 3] = ["public", "unlisted", "private"];
 
 /// What the webview sees: no tokens, just whether (and as whom) YouTube is
 /// signed in.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SettingsView {
     pub download_quality: String,
     #[serde(rename = "output_folder")]
@@ -180,11 +213,29 @@ pub struct SettingsView {
     pub auto_process: bool,
 }
 
+impl std::fmt::Debug for SettingsView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsView")
+            .field("download_quality", &self.download_quality)
+            .field("library_folder", &self.library_folder)
+            .field("modal_api_url", &self.modal_api_url)
+            .field("modal_api_key", &crate::logging::hidden(&self.modal_api_key))
+            .field("logo_path", &self.logo_path)
+            .field("youtube_playlist_id", &self.youtube_playlist_id)
+            .field("upload_privacy", &self.upload_privacy)
+            .field("youtube_signed_in", &self.youtube_signed_in)
+            .field("youtube_channel_name", &self.youtube_channel_name)
+            .field("recent_preachers", &self.recent_preachers)
+            .field("auto_process", &self.auto_process)
+            .finish()
+    }
+}
+
 /// What the webview may change: only the user-editable fields, each one
 /// optional so a save touches just what was edited. Sign-in, privacy and
 /// anything else the app manages itself can't be sent at all. For the
 /// optional settings, an empty string clears them.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsPatch {
     #[serde(default)]
@@ -201,6 +252,20 @@ pub struct SettingsPatch {
     pub youtube_playlist_id: Option<String>,
     #[serde(default)]
     pub auto_process: Option<bool>,
+}
+
+impl std::fmt::Debug for SettingsPatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsPatch")
+            .field("download_quality", &self.download_quality)
+            .field("library_folder", &self.library_folder)
+            .field("modal_api_url", &self.modal_api_url)
+            .field("modal_api_key", &crate::logging::hidden(&self.modal_api_key))
+            .field("logo_path", &self.logo_path)
+            .field("youtube_playlist_id", &self.youtube_playlist_id)
+            .field("auto_process", &self.auto_process)
+            .finish()
+    }
 }
 
 impl SettingsPatch {
@@ -595,6 +660,31 @@ fn make_private(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_hides_the_sign_in_and_the_key() {
+        let mut state = AppState::default();
+        state.settings.modal_api_key = Some("modal-hidden-key".into());
+        state.settings.youtube_auth = Some(YouTubeAuth {
+            access_token: Some("ya29.hidden-access".into()),
+            refresh_token: Some("1//hidden-refresh".into()),
+            channel_name: Some("Youth Channel".into()),
+            ..Default::default()
+        });
+        let patch = SettingsPatch { modal_api_key: Some("modal-hidden-key".into()), ..Default::default() };
+        for shown in [
+            format!("{:?}", state),
+            format!("{:?}", state.settings),
+            format!("{:?}", state.settings.view()),
+            format!("{:?}", patch),
+            format!("{:?}", state.settings.youtube_auth),
+        ] {
+            for secret in ["modal-hidden-key", "ya29.hidden-access", "1//hidden-refresh"] {
+                assert!(!shown.contains(secret), "{}", shown);
+            }
+        }
+        assert!(format!("{:?}", state.settings).contains("Youth Channel"));
+    }
 
     fn signed_in() -> Settings {
         Settings {

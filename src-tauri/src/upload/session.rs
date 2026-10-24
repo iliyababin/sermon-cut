@@ -9,7 +9,8 @@ pub const MAX_SESSION_AGE: chrono::Duration = chrono::Duration::days(6);
 
 const TRUSTED_PREFIX: &str = "https://www.googleapis.com/upload/";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The URI alone lets anyone finish the upload, so Debug hides it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct UploadSession {
     pub uri: String,
     /// The entry's fingerprint hash (never recomputed for this).
@@ -25,6 +26,19 @@ pub struct UploadSession {
     /// session turns out finished. None for sessions from before 0.6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_key: Option<String>,
+}
+
+impl std::fmt::Debug for UploadSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadSession")
+            .field("uri", &crate::logging::Hidden)
+            .field("file_hash", &self.file_hash)
+            .field("size", &self.size)
+            .field("metadata_hash", &self.metadata_hash)
+            .field("created", &self.created)
+            .field("file_key", &self.file_key)
+            .finish()
+    }
 }
 
 impl UploadSession {
@@ -116,6 +130,13 @@ impl SessionStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_hides_the_uri() {
+        let s = UploadSession::new("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=SECRETID".into(), "h", 1, "m");
+        let shown = format!("{:?}", s);
+        assert!(!shown.contains("SECRETID") && shown.contains("<redacted>"), "{}", shown);
+    }
 
     #[test]
     fn reused_only_when_young_and_matching() {

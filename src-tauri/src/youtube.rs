@@ -9,24 +9,54 @@ use tokio_util::sync::CancellationToken;
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// These hold secrets, so their Debug hides them (docs/INVARIANTS.md).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct YouTubeCredentials {
     pub client_id: String,
     pub client_secret: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+impl std::fmt::Debug for YouTubeCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YouTubeCredentials")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &crate::logging::Hidden)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct YouTubeTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for YouTubeTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YouTubeTokens")
+            .field("access_token", &crate::logging::Hidden)
+            .field("refresh_token", &crate::logging::hidden(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: Option<i64>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &crate::logging::Hidden)
+            .field("refresh_token", &crate::logging::hidden(&self.refresh_token))
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 impl YouTubeCredentials {
@@ -512,6 +542,27 @@ mod tests {
 
     fn credentials() -> YouTubeCredentials {
         YouTubeCredentials { client_id: "client".into(), client_secret: "secret".into() }
+    }
+
+    #[test]
+    fn debug_output_hides_the_secrets() {
+        let creds = YouTubeCredentials { client_id: "the-client-id".into(), client_secret: "GOCSPX-hidden-secret".into() };
+        let tokens = YouTubeTokens {
+            access_token: "ya29.hidden-access".into(),
+            refresh_token: Some("1//hidden-refresh".into()),
+            expires_at: Some(1),
+        };
+        let response: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"ya29.hidden-access","refresh_token":"1//hidden-refresh","expires_in":3599}"#)
+                .unwrap();
+        for shown in [format!("{:?}", creds), format!("{:?}", tokens), format!("{:#?}", response)] {
+            for secret in ["GOCSPX-hidden-secret", "ya29.hidden-access", "1//hidden-refresh"] {
+                assert!(!shown.contains(secret), "{}", shown);
+            }
+            assert!(shown.contains("<redacted>"), "{}", shown);
+        }
+        assert!(format!("{:?}", creds).contains("the-client-id"));
+        assert!(format!("{:?}", response).contains("3599"));
     }
 
     /// A sign-in against the mock token endpoint. Returns the running flow

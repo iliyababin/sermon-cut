@@ -41,7 +41,8 @@ struct ModalChapter {
     title: String,
 }
 
-#[derive(Debug, Serialize)]
+/// No Debug: it's the audio.
+#[derive(Serialize)]
 struct TranscribeRequest {
     audio_base64: String,
 }

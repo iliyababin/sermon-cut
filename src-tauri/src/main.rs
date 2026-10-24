@@ -4,6 +4,7 @@ mod commands;
 mod youtube_dl;
 mod ffmpeg;
 mod library;
+mod logging;
 mod modal;
 mod notify;
 mod state;
@@ -116,6 +117,7 @@ fn ask_before_quitting(app: &AppHandle, library: &Library) -> bool {
 }
 
 fn main() {
+    logging::install_panic_hook();
     tools::extend_path();
 
     let app_state = AppState::load();
@@ -131,6 +133,11 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        // Then the log, before anything that might write to it. After the
+        // single-instance check, so a second copy never opens (or rotates)
+        // the log file the first one is writing.
+        .plugin(logging::plugin())
+        .plugin(logging::ready_plugin(settings.library_folder_or_default()))
         .setup({
             let library = library.clone();
             let app_state = app_state.clone();

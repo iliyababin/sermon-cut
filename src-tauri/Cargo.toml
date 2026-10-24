@@ -42,6 +42,15 @@ tokio-util = "0.7"
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
 fs4 = "1.1.0"
+# The log file (see src/logging.rs). 2.10: KeepSome rotation and its fixes.
+tauri-plugin-log = "2.10.1"
+log = "0.4"
+os_info = "3"
+regex = "1"
+
+[dev-dependencies]
+# tauri::test's mock app, for the log rotation test.
+tauri = { version = "2.0", features = ["protocol-asset", "test"] }
 
 [features]
 default = ["custom-protocol"]

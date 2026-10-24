@@ -500,6 +500,7 @@ impl AppState {
 
     fn from_persisted(persisted: PersistedState) -> Self {
         let mut settings = persisted.settings.unwrap_or_default();
+        crate::logging::register_settings(&settings);
         if settings.modal_api_url.trim_end_matches('/') == RETIRED_MODAL_API_URL {
             settings.modal_api_url = DEFAULT_MODAL_API_URL.to_string();
         }
@@ -521,6 +522,8 @@ impl AppState {
     /// file being replaced becomes state.json.bak, but only if it's good,
     /// so a damaged file never overwrites the last good backup.
     fn save_to(&self, path: &Path) -> Result<(), String> {
+        // Saved after every sign-in, token refresh and key change.
+        crate::logging::register_settings(&self.settings);
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)

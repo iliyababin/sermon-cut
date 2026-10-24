@@ -128,7 +128,33 @@ pub async fn transcribe_audio(
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
-    transcribe_with(&client, api_url, api_key, body, &RETRY_DELAYS, &Limits::default()).await
+    log::info!(
+        "Sending {:.1} MB of audio to {}",
+        metadata.len() as f64 / 1e6,
+        crate::logging::url_host(api_url)
+    );
+    let started = std::time::Instant::now();
+    let result = transcribe_with(&client, api_url, api_key, body, &RETRY_DELAYS, &Limits::default()).await;
+    let secs = started.elapsed().as_secs();
+    match &result {
+        Ok(t) => log::info!(
+            "Transcription done in {}m {:02}s: {} segments; sermon {}{}",
+            secs / 60,
+            secs % 60,
+            t.segments.len(),
+            match (t.sermon_start, t.sermon_end) {
+                (Some(s), Some(e)) => format!("{:.0}–{:.0}s", s, e),
+                _ => "not found".into(),
+            },
+            match (&t.analysis_error, &t.no_sermon_reason) {
+                (Some(_), _) => "; the analysis failed (see the review screen)",
+                (None, Some(_)) => "; the AI gave a reason",
+                _ => "",
+            }
+        ),
+        Err(e) => log::warn!("Transcription failed after {}m {:02}s: {}", secs / 60, secs % 60, e),
+    }
+    result
 }
 
 /// How long a transcription may take, and how its result is waited for.
@@ -218,6 +244,8 @@ async fn transcribe_with(
 
     let origin = reqwest::Url::parse(api_url).map_err(|e| format!("Invalid server URL: {}", e))?;
     let (mut status, mut location, mut bytes) = read(response).await?;
+    log::info!("The server answered {} ({} bytes){}", status, bytes.len(), if location.is_some() { "; waiting for the result" } else { "" });
+    let mut polls = crate::logging::FailureTracker::new(module_path!(), "Asking for the result");
     let mut wait = limits.backoff;
     let mut gap = limits.min_poll;
     let mut last_ask = tokio::time::Instant::now();
@@ -230,6 +258,7 @@ async fn transcribe_with(
             tokio::time::sleep_until((last_ask + gap).min(deadline)).await;
             let left = remaining();
             if left.is_zero() {
+                log::warn!("Gave up waiting for the result after {} min", limits.overall.as_secs() / 60);
                 return Err(TIMED_OUT.into());
             }
             last_ask = tokio::time::Instant::now();
@@ -243,6 +272,7 @@ async fn transcribe_with(
                     Ok(answer) => {
                         (status, location, bytes) = answer;
                         failing_since = None;
+                        polls.log_recovered();
                         // Answered at once: wait longer before the next ask.
                         gap = if last_ask.elapsed() < gap { (gap * 2).min(limits.max_backoff.max(limits.min_poll)) } else { limits.min_poll };
                         break;
@@ -259,13 +289,14 @@ async fn transcribe_with(
                     // Modal's: retried, but not for ever.
                     let since = *failing_since.get_or_insert(last_ask);
                     if since.elapsed() >= limits.lost_after {
+                        log::warn!("Only server errors for {}s: the job is lost", since.elapsed().as_secs());
                         return Err(LOST.into());
                     }
-                    format!("server error {} ({})", code, String::from_utf8_lossy(&body[..body.len().min(200)]))
+                    format!("server error {} ({} bytes)", code, body.len())
                 }
                 Err(e) => e.to_string(),
             };
-            log::warn!("Waiting for the result failed ({}); asking again", failure);
+            polls.log_failure(format!("{}; asking again", crate::logging::hosts_only(&failure)));
             tokio::time::sleep(wait.min(remaining())).await;
             wait = (wait * 2).min(limits.max_backoff);
         }
@@ -276,7 +307,9 @@ async fn transcribe_with(
         if let Some(error) = server_failure(&bytes) {
             return Err(error);
         }
-        return Err(format!("API error ({}): {}", status, String::from_utf8_lossy(&bytes)));
+        // Not the body: it can be anything, and the error goes in the log.
+        log::warn!("The server answered {} ({} bytes)", status, bytes.len());
+        return Err(format!("The transcription server answered with an error ({}). Try again later.", status));
     }
     parse_response(&bytes)
 }

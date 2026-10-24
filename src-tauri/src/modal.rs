@@ -147,6 +147,10 @@ struct Limits {
     /// server redirects at once (it doubles while it keeps doing so, up to
     /// `max_backoff`), so a misbehaving server isn't asked in a tight loop.
     min_poll: Duration,
+    /// Modal's own server errors (not ours) for this long in a row, with
+    /// no other answer between: the job is gone (e.g. its container was
+    /// stopped), so stop waiting for it.
+    lost_after: Duration,
 }
 
 impl Default for Limits {
@@ -158,11 +162,24 @@ impl Default for Limits {
             backoff: Duration::from_secs(2),
             max_backoff: Duration::from_secs(30),
             min_poll: Duration::from_secs(1),
+            lost_after: Duration::from_secs(3 * 60),
         }
     }
 }
 
 const TIMED_OUT: &str = "Transcription took too long (over 55 minutes). Try again later.";
+const LOST: &str = "The transcription server lost this job (its machine was restarted). Click Retry to send it again.";
+
+/// Our server's own failure answer, {"success": false, "error": ...}: a
+/// real answer, not worth asking again.
+fn server_failure(bytes: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Failure {
+        success: bool,
+        error: String,
+    }
+    serde_json::from_slice::<Failure>(bytes).ok().filter(|f| !f.success).map(|f| f.error)
+}
 
 /// Send the audio once (again only if it never reached the server), then
 /// wait for the answer. Modal answers a request that runs past 150 s with
@@ -203,6 +220,8 @@ async fn transcribe_with(
     let mut wait = limits.backoff;
     let mut gap = limits.min_poll;
     let mut last_ask = tokio::time::Instant::now();
+    // Since when only Modal's own server errors came back.
+    let mut failing_since: Option<tokio::time::Instant> = None;
     while let Some(next) = redirect_target(status, location.as_deref(), &origin)? {
         // Ask for the result until there's an answer worth reading.
         loop {
@@ -222,13 +241,27 @@ async fn transcribe_with(
                 Ok(response) if !response.status().is_server_error() => match read(response).await {
                     Ok(answer) => {
                         (status, location, bytes) = answer;
+                        failing_since = None;
                         // Answered at once: wait longer before the next ask.
                         gap = if last_ask.elapsed() < gap { (gap * 2).min(limits.max_backoff.max(limits.min_poll)) } else { limits.min_poll };
                         break;
                     }
                     Err(e) => e,
                 },
-                Ok(response) => format!("server error {}", response.status()),
+                Ok(response) => {
+                    let code = response.status();
+                    let body = response.bytes().await.unwrap_or_default();
+                    // Ours: the job ran and failed, so asking again won't help.
+                    if let Some(error) = server_failure(&body) {
+                        return Err(error);
+                    }
+                    // Modal's: retried, but not for ever.
+                    let since = *failing_since.get_or_insert(last_ask);
+                    if since.elapsed() >= limits.lost_after {
+                        return Err(LOST.into());
+                    }
+                    format!("server error {} ({})", code, String::from_utf8_lossy(&body[..body.len().min(200)]))
+                }
                 Err(e) => e.to_string(),
             };
             eprintln!("[modal] Waiting for the result failed ({}); asking again", failure);
@@ -239,6 +272,9 @@ async fn transcribe_with(
     }
 
     if !status.is_success() {
+        if let Some(error) = server_failure(&bytes) {
+            return Err(error);
+        }
         return Err(format!("API error ({}): {}", status, String::from_utf8_lossy(&bytes)));
     }
     parse_response(&bytes)
@@ -460,6 +496,7 @@ mod tests {
             backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(50),
             min_poll: Duration::from_millis(10),
+            lost_after: Duration::from_secs(2),
         }
     }
 
@@ -572,6 +609,65 @@ mod tests {
         let r = transcribe_with(&client(Duration::from_secs(5)), &url, None, b"{}".to_vec(), &NO_WAIT, &fast()).await.unwrap();
         assert_eq!(r.full_text, "Hi");
         assert_eq!(methods(&seen), ["POST /transcribe", "GET /result/1", "GET /result/1", "GET /result/1", "GET /result/1"]);
+    }
+
+    /// The server's own failure answer ends the wait at once.
+    #[tokio::test]
+    async fn the_servers_failure_answer_is_not_asked_again() {
+        let failed = r#"{"success":false,"error":"Transcription failed: EOFError: End of file"}"#;
+        let (url, seen) = mock(move |method, _, _| match method {
+            "POST" => Act::Reply(reply("303 See Other", "Location: /result/1\r\n", "")),
+            _ => Act::Reply(reply("500 Internal Server Error", "Content-Type: application/json\r\n", failed)),
+        })
+        .await;
+        let err = transcribe_with(&client(Duration::from_secs(5)), &url, None, b"{}".to_vec(), &NO_WAIT, &fast()).await.unwrap_err();
+        assert_eq!(err, "Transcription failed: EOFError: End of file");
+        assert_eq!(methods(&seen), ["POST /transcribe", "GET /result/1"]);
+
+        // Also when it comes straight back from the POST.
+        let (url, _) = mock(move |_, _, _| Act::Reply(reply("500 Internal Server Error", "", failed))).await;
+        let err = transcribe_with(&client(Duration::from_secs(5)), &url, None, b"{}".to_vec(), &NO_WAIT, &fast()).await.unwrap_err();
+        assert_eq!(err, "Transcription failed: EOFError: End of file");
+    }
+
+    /// Modal's own errors for `lost_after` in a row: the job is gone (a
+    /// stopped container), so the wait ends long before `overall`.
+    #[tokio::test]
+    async fn a_job_modal_lost_ends_the_wait_early() {
+        let (url, seen) = mock(|method, _, _| match method {
+            "POST" => Act::Reply(reply("303 See Other", "Location: /result/1\r\n", "")),
+            _ => Act::Reply(reply("500 Internal Server Error", "", "modal-http: internal error: function was terminated by signal")),
+        })
+        .await;
+        let limits = Limits { overall: Duration::from_secs(30), lost_after: Duration::from_millis(300), ..fast() };
+        let started = std::time::Instant::now();
+        let err = transcribe_with(&client(Duration::from_secs(5)), &url, None, b"{}".to_vec(), &NO_WAIT, &limits).await.unwrap_err();
+        assert_eq!(err, LOST);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(methods(&seen).iter().filter(|m| m.starts_with("POST")).count(), 1, "the audio isn't sent again");
+    }
+
+    /// Any real answer between Modal's errors starts the count again.
+    #[tokio::test]
+    async fn modal_errors_between_redirects_are_not_a_lost_job() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (url, _) = mock(move |method, _, _| {
+            if method == "POST" {
+                return Act::Reply(reply("303 See Other", "Location: /result/1\r\n", ""));
+            }
+            match n.fetch_add(1, Ordering::SeqCst) {
+                // Three runs of three errors, a redirect (still running)
+                // between them, then the result.
+                0..=2 | 4..=6 | 8..=10 => Act::Reply(reply("502 Bad Gateway", "", "busy")),
+                3 | 7 => Act::Reply(reply("303 See Other", "Location: /result/1\r\n", "")),
+                _ => Act::Reply(reply("200 OK", "", RESULT)),
+            }
+        })
+        .await;
+        // Covers one run of three errors (about 0.1 s) but not all nine.
+        let limits = Limits { lost_after: Duration::from_millis(250), backoff: Duration::from_millis(40), max_backoff: Duration::from_millis(40), ..fast() };
+        let r = transcribe_with(&client(Duration::from_secs(5)), &url, None, b"{}".to_vec(), &NO_WAIT, &limits).await.unwrap();
+        assert_eq!(r.full_text, "Hi");
     }
 
     #[tokio::test]

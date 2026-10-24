@@ -1,8 +1,14 @@
 """Sermon Cut — Modal backend.
 
-A single GPU endpoint. POST base64-encoded audio, get back a Whisper
-transcript plus an LLM pass that locates the sermon inside a full service
-recording.
+One endpoint. POST base64-encoded audio, get back a Whisper transcript plus
+an LLM pass that locates the sermon inside a full service recording.
+
+The endpoint itself runs on a small CPU container that Modal doesn't
+preempt; it hands the audio to a GPU function (`transcribe_gpu`) and runs
+the analysis when that returns. GPU containers can be preempted at any
+time: Modal then reruns `transcribe_gpu` from its stored input, and the
+endpoint just waits longer. (When it all ran in the GPU endpoint, a
+preemption lost the request: there was no stored input to rerun.)
 
     modal deploy app.py     # deploy
     modal serve app.py      # hot-reload dev
@@ -38,10 +44,13 @@ from analysis import (
 app = modal.App("youtube-clipper")
 
 GPU = "T4"
-# 45 min: a 3-hour service (the app's limit) takes well under 15. The app waits up
+# 45 min for the whole request: a 3-hour service (the app's limit) takes well
+# under 15 to transcribe, even with a preempted try or two. The app waits up
 # to 55 minutes (modal::Limits in src-tauri/src/modal.rs), so it never gives
 # up on a request the server is still working on.
 TIMEOUT = 2700
+# One transcription try on the GPU. A 1h42 service took 3 minutes.
+GPU_TIMEOUT = 1200
 
 # Baked into the image at build time. Secrets aren't available during the
 # build, so a WHISPER_MODEL override downloads at runtime instead.
@@ -65,6 +74,13 @@ image = (
     # during the build, so the module has to be in the image before it.
     .add_local_python_source("analysis", copy=True)
     .run_function(download_whisper_model)
+)
+
+# The endpoint's container: no GPU, no CUDA, no Whisper.
+web_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("openai", "fastapi")
+    .add_local_python_source("analysis")
 )
 
 # Whisper does better on religious vocabulary when primed with it.
@@ -228,19 +244,49 @@ def analyze(segments: list) -> dict:
 @app.function(
     image=image,
     gpu=GPU,
+    timeout=GPU_TIMEOUT,
+    # Errors other than preemption (which Modal reruns anyway).
+    retries=modal.Retries(max_retries=1, initial_delay=5.0),
+    secrets=[modal.Secret.from_name("openrouter-api-key")],
+)
+def transcribe_gpu(audio: bytes) -> tuple:
+    """Transcribe on the GPU. Returns (segments, full_text). Safe to rerun:
+    it only reads its input."""
+    with tempfile.NamedTemporaryFile(suffix=".ogg") as f:
+        f.write(audio)
+        f.flush()
+        print(f"[INFO] Received {len(audio) / 1024 / 1024:.1f} MB of audio")
+        try:
+            return transcribe(f.name)
+        except Exception as e:
+            print(f"[ERROR] Transcription failed: {e!r}")
+            failure = f"{type(e).__name__}: {e}"
+    # A plain error, raised outside the except block so it carries no
+    # context: the endpoint's image can't rebuild Whisper's own exception
+    # types (e.g. av.error.EOFError).
+    raise RuntimeError(failure)
+
+
+@app.function(
+    image=web_image,
     timeout=TIMEOUT,
+    # Never preempted: it holds the request, which can't be replayed.
+    nonpreemptible=True,
     secrets=[modal.Secret.from_name("openrouter-api-key")],
 )
 @modal.fastapi_endpoint(method="POST")
 async def transcribe_audio(request: Request):
     """Transcribe audio and locate the sermon.
 
-    Request:  {"audio_base64": "..."}  — 16kHz mono PCM WAV works best
+    Request:  {"audio_base64": "..."}  — 16 kHz mono Opus works well
     Response: {"success", "segments", "text", "sermon_analysis", "analysis_error"?}
     A failed analysis keeps the transcript: sermon_analysis is null and
     analysis_error says why. Bodies over MAX_BODY_BYTES get a 413 before
-    they are parsed.
+    they are parsed. A failed transcription is a 500 with
+    {"success": false, "error": ...}.
     """
+    import base64
+
     expected = os.environ.get("API_TOKEN")
     authorization = request.headers.get("authorization")
     if expected and authorization != f"Bearer {expected}":
@@ -264,34 +310,20 @@ async def transcribe_audio(request: Request):
     audio_base64 = data.get("audio_base64")
     if not audio_base64:
         return fail("audio_base64 is required", 400)
-
-    # Transcription and analysis block for minutes; keep them off the loop.
-    return await asyncio.to_thread(process_audio, audio_base64)
-
-
-def process_audio(audio_base64: str):
-    import base64
-
-    audio_path = None
     try:
-        audio = base64.b64decode(audio_base64)
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
-            audio_path = f.name
-            f.write(audio)
-        print(f"[INFO] Received {len(audio) / 1024 / 1024:.1f} MB of audio")
+        audio = base64.b64decode(audio_base64, validate=True)
+    except ValueError:
+        return fail("audio_base64 isn't valid base64", 400)
+    del data, audio_base64
 
-        segments, full_text = transcribe(audio_path)
+    try:
+        segments, full_text = await transcribe_gpu.remote.aio(audio)
     except Exception as e:
-        print(f"[ERROR] Transcription failed: {e}")
-        import traceback
+        print(f"[ERROR] Transcription failed: {e!r}")
+        return fail(f"Transcription failed: {e}")
 
-        traceback.print_exc()
-        return fail(str(e))
-    finally:
-        if audio_path and os.path.exists(audio_path):
-            os.unlink(audio_path)
-
-    analysis, analysis_error = run_analysis_safely(analyze, segments)
+    # The analysis call blocks for up to a couple of minutes; keep it off the loop.
+    analysis, analysis_error = await asyncio.to_thread(run_analysis_safely, analyze, segments)
     print(f"[INFO] Analysis: {analysis if analysis is not None else analysis_error}")
 
     return JSONResponse(

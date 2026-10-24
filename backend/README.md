@@ -98,7 +98,12 @@ python3 -m unittest discover backend
 
 ## Cost notes
 
-Runs on a T4 with a 45-minute timeout (the app waits up to 55). The default Whisper model is baked into
+The endpoint runs on a small CPU container that Modal doesn't preempt (billed
+at 3x the CPU rate, which is cents for minutes of mostly waiting); it hands the
+audio to `transcribe_gpu` on a T4 and runs the analysis itself once that
+returns. GPU containers can be preempted at any time: Modal reruns
+`transcribe_gpu` from its stored input and the request just takes longer.
+The request has a 45-minute timeout (the app waits up to 55), each GPU try 20. The default Whisper model is baked into
 the image at build time (a `WHISPER_MODEL` override downloads on first use) and
 loaded once per container; back-to-back requests reuse a warm container. A ~90-minute service is
 a few minutes of GPU time plus one Sonnet call over the transcript.

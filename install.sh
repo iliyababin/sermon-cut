@@ -174,6 +174,17 @@ echo "yt-dlp $("$TOOLS_DIR/yt-dlp" --version </dev/null)"
 # so look it up instead of hard-coding it.
 step "Downloading $APP_NAME"
 release_json=$(curl -fsSL --retry 3 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+# The macOS tarball's URL from an updater latest.json (the darwin-aarch64-app
+# entry, else darwin-aarch64); prints nothing if there's none.
+latest_app_url() {
+  for key in darwin-aarch64-app darwin-aarch64; do
+    url=$(printf '%s' "$1" | tr -d '\n' \
+      | grep -oE "\"$key\": *\{[^}]*\}" \
+      | grep -oE '"url": *"https:[^"]*"' \
+      | head -1 | sed -E 's/.*"(https:[^"]*)"$/\1/' || true)
+    if [ -n "$url" ]; then printf '%s\n' "$url"; return; fi
+  done
+}
 asset_url() { # name-suffix regex; prints nothing if there's no such asset
   { printf '%s' "$release_json" \
       | grep -oE "\"browser_download_url\": *\"[^\"]*$1\"" || true; } \
@@ -182,8 +193,14 @@ asset_url() { # name-suffix regex; prints nothing if there's no such asset
 app_url=$(asset_url '_aarch64\.app\.tar\.gz')
 sums_url=$(asset_url '/SHA256SUMS\.txt')
 if [ -z "$app_url" ]; then
-  # API unreachable or rate limited: fall back to the original asset name.
-  app_url="https://github.com/$REPO/releases/latest/download/Sermon.Cut_aarch64.app.tar.gz"
+  # API unreachable or rate limited: the updater's latest.json, at a fixed
+  # address that isn't rate limited, names the same tarball.
+  latest_json=$(curl -fsSL --retry 3 "https://github.com/$REPO/releases/latest/download/latest.json" 2>/dev/null || true)
+  app_url=$(latest_app_url "$latest_json")
+  [ -n "$app_url" ] || fail "Couldn't find the latest $APP_NAME release. Check the internet connection and try again."
+  case "$app_url" in
+    */releases/download/*) sums_url="${app_url%/*}/SHA256SUMS.txt" ;;
+  esac
 fi
 app_asset=$(basename "$app_url")
 download "$app_url" "$TMP/$app_asset"

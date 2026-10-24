@@ -87,6 +87,9 @@ jobs:
           printf '%s' "$YOUTUBE_CLIENT_SECRETS" > src-tauri/resources/youtube_client_secrets.json
 
       - name: Build Tauri app
+        # Not v1: its latest.json links go through api.github.com, which is
+        # rate limited, and install.sh falls back to latest.json exactly when
+        # the API is unavailable.
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

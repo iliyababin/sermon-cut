@@ -1,5 +1,6 @@
 use image::RgbImage;
 use ndarray::Array4;
+use ort::environment::Environment;
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::Path;
@@ -20,6 +21,19 @@ pub struct PoseDetection {
 }
 
 static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
+static ENV: OnceLock<Environment> = OnceLock::new();
+
+/// ONNX Runtime allows one environment per process; it lives for the app.
+fn get_env() -> Result<&'static Environment, String> {
+    if let Some(env) = ENV.get() {
+        return Ok(env);
+    }
+    match ort::init().with_name("sermon-cut").build() {
+        Ok(env) => Ok(ENV.get_or_init(|| env)),
+        // Another thread built it first.
+        Err(e) => ENV.get().ok_or_else(|| format!("Failed to start ONNX Runtime: {}", e)),
+    }
+}
 
 /// Initialise (or return cached) ONNX Runtime session for the YOLOv8-Pose model.
 fn get_session(model_path: &Path) -> Result<&'static Mutex<Session>, String> {
@@ -27,7 +41,7 @@ fn get_session(model_path: &Path) -> Result<&'static Mutex<Session>, String> {
         return Ok(s);
     }
     println!("[yolo] Loading ONNX model from {}", model_path.display());
-    let session = Session::builder()
+    let session = Session::builder(get_env()?)
         .map_err(|e| format!("Failed to create session builder: {}", e))?
         .with_intra_threads(4)
         .map_err(|e| format!("Failed to set threads: {}", e))?
@@ -193,5 +207,20 @@ fn iou(a: &PoseDetection, b: &PoseDetection) -> f32 {
         0.0
     } else {
         inter / union
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loads the bundled model and runs it, so an ONNX Runtime update that
+    /// breaks loading or the output shape fails here.
+    #[test]
+    fn bundled_model_runs_on_an_empty_frame() {
+        let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/yolov8n-pose.onnx");
+        let img = RgbImage::from_pixel(1280, 720, image::Rgb([40, 40, 40]));
+        let found = detect(&model, &img).expect("model runs");
+        assert!(found.is_empty(), "no one in an empty frame: {found:?}");
     }
 }

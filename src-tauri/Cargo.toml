@@ -18,7 +18,7 @@ tauri-plugin-shell = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 base64 = "0.22"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -27,7 +27,7 @@ futures = "0.3"
 md5 = "0.7"
 sha2 = "0.10"
 urlencoding = "2.1"
-ort = "2.0.0-rc.11"
+ort = "2.0.0-rc.15"
 ndarray = "0.17"
 image = { version = "0.25", features = ["jpeg", "png"] }
 # Colour profiles (e.g. Display P3) to sRGB; image already depends on it.
